@@ -1,4 +1,5 @@
-//! macOS AACS Volume Identifier reader via IOKit + SCSITaskDevice.
+//! macOS AACS Volume Identifier reader via IOKit + SCSITaskDevice
+//! (primary) or IOKit + MMCDevice (fallback).
 //!
 //! Loads `IOKit.framework` and `CoreFoundation.framework` at runtime via
 //! [`libloading`] (matches oxideplay's SDL2 loader pattern: no link-time
@@ -16,18 +17,35 @@
 //!    iterator entry by reading its `BSD Name` property, recursing into
 //!    children (the optical-drive service publishes its BSD Name on a
 //!    child IOMedia entry, not on itself).
-//! 3. `IOCreatePlugInInterfaceForService(service,
-//!    kIOSCSITaskDeviceUserClientTypeID, kIOCFPlugInInterfaceID, …)` →
-//!    `QueryInterface(plugin, kIOSCSITaskDeviceInterfaceID, …)` →
-//!    `SCSITaskDeviceInterface**`.
-//! 4. `ObtainExclusiveAccess` → `CreateSCSITask` →
-//!    `SetCommandDescriptorBlock` (12-byte READ DISC STRUCTURE CDB) →
-//!    `SetScatterGatherEntries` (one IOAddressRange covering a 36-byte
-//!    DMA buffer, direction = FromTargetToInitiator) →
-//!    `SetTimeoutDuration(5000ms)` → `ExecuteTaskSync`.
+//! 3. At each IOService entry (the matched node + up to 6 parent hops up
+//!    the IOService plane), try opening one of two factory IDs. Path (a)
+//!    is `kIOSCSITaskDeviceUserClientTypeID` →
+//!    `QueryInterface(kIOSCSITaskDeviceInterfaceID)` →
+//!    `SCSITaskDeviceInterface**`, the original "raw SCSI passthrough"
+//!    path; it requires the `com.apple.security.scsi` entitlement on
+//!    macOS 11+, and many post-Big-Sur drives reject every unprivileged
+//!    caller with `kIOReturnUnsupported`. Path (b) is
+//!    `kIOMMCDeviceUserClientTypeID` →
+//!    `QueryInterface(kIOMMCDeviceInterfaceID)` →
+//!    `MMCDeviceInterface**`, a fallback that exposes a typed
+//!    `ReadDiscStructure` slot directly (no CDB, no scatter-gather, no
+//!    exclusive-access handshake required of us) — used by most
+//!    third-party BD ripping tools that target modern macOS.
+//! 4. Primary (SCSITask) path: `ObtainExclusiveAccess` →
+//!    `CreateSCSITask` → `SetCommandDescriptorBlock` (12-byte READ DISC
+//!    STRUCTURE CDB) → `SetScatterGatherEntries` (one IOAddressRange
+//!    covering a 36-byte DMA buffer, direction =
+//!    FromTargetToInitiator) → `SetTimeoutDuration(5000ms)` →
+//!    `ExecuteTaskSync`.
+//!    Fallback (MMC) path: a single call to
+//!    `((**iface).ReadDiscStructure)(iface, MEDIA_TYPE=0x01 (BD),
+//!    ADDRESS=0, LAYER=0, FORMAT=0x80 (AACS Volume Identifier),
+//!    buf, 36, &task_status, &sense)`.
 //! 5. Parse: 4-byte response header (length + reserved) followed by the
-//!    16-byte Volume Identifier at offsets 4..20.
-//! 6. Release the task, release exclusive access, drop the plugin.
+//!    16-byte Volume Identifier at offsets 4..20 — same layout for both
+//!    paths since they end up running the same MMC opcode.
+//! 6. Release the task / MMC interface, release exclusive access if we
+//!    claimed it, drop the plugin.
 //!
 //! ## Exclusive access caveat
 //!
@@ -116,6 +134,12 @@ const kIOReturnSuccess: IOReturn = 0;
 // | 0x2c5. We surface the bit pattern by name only so we can give a
 // targeted error message; the actual numeric value is only logged.
 const kIOReturnExclusiveAccess: IOReturn = 0xE00_002C5u32 as i32;
+// `iokit_common_err(0x2c7)` — returned by IOCreatePlugInInterfaceForService
+// when the named factory ID is not advertised by this IOService node (or
+// when the SCSITaskDeviceUserClient is gated behind an entitlement we
+// don't have on macOS 11+). Treated as "try the next factory ID at this
+// node, or climb to the next parent".
+const kIOReturnUnsupported: IOReturn = 0xE00_002C7u32 as i32;
 const kSCSITaskStatus_GOOD: u32 = 0x00;
 const kSCSITaskStatus_CHECK_CONDITION: u32 = 0x02;
 const kSCSIDataTransfer_FromTargetToInitiator: u8 = 0x02;
@@ -246,6 +270,82 @@ struct SCSITaskInterface {
     ) -> IOReturn,
 }
 
+/// Typed signature for the only `MMCDeviceInterface` slot we call —
+/// `ReadDiscStructure`. The MMC backend exposes this as a typed method
+/// so we never construct a CDB or wire up scatter-gather DMA buffers
+/// ourselves.
+///
+/// Arguments mirror MMC-5 §6.21.4 (READ DISC STRUCTURE) directly:
+///   - `MEDIA_TYPE` low nibble: `0x01` = BD.
+///   - `ADDRESS`: irrelevant for AACS Volume Identifier (format `0x80`).
+///   - `LAYER_NUMBER`: `0` for single-layer BD-ROM AACS Volume ID.
+///   - `FORMAT`: `0x80` = AACS Volume Identifier.
+///   - `buffer` / `bufferSize`: 36 bytes (4-byte header + 16 bytes
+///     Volume ID + 16 bytes reserved).
+///   - `taskStatus` / `senseDataBuffer`: SCSI task outcome reported by
+///     the user client. The MMC interface still surfaces them so we can
+///     diagnose CHECK CONDITION the same way the SCSITask path does.
+type Fn_MMC_ReadDiscStructure = unsafe extern "C" fn(
+    *mut c_void,
+    UInt8,
+    UInt32,
+    UInt8,
+    UInt8,
+    *mut c_void,
+    UInt16,
+    *mut UInt32,
+    *mut SCSI_Sense_Data,
+) -> IOReturn;
+
+/// `MMCDeviceInterface` vtable from `SCSITaskLib.h`. Only
+/// `ReadDiscStructure` (slot 16, 0-indexed after the IUnknown +
+/// version/revision header) is typed; the other method slots are kept
+/// as opaque `*mut c_void` so the field offsets line up with the C
+/// struct without us having to model each MMC opcode.
+#[repr(C)]
+struct MMCDeviceInterface {
+    _reserved: *mut c_void,
+    QueryInterface: Fn_QueryInterface,
+    AddRef: Fn_AddRef,
+    Release: Fn_Release,
+    version: UInt16,
+    revision: UInt16,
+    // Slot 0 — Inquiry.
+    Inquiry: *mut c_void,
+    // Slot 1 — TestUnitReady.
+    TestUnitReady: *mut c_void,
+    // Slot 2 — GetPerformance.
+    GetPerformance: *mut c_void,
+    // Slot 3 — GetConfiguration.
+    GetConfiguration: *mut c_void,
+    // Slot 4 — ModeSense10.
+    ModeSense10: *mut c_void,
+    // Slot 5 — SetWriteParametersModePage.
+    SetWriteParametersModePage: *mut c_void,
+    // Slot 6 — GetTrayState.
+    GetTrayState: *mut c_void,
+    // Slot 7 — SetTrayState.
+    SetTrayState: *mut c_void,
+    // Slot 8 — ReadTableOfContents.
+    ReadTableOfContents: *mut c_void,
+    // Slot 9 — ReadDiscInformation.
+    ReadDiscInformation: *mut c_void,
+    // Slot 10 — ReadTrackInformation.
+    ReadTrackInformation: *mut c_void,
+    // Slot 11 — ReadDVDStructure.
+    ReadDVDStructure: *mut c_void,
+    // Slot 12 — GetSCSITaskDeviceInterface.
+    GetSCSITaskDeviceInterface: *mut c_void,
+    // Slot 13 — GetPerformanceV2.
+    GetPerformanceV2: *mut c_void,
+    // Slot 14 — SetCDSpeed.
+    SetCDSpeed: *mut c_void,
+    // Slot 15 — ReadFormatCapacities.
+    ReadFormatCapacities: *mut c_void,
+    // Slot 16 — ReadDiscStructure (the only slot we call).
+    ReadDiscStructure: Fn_MMC_ReadDiscStructure,
+}
+
 // ---------------------------------------------------------------------------
 // COM-style UUIDs from SCSITaskLib.h and IOCFPlugIn.h
 // ---------------------------------------------------------------------------
@@ -263,6 +363,16 @@ const K_IO_SCSI_TASK_DEVICE_USER_CLIENT_TYPE_ID: CFUUIDBytes = CFUUIDBytes::new(
 // kIOSCSITaskDeviceInterfaceID = 1BBC4132-08A5-11D5-90ED-0030657D052A
 const K_IO_SCSI_TASK_DEVICE_INTERFACE_ID: CFUUIDBytes = CFUUIDBytes::new([
     0x1B, 0xBC, 0x41, 0x32, 0x08, 0xA5, 0x11, 0xD5, 0x90, 0xED, 0x00, 0x30, 0x65, 0x7D, 0x05, 0x2A,
+]);
+
+// kIOMMCDeviceUserClientTypeID = 97ABCF2C-23CC-11D5-A0E8-003065704866
+const K_IO_MMC_DEVICE_USER_CLIENT_TYPE_ID: CFUUIDBytes = CFUUIDBytes::new([
+    0x97, 0xAB, 0xCF, 0x2C, 0x23, 0xCC, 0x11, 0xD5, 0xA0, 0xE8, 0x00, 0x30, 0x65, 0x70, 0x48, 0x66,
+]);
+
+// kIOMMCDeviceInterfaceID = 1F651106-23CC-11D5-BBDB-003065704866
+const K_IO_MMC_DEVICE_INTERFACE_ID: CFUUIDBytes = CFUUIDBytes::new([
+    0x1F, 0x65, 0x11, 0x06, 0x23, 0xCC, 0x11, 0xD5, 0xBB, 0xDB, 0x00, 0x30, 0x65, 0x70, 0x48, 0x66,
 ]);
 
 // ---------------------------------------------------------------------------
@@ -703,104 +813,80 @@ impl Drop for ScsiDevice<'_> {
     }
 }
 
-fn open_scsi_device<'a>(
+/// Owns a `**MMCDeviceInterface` handle and releases the interface +
+/// plugin on drop. The MMC plugin does not require us to call
+/// `ObtainExclusiveAccess` separately — the user client serialises
+/// access internally — so this struct is simpler than `ScsiDevice`.
+struct MmcDevice<'a> {
     syms: &'a Symbols,
+    iface: *mut *mut MMCDeviceInterface,
+    plugin: *mut *mut IOCFPlugInInterface,
+}
+
+impl Drop for MmcDevice<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.iface.is_null() {
+                ((**self.iface).Release)(self.iface as *mut c_void);
+            }
+            if !self.plugin.is_null() {
+                (self.syms.IODestroyPlugInInterface)(self.plugin);
+            }
+        }
+    }
+}
+
+/// One of the two user-client interfaces we know how to extract an AACS
+/// Volume Identifier from. Constructed by [`open_optical_device`].
+enum OpticalDevice<'a> {
+    Scsi(ScsiDevice<'a>),
+    Mmc(MmcDevice<'a>),
+}
+
+/// Try `IOCreatePlugInInterfaceForService` on a single IOService node
+/// with the requested factory type UUID. Returns the resulting plugin
+/// handle on success, or the raw `kern_return_t` on failure (the caller
+/// inspects this to decide whether to try the other factory ID at the
+/// same node or climb to the next parent).
+unsafe fn try_open_plugin(
+    syms: &Symbols,
     service: io_service_t,
-) -> Result<ScsiDevice<'a>, DriveError> {
-    // Wrap UUIDs into CFUUIDRef.
-    let plugin_uuid =
-        unsafe { (syms.CFUUIDCreateFromUUIDBytes)(ptr::null(), K_IO_CF_PLUGIN_INTERFACE_ID) };
-    if plugin_uuid.is_null() {
-        return Err(DriveError::Mmc(
-            "CFUUIDCreateFromUUIDBytes(kIOCFPlugInInterfaceID) returned NULL".to_string(),
-        ));
-    }
-    let plugin_uuid = CfRef {
-        syms,
-        ptr: plugin_uuid,
-    };
-
-    let dev_type_uuid = unsafe {
-        (syms.CFUUIDCreateFromUUIDBytes)(ptr::null(), K_IO_SCSI_TASK_DEVICE_USER_CLIENT_TYPE_ID)
-    };
-    if dev_type_uuid.is_null() {
-        return Err(DriveError::Mmc(
-            "CFUUIDCreateFromUUIDBytes(kIOSCSITaskDeviceUserClientTypeID) returned NULL"
-                .to_string(),
-        ));
-    }
-    let dev_type_uuid = CfRef {
-        syms,
-        ptr: dev_type_uuid,
-    };
-
-    // The SCSITaskDeviceUserClient plugin factory is registered on the
-    // IOSCSIPeripheralDeviceTypeXX node (the SCSI-level nub), not on
-    // the IOBDServices / IODVDServices media-class node we matched via
-    // BSD name. Try the matched service first; if it answers
-    // `kIOReturnUnsupported`, walk up the IOService plane to the SCSI
-    // peripheral parent and retry. Bounded by IOREG_MAX_PARENT_HOPS so
-    // we never loop indefinitely on a pathological registry.
-    const IOREG_MAX_PARENT_HOPS: usize = 6;
+    dev_type_uuid: CFTypeRef,
+    plugin_uuid: CFTypeRef,
+) -> Result<*mut *mut IOCFPlugInInterface, kern_return_t> {
     let mut plugin: *mut *mut IOCFPlugInInterface = ptr::null_mut();
     let mut score: SInt32 = 0;
-    let mut current = service;
-    // Owned io_objects we created via IORegistryEntryGetParentEntry —
-    // we must release each before returning. The originally-passed
-    // `service` is the caller's; we don't release it.
-    let mut owned_parents: Vec<io_registry_entry_t> = Vec::new();
-    let plane = b"IOService\0";
-    let mut last_kr: kern_return_t = kIOReturnSuccess;
-    for hop in 0..=IOREG_MAX_PARENT_HOPS {
-        let kr = unsafe {
-            (syms.IOCreatePlugInInterfaceForService)(
-                current,
-                dev_type_uuid.ptr,
-                plugin_uuid.ptr,
-                &mut plugin,
-                &mut score,
-            )
+    let kr = unsafe {
+        (syms.IOCreatePlugInInterfaceForService)(
+            service,
+            dev_type_uuid,
+            plugin_uuid,
+            &mut plugin,
+            &mut score,
+        )
+    };
+    if kr == kIOReturnSuccess && !plugin.is_null() {
+        Ok(plugin)
+    } else {
+        // Defensive: if the kernel ever returned success with a NULL
+        // plugin, treat it like kIOReturnUnsupported so we still try the
+        // alternate factory ID / climb the parent chain.
+        let effective = if kr == kIOReturnSuccess {
+            kIOReturnUnsupported
+        } else {
+            kr
         };
-        last_kr = kr;
-        if kr == kIOReturnSuccess && !plugin.is_null() {
-            break;
-        }
-        // Climb to parent for the next attempt.
-        let mut parent: io_registry_entry_t = 0;
-        let pkr = unsafe {
-            (syms.IORegistryEntryGetParentEntry)(
-                current,
-                plane.as_ptr() as *const c_char,
-                &mut parent,
-            )
-        };
-        if pkr != kIOReturnSuccess || parent == 0 {
-            for p in &owned_parents {
-                unsafe { (syms.IOObjectRelease)(*p) };
-            }
-            return Err(DriveError::Mmc(format!(
-                "IOCreatePlugInInterfaceForService(kIOSCSITaskDeviceUserClientTypeID) \
-                 failed at every parent hop (0..={hop}): last status 0x{kr:08x}; \
-                 final parent walk: 0x{pkr:08x}"
-            )));
-        }
-        owned_parents.push(parent);
-        current = parent;
+        Err(effective)
     }
-    // Release the parent chain — IOCreatePlugInInterfaceForService
-    // doesn't retain the service, so the io_object_t is no longer
-    // needed once the plugin handle is alive.
-    for p in &owned_parents {
-        unsafe { (syms.IOObjectRelease)(*p) };
-    }
-    if plugin.is_null() {
-        return Err(DriveError::Mmc(format!(
-            "IOCreatePlugInInterfaceForService(kIOSCSITaskDeviceUserClientTypeID) \
-             returned NULL after walking up to {IOREG_MAX_PARENT_HOPS} parents; \
-             last kern_return_t was 0x{last_kr:08x}"
-        )));
-    }
+}
 
+/// Promote a freshly-obtained `IOCFPlugInInterface**` into an
+/// [`ScsiDevice`] by `QueryInterface`-ing for the SCSITaskDeviceInterface
+/// and claiming exclusive access on the resulting handle.
+fn finalize_scsi_device<'a>(
+    syms: &'a Symbols,
+    plugin: *mut *mut IOCFPlugInInterface,
+) -> Result<ScsiDevice<'a>, DriveError> {
     // QueryInterface(plugin, kIOSCSITaskDeviceInterfaceID, &out)
     let mut iface: *mut c_void = ptr::null_mut();
     let hr = unsafe {
@@ -843,6 +929,178 @@ fn open_scsi_device<'a>(
     }
     dev.have_excl = true;
     Ok(dev)
+}
+
+/// Promote a freshly-obtained `IOCFPlugInInterface**` into an
+/// [`MmcDevice`] by `QueryInterface`-ing for the MMCDeviceInterface.
+fn finalize_mmc_device<'a>(
+    syms: &'a Symbols,
+    plugin: *mut *mut IOCFPlugInInterface,
+) -> Result<MmcDevice<'a>, DriveError> {
+    let mut iface: *mut c_void = ptr::null_mut();
+    let hr = unsafe {
+        ((**plugin).QueryInterface)(
+            plugin as *mut c_void,
+            K_IO_MMC_DEVICE_INTERFACE_ID,
+            &mut iface,
+        )
+    };
+    if hr != 0 || iface.is_null() {
+        unsafe { (syms.IODestroyPlugInInterface)(plugin) };
+        return Err(DriveError::Mmc(format!(
+            "QueryInterface(kIOMMCDeviceInterfaceID) failed: 0x{hr:08x}"
+        )));
+    }
+    let iface = iface as *mut *mut MMCDeviceInterface;
+    Ok(MmcDevice {
+        syms,
+        iface,
+        plugin,
+    })
+}
+
+fn open_optical_device<'a>(
+    syms: &'a Symbols,
+    service: io_service_t,
+) -> Result<OpticalDevice<'a>, DriveError> {
+    // Wrap UUIDs into CFUUIDRef.
+    let plugin_uuid =
+        unsafe { (syms.CFUUIDCreateFromUUIDBytes)(ptr::null(), K_IO_CF_PLUGIN_INTERFACE_ID) };
+    if plugin_uuid.is_null() {
+        return Err(DriveError::Mmc(
+            "CFUUIDCreateFromUUIDBytes(kIOCFPlugInInterfaceID) returned NULL".to_string(),
+        ));
+    }
+    let plugin_uuid = CfRef {
+        syms,
+        ptr: plugin_uuid,
+    };
+
+    let scsi_type_uuid = unsafe {
+        (syms.CFUUIDCreateFromUUIDBytes)(ptr::null(), K_IO_SCSI_TASK_DEVICE_USER_CLIENT_TYPE_ID)
+    };
+    if scsi_type_uuid.is_null() {
+        return Err(DriveError::Mmc(
+            "CFUUIDCreateFromUUIDBytes(kIOSCSITaskDeviceUserClientTypeID) returned NULL"
+                .to_string(),
+        ));
+    }
+    let scsi_type_uuid = CfRef {
+        syms,
+        ptr: scsi_type_uuid,
+    };
+
+    let mmc_type_uuid = unsafe {
+        (syms.CFUUIDCreateFromUUIDBytes)(ptr::null(), K_IO_MMC_DEVICE_USER_CLIENT_TYPE_ID)
+    };
+    if mmc_type_uuid.is_null() {
+        return Err(DriveError::Mmc(
+            "CFUUIDCreateFromUUIDBytes(kIOMMCDeviceUserClientTypeID) returned NULL".to_string(),
+        ));
+    }
+    let mmc_type_uuid = CfRef {
+        syms,
+        ptr: mmc_type_uuid,
+    };
+
+    // The SCSITaskDeviceUserClient plugin factory is registered on the
+    // IOSCSIPeripheralDeviceTypeXX node (the SCSI-level nub), not on
+    // the IOBDServices / IODVDServices media-class node we matched via
+    // BSD name. Try the matched service first; if it answers
+    // `kIOReturnUnsupported`, walk up the IOService plane to the SCSI
+    // peripheral parent and retry. At each level, also try
+    // `kIOMMCDeviceUserClientTypeID` — on macOS 11+ the SCSITask
+    // factory is gated behind `com.apple.security.scsi` while the MMC
+    // factory remains open to unprivileged callers. Bounded by
+    // IOREG_MAX_PARENT_HOPS so we never loop indefinitely on a
+    // pathological registry.
+    const IOREG_MAX_PARENT_HOPS: usize = 6;
+    let mut current = service;
+    // Owned io_objects we created via IORegistryEntryGetParentEntry —
+    // we must release each before returning. The originally-passed
+    // `service` is the caller's; we don't release it.
+    let mut owned_parents: Vec<io_registry_entry_t> = Vec::new();
+    let plane = b"IOService\0";
+    let mut last_scsi_kr: kern_return_t = kIOReturnSuccess;
+    let mut last_mmc_kr: kern_return_t = kIOReturnSuccess;
+    let mut hops_visited: usize = 0;
+
+    for hop in 0..=IOREG_MAX_PARENT_HOPS {
+        hops_visited = hop + 1;
+        // Try SCSITaskDeviceUserClient first — when it works, the
+        // primary path is more deterministic (we own the CDB) and
+        // covers historical pre-Big-Sur deployments without needing the
+        // MMC fallback.
+        match unsafe { try_open_plugin(syms, current, scsi_type_uuid.ptr, plugin_uuid.ptr) } {
+            Ok(plugin) => {
+                for p in &owned_parents {
+                    unsafe { (syms.IOObjectRelease)(*p) };
+                }
+                let scsi = finalize_scsi_device(syms, plugin)?;
+                return Ok(OpticalDevice::Scsi(scsi));
+            }
+            Err(kr) => {
+                last_scsi_kr = kr;
+            }
+        }
+
+        // SCSITask path was rejected — try the MMC user client at the
+        // same node before climbing. This is the modern macOS fallback
+        // (kIOReturnUnsupported is the typical SCSITask response on
+        // post-Big-Sur drives without the security entitlement).
+        match unsafe { try_open_plugin(syms, current, mmc_type_uuid.ptr, plugin_uuid.ptr) } {
+            Ok(plugin) => {
+                for p in &owned_parents {
+                    unsafe { (syms.IOObjectRelease)(*p) };
+                }
+                let mmc = finalize_mmc_device(syms, plugin)?;
+                return Ok(OpticalDevice::Mmc(mmc));
+            }
+            Err(kr) => {
+                last_mmc_kr = kr;
+            }
+        }
+
+        // Climb to parent for the next attempt.
+        let mut parent: io_registry_entry_t = 0;
+        let pkr = unsafe {
+            (syms.IORegistryEntryGetParentEntry)(
+                current,
+                plane.as_ptr() as *const c_char,
+                &mut parent,
+            )
+        };
+        if pkr != kIOReturnSuccess || parent == 0 {
+            for p in &owned_parents {
+                unsafe { (syms.IOObjectRelease)(*p) };
+            }
+            return Err(DriveError::Mmc(format!(
+                "AACS Volume ID read failed: couldn't open any user-client plugin \
+                 at any level (tried kIOSCSITaskDeviceUserClientTypeID + \
+                 kIOMMCDeviceUserClientTypeID across {hv} parent hops; \
+                 last SCSI status 0x{ls:08x}, last MMC status 0x{lm:08x}; \
+                 parent walk terminated at hop {hop} with 0x{pkr:08x})",
+                hv = hops_visited,
+                ls = last_scsi_kr as u32,
+                lm = last_mmc_kr as u32,
+            )));
+        }
+        owned_parents.push(parent);
+        current = parent;
+    }
+
+    // Walked the full chain without success.
+    for p in &owned_parents {
+        unsafe { (syms.IOObjectRelease)(*p) };
+    }
+    Err(DriveError::Mmc(format!(
+        "AACS Volume ID read failed: couldn't open any user-client plugin \
+         at any level (tried kIOSCSITaskDeviceUserClientTypeID + \
+         kIOMMCDeviceUserClientTypeID across {hops_visited} parent hops; \
+         last SCSI status 0x{ls:08x}, last MMC status 0x{lm:08x})",
+        ls = last_scsi_kr as u32,
+        lm = last_mmc_kr as u32,
+    )))
 }
 
 /// Issue the READ DISC STRUCTURE (opcode `0xAD`, format `0x80`) command
@@ -982,6 +1240,73 @@ fn read_aacs_volume_id_buffer(dev: &ScsiDevice<'_>) -> Result<[u8; 36], DriveErr
 }
 
 // ---------------------------------------------------------------------------
+// MMCDevice plumbing
+// ---------------------------------------------------------------------------
+
+/// Call `MMCDeviceInterface::ReadDiscStructure` with the AACS Volume
+/// Identifier format (`0x80`) on a BD (`MEDIA_TYPE = 0x01`) and return
+/// the 36-byte response buffer. The layout — a 4-byte response header
+/// at `buf[0..4]` followed by the 16-byte Volume Identifier at
+/// `buf[4..20]` — matches the SCSITask path exactly because both
+/// invocations end up running the same MMC-level opcode; the MMC user
+/// client just brokers it for us instead of taking a raw CDB.
+fn read_aacs_volume_id_buffer_mmc(dev: &MmcDevice<'_>) -> Result<[u8; 36], DriveError> {
+    let mut data = [0u8; 36];
+    let mut sense = SCSI_Sense_Data::zeroed();
+    let mut task_status: u32 = 0;
+
+    let kr = unsafe {
+        ((**dev.iface).ReadDiscStructure)(
+            dev.iface as *mut c_void,
+            0x01,                             // MEDIA_TYPE: BD
+            0,                                // ADDRESS (n/a for format 0x80)
+            0,                                // LAYER_NUMBER
+            0x80,                             // FORMAT: AACS Volume Identifier
+            data.as_mut_ptr() as *mut c_void, // buffer
+            data.len() as UInt16,             // bufferSize (36)
+            &mut task_status,
+            &mut sense,
+        )
+    };
+    if kr != kIOReturnSuccess {
+        return Err(DriveError::Mmc(format!(
+            "MMCDeviceInterface::ReadDiscStructure (AACS Volume Identifier) \
+             failed: 0x{kr:08x}"
+        )));
+    }
+
+    if task_status != kSCSITaskStatus_GOOD {
+        if task_status == kSCSITaskStatus_CHECK_CONDITION {
+            return Err(DriveError::Mmc(format!(
+                "MMC ReadDiscStructure returned CHECK CONDITION (0x{:02x}), \
+                 sense KCQ {:02x}/{:02x}/{:02x} — \
+                 the drive may not support the AACS Volume Identifier format \
+                 (0x80) on this medium",
+                task_status,
+                sense.sense_key(),
+                sense.asc(),
+                sense.ascq()
+            )));
+        }
+        return Err(DriveError::Mmc(format!(
+            "MMC ReadDiscStructure returned task status 0x{task_status:02x}"
+        )));
+    }
+
+    // Same 2-byte big-endian response-length sanity check as the
+    // SCSITask path (see read_aacs_volume_id_buffer).
+    let resp_len = ((data[0] as u16) << 8) | (data[1] as u16);
+    if (resp_len as usize) < 18 {
+        return Err(DriveError::Mmc(format!(
+            "MMC ReadDiscStructure response header reports only {resp_len} \
+             bytes of payload (expected >= 18 for AACS Volume Identifier)"
+        )));
+    }
+
+    Ok(data)
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -993,8 +1318,11 @@ pub fn read_volume_id(disc_root: &Path) -> Result<[u8; 16], DriveError> {
         syms: &syms,
         obj: svc,
     };
-    let dev = open_scsi_device(&syms, svc_guard.obj)?;
-    let buf = read_aacs_volume_id_buffer(&dev)?;
+    let dev = open_optical_device(&syms, svc_guard.obj)?;
+    let buf = match dev {
+        OpticalDevice::Scsi(d) => read_aacs_volume_id_buffer(&d)?,
+        OpticalDevice::Mmc(d) => read_aacs_volume_id_buffer_mmc(&d)?,
+    };
     let mut out = [0u8; 16];
     out.copy_from_slice(&buf[4..20]);
     Ok(out)
@@ -1069,6 +1397,37 @@ mod tests {
                 0x05, 0x2A,
             ]
         );
+        assert_eq!(
+            K_IO_MMC_DEVICE_USER_CLIENT_TYPE_ID.bytes,
+            [
+                0x97, 0xAB, 0xCF, 0x2C, 0x23, 0xCC, 0x11, 0xD5, 0xA0, 0xE8, 0x00, 0x30, 0x65, 0x70,
+                0x48, 0x66,
+            ]
+        );
+        assert_eq!(
+            K_IO_MMC_DEVICE_INTERFACE_ID.bytes,
+            [
+                0x1F, 0x65, 0x11, 0x06, 0x23, 0xCC, 0x11, 0xD5, 0xBB, 0xDB, 0x00, 0x30, 0x65, 0x70,
+                0x48, 0x66,
+            ]
+        );
+    }
+
+    #[test]
+    fn mmc_vtable_slot_count_matches_sdk_header() {
+        // Slot 16 (ReadDiscStructure) is the highest method we model. A
+        // wrong field count would shift the typed function pointer and
+        // silently call into the wrong vtable entry — guard the
+        // computed size of MMCDeviceInterface to catch accidental
+        // additions/removals before the FFI call segfaults.
+        //
+        // Layout: 4 IUnknown ptrs (32 B on LP64) + 2x UInt16 + 2-byte
+        // pad to ptr alignment + 17 fn-pointer slots (= 17 * 8 B on
+        // LP64) = 8 + 24 + 4*8 = ... easier to just assert it's exactly
+        // the same as if we listed 17 raw pointers, since every slot
+        // (typed or opaque) lowers to a single pointer.
+        let expected = std::mem::size_of::<usize>() * (4 + 17) + 8 /* version+revision+pad */;
+        assert_eq!(std::mem::size_of::<MMCDeviceInterface>(), expected);
     }
 
     #[test]
