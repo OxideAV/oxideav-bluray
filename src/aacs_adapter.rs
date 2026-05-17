@@ -89,25 +89,65 @@ pub fn try_resolve_aacs(disc_root: &Path) -> std::io::Result<Option<Box<dyn Stre
 
     let keydb = match KeyDb::load_default() {
         Ok(k) if !k.is_empty() => k,
-        _ => return Ok(None),
+        Ok(_) => {
+            eprintln!(
+                "oxideav-bluray: AACS resolution skipped — KEYDB.cfg \
+                 loaded but parsed to zero entries (set \
+                 OXIDEAV_AACS_DEBUG=1 to see per-line parse skips)."
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            eprintln!(
+                "oxideav-bluray: AACS resolution skipped — KEYDB.cfg \
+                 not found: {e}. Checked, in order: $OXIDEAV_AACS_KEYDB, \
+                 ~/Library/Preferences/aacs/KEYDB.cfg, \
+                 $XDG_CONFIG_HOME/aacs/KEYDB.cfg, $XDG_CONFIG_DIRS/<dir>/aacs/KEYDB.cfg, \
+                 ~/.config/aacs/KEYDB.cfg."
+            );
+            return Ok(None);
+        }
     };
 
     // Early-bail: confirm AACS metadata at least parses before we
     // spin up the per-VUK trial loop. Discarded; each loop iteration
     // re-opens because unwrap_title_keys mutates the volume in place
     // and AacsVolume isn't Clone.
-    if AacsVolume::open(disc_root).is_err() {
+    if let Err(e) = AacsVolume::open(disc_root) {
+        eprintln!("oxideav-bluray: AACS volume open failed: {e}");
         return Ok(None);
     }
 
     // First .m2ts clip on disc — used as the trial-decrypt oracle.
     let first_m2ts = match find_first_m2ts(disc_root) {
         Some(p) => p,
-        None => return Ok(None),
+        None => {
+            eprintln!(
+                "oxideav-bluray: AACS resolution skipped — no .m2ts \
+                 file found under BDMV/STREAM/"
+            );
+            return Ok(None);
+        }
     };
     let trial_sample = match std::fs::read(&first_m2ts) {
         Ok(b) if b.len() >= AACS_UNIT_LEN => b[..AACS_UNIT_LEN].to_vec(),
-        _ => return Ok(None),
+        Ok(b) => {
+            eprintln!(
+                "oxideav-bluray: AACS trial-decrypt skipped — {} is \
+                 only {} bytes (< AACS Aligned Unit {})",
+                first_m2ts.display(),
+                b.len(),
+                AACS_UNIT_LEN
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            eprintln!(
+                "oxideav-bluray: AACS trial-decrypt skipped — failed to read {}: {e}",
+                first_m2ts.display()
+            );
+            return Ok(None);
+        }
     };
 
     let mut tried = 0usize;
