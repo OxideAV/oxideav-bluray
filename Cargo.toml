@@ -1,0 +1,29 @@
+[package]
+name = "oxideav-bluray"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles <admin@echelle.co.jp>"]
+description = "Read-only Blu-ray Disc (BD-ROM) UDF mount + BDMV directory walk + playlist (.mpls / .clpi) parsing + .m2ts streaming — clean-room per BDA whitepapers + ECMA-167"
+repository = "https://github.com/OxideAV/oxideav-bluray"
+homepage = "https://github.com/OxideAV/oxideav-bluray"
+readme = "README.md"
+keywords = ["bluray", "bdmv", "udf", "m2ts", "mpls"]
+categories = ["multimedia", "filesystem", "parser-implementations"]
+
+[features]
+default = ["registry"]
+
+# `registry` wires up the `bluray://` source driver against
+# `oxideav-core::SourceRegistry` so this crate plugs into the broader
+# oxideav framework. Drop it (`default-features = false`) for a
+# free-standing build that only exposes the UDF mounter + BDMV parsers
+# + `Disc` / `TitleSource` API without the framework dependency tree.
+registry = ["dep:oxideav-core"]
+
+[dependencies]
+# Optional under the `registry` feature so consumers can depend on
+# `oxideav-bluray` with `default-features = false` and avoid the
+# framework dependency tree entirely.
+oxideav-core = { version = "0.1", optional = true }
