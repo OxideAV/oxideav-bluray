@@ -20,7 +20,7 @@
 
 use crate::decrypt::{DecryptError, StreamDecryptor};
 use crate::m2ts::M2TS_PACKET_LEN;
-use oxideav_aacs::{AacsVolume, KeyDb};
+use oxideav_aacs::{AacsVolume, CpsUnit, KeyDb, TitleKey};
 use std::path::Path;
 
 /// AES-128-CBC AACS Aligned Unit length (= 6144 bytes), per AACS
@@ -110,29 +110,67 @@ pub fn try_resolve_aacs(disc_root: &Path) -> std::io::Result<Option<Box<dyn Stre
         _ => return Ok(None),
     };
 
+    let mut tried = 0usize;
     for entry in keydb.entries() {
         let mut v_try = match AacsVolume::open(disc_root) {
             Ok(v) => v,
             Err(_) => return Ok(None),
         };
-        if v_try.unwrap_title_keys(&entry.vuk).is_err() {
+
+        // If the KEYDB.cfg line supplied pre-unwrapped Unit Keys
+        // (libbluray extended format), inject them directly into each
+        // CpsUnit and skip the VUK→title-key unwrap step. Otherwise
+        // unwrap from the VUK via AES-128-ECB.
+        if !entry.unit_keys.is_empty() {
+            for (id, key) in &entry.unit_keys {
+                if let Some(cps) = v_try
+                    .cps_units
+                    .iter_mut()
+                    .find(|c: &&mut CpsUnit| c.id == *id)
+                {
+                    cps.title_key = Some(TitleKey(*key));
+                }
+            }
+        } else if v_try.unwrap_title_keys(&entry.vuk).is_err() {
             continue;
         }
-        let cps = match v_try.cps_units.first() {
-            Some(c) => c,
-            None => continue,
-        };
-        let mut buf = trial_sample.clone();
-        let decrypted = match v_try.decrypt_unit(cps, &buf) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        buf.copy_from_slice(&decrypted);
-        if looks_like_bdav_ts(&buf) {
-            return Ok(Some(Box::new(AacsDecryptor { volume: v_try })));
+
+        // Try every CPS Unit's title key against the trial sample —
+        // different clips on the same disc are encrypted under
+        // different CPS Units, and we don't know yet which one wraps
+        // the first .m2ts. First that yields a valid BD-AV TS sync
+        // pattern wins.
+        for cps_idx in 0..v_try.cps_units.len() {
+            tried += 1;
+            let cps = v_try.cps_units[cps_idx];
+            if cps.title_key.is_none() {
+                continue;
+            }
+            let mut buf = trial_sample.clone();
+            let decrypted = match v_try.decrypt_unit(&cps, &buf) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            buf.copy_from_slice(&decrypted);
+            if looks_like_bdav_ts(&buf) {
+                return Ok(Some(Box::new(AacsDecryptor { volume: v_try })));
+            }
         }
     }
 
+    eprintln!(
+        "oxideav-bluray: AACS resolution failed. Tried {} CPS-unit × VUK \
+         combinations against {}; none produced a valid BD-AV TS sync \
+         pattern. Diagnostics: \
+         {} KEYDB.cfg entries loaded, {} CPS Units on the disc.",
+        tried,
+        first_m2ts.display(),
+        keydb.len(),
+        match AacsVolume::open(disc_root) {
+            Ok(v) => v.cps_units.len(),
+            Err(_) => 0,
+        }
+    );
     Ok(None)
 }
 
