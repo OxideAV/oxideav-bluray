@@ -290,6 +290,11 @@ type Fn_IOCreatePlugInInterfaceForService = unsafe extern "C" fn(
 ) -> kern_return_t;
 type Fn_IODestroyPlugInInterface =
     unsafe extern "C" fn(*mut *mut IOCFPlugInInterface) -> kern_return_t;
+type Fn_IORegistryEntryGetParentEntry = unsafe extern "C" fn(
+    io_registry_entry_t,
+    *const c_char,
+    *mut io_registry_entry_t,
+) -> kern_return_t;
 type Fn_CFRelease = unsafe extern "C" fn(CFTypeRef);
 type Fn_CFStringCreateWithCString =
     unsafe extern "C" fn(CFAllocatorRef, *const c_char, CFStringEncoding) -> CFStringRef;
@@ -310,6 +315,7 @@ struct Symbols {
     IORegistryEntrySearchCFProperty: Fn_IORegistryEntrySearchCFProperty,
     IOCreatePlugInInterfaceForService: Fn_IOCreatePlugInInterfaceForService,
     IODestroyPlugInInterface: Fn_IODestroyPlugInInterface,
+    IORegistryEntryGetParentEntry: Fn_IORegistryEntryGetParentEntry,
 
     CFRelease: Fn_CFRelease,
     CFStringCreateWithCString: Fn_CFStringCreateWithCString,
@@ -372,6 +378,11 @@ impl Symbols {
                     &iokit,
                     b"IODestroyPlugInInterface\0",
                     "IODestroyPlugInInterface",
+                )?,
+                IORegistryEntryGetParentEntry: get(
+                    &iokit,
+                    b"IORegistryEntryGetParentEntry\0",
+                    "IORegistryEntryGetParentEntry",
                 )?,
 
                 CFRelease: get(&cf, b"CFRelease\0", "CFRelease")?,
@@ -723,21 +734,70 @@ fn open_scsi_device<'a>(
         ptr: dev_type_uuid,
     };
 
+    // The SCSITaskDeviceUserClient plugin factory is registered on the
+    // IOSCSIPeripheralDeviceTypeXX node (the SCSI-level nub), not on
+    // the IOBDServices / IODVDServices media-class node we matched via
+    // BSD name. Try the matched service first; if it answers
+    // `kIOReturnUnsupported`, walk up the IOService plane to the SCSI
+    // peripheral parent and retry. Bounded by IOREG_MAX_PARENT_HOPS so
+    // we never loop indefinitely on a pathological registry.
+    const IOREG_MAX_PARENT_HOPS: usize = 6;
     let mut plugin: *mut *mut IOCFPlugInInterface = ptr::null_mut();
     let mut score: SInt32 = 0;
-    let kr = unsafe {
-        (syms.IOCreatePlugInInterfaceForService)(
-            service,
-            dev_type_uuid.ptr,
-            plugin_uuid.ptr,
-            &mut plugin,
-            &mut score,
-        )
-    };
-    if kr != kIOReturnSuccess || plugin.is_null() {
+    let mut current = service;
+    // Owned io_objects we created via IORegistryEntryGetParentEntry —
+    // we must release each before returning. The originally-passed
+    // `service` is the caller's; we don't release it.
+    let mut owned_parents: Vec<io_registry_entry_t> = Vec::new();
+    let plane = b"IOService\0";
+    let mut last_kr: kern_return_t = kIOReturnSuccess;
+    for hop in 0..=IOREG_MAX_PARENT_HOPS {
+        let kr = unsafe {
+            (syms.IOCreatePlugInInterfaceForService)(
+                current,
+                dev_type_uuid.ptr,
+                plugin_uuid.ptr,
+                &mut plugin,
+                &mut score,
+            )
+        };
+        last_kr = kr;
+        if kr == kIOReturnSuccess && !plugin.is_null() {
+            break;
+        }
+        // Climb to parent for the next attempt.
+        let mut parent: io_registry_entry_t = 0;
+        let pkr = unsafe {
+            (syms.IORegistryEntryGetParentEntry)(
+                current,
+                plane.as_ptr() as *const c_char,
+                &mut parent,
+            )
+        };
+        if pkr != kIOReturnSuccess || parent == 0 {
+            for p in &owned_parents {
+                unsafe { (syms.IOObjectRelease)(*p) };
+            }
+            return Err(DriveError::Mmc(format!(
+                "IOCreatePlugInInterfaceForService(kIOSCSITaskDeviceUserClientTypeID) \
+                 failed at every parent hop (0..={hop}): last status 0x{kr:08x}; \
+                 final parent walk: 0x{pkr:08x}"
+            )));
+        }
+        owned_parents.push(parent);
+        current = parent;
+    }
+    // Release the parent chain — IOCreatePlugInInterfaceForService
+    // doesn't retain the service, so the io_object_t is no longer
+    // needed once the plugin handle is alive.
+    for p in &owned_parents {
+        unsafe { (syms.IOObjectRelease)(*p) };
+    }
+    if plugin.is_null() {
         return Err(DriveError::Mmc(format!(
             "IOCreatePlugInInterfaceForService(kIOSCSITaskDeviceUserClientTypeID) \
-             failed: 0x{kr:08x}"
+             returned NULL after walking up to {IOREG_MAX_PARENT_HOPS} parents; \
+             last kern_return_t was 0x{last_kr:08x}"
         )));
     }
 
