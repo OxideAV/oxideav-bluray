@@ -158,18 +158,60 @@ pub fn try_resolve_aacs(disc_root: &Path) -> std::io::Result<Option<Box<dyn Stre
         }
     }
 
+    // Dump every actionable diagnostic to stderr so the user can see
+    // at a glance whether (a) KEYDB.cfg loaded, (b) which entries it
+    // holds, (c) what's in the disc's AACS/ directory, (d) what the
+    // disc's Content Certificate's leading 20 bytes look like (which
+    // is the conventional source of the libbluray disc_id).
+    eprintln!("oxideav-bluray: AACS resolution failed.");
     eprintln!(
-        "oxideav-bluray: AACS resolution failed. Tried {} CPS-unit × VUK \
-         combinations against {}; none produced a valid BD-AV TS sync \
-         pattern. Diagnostics: \
-         {} KEYDB.cfg entries loaded, {} CPS Units on the disc.",
-        tried,
-        first_m2ts.display(),
-        keydb.len(),
-        match AacsVolume::open(disc_root) {
-            Ok(v) => v.cps_units.len(),
-            Err(_) => 0,
+        "  Tried {tried} CPS-unit × VUK combinations against {}; none \
+         produced a valid BD-AV TS sync pattern.",
+        first_m2ts.display()
+    );
+    eprintln!("  KEYDB.cfg: {} entries loaded", keydb.len());
+    for entry in keydb.entries() {
+        let id_hex = entry
+            .disc_id
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<String>();
+        eprintln!(
+            "    {id_hex} (vuk {:02X}{:02X}…{:02X}{:02X}, {} unit keys, label {:?})",
+            entry.vuk.as_bytes()[0],
+            entry.vuk.as_bytes()[1],
+            entry.vuk.as_bytes()[14],
+            entry.vuk.as_bytes()[15],
+            entry.unit_keys.len(),
+            entry.label.as_deref().unwrap_or("")
+        );
+    }
+    eprintln!("  Disc AACS/ contents:");
+    if let Ok(entries) = std::fs::read_dir(disc_root.join("AACS")) {
+        for e in entries.flatten() {
+            let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+            eprintln!("    {} ({len} bytes)", e.file_name().to_string_lossy());
         }
+    }
+    // Content_Certificate.cer is where the disc_id conventionally
+    // lives; print the leading 40 hex bytes so the user can spot
+    // a mismatch with KEYDB.cfg.
+    let cert_path = disc_root.join("AACS").join("Content_Certificate.cer");
+    if let Ok(bytes) = std::fs::read(&cert_path) {
+        let n = bytes.len().min(40);
+        let hex: String = bytes[..n]
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        eprintln!("  Content_Certificate.cer head ({n}): {hex}");
+    } else {
+        eprintln!(
+            "  Content_Certificate.cer: not readable at {}",
+            cert_path.display()
+        );
+    }
+    eprintln!(
+        "  (Set OXIDEAV_AACS_DEBUG=1 to see KEYDB.cfg per-line parse traces.)"
     );
     Ok(None)
 }
