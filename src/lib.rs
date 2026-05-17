@@ -67,6 +67,8 @@ pub mod aacs_adapter;
 pub mod bdmv;
 pub mod decrypt;
 pub mod disc;
+#[cfg(feature = "aacs")]
+pub mod drive;
 pub mod error;
 pub mod m2ts;
 pub mod source;

@@ -1,39 +1,44 @@
 //! AACS [`StreamDecryptor`] adapter — bridges the bluray crate's
-//! decryption hook to `oxideav-aacs`. Built behind the `aacs` cargo
-//! feature so consumers that only need BD-R / unprotected playback
-//! can skip the dep.
+//! decryption hook to `oxideav-aacs`.
 //!
-//! Usage flow per AACS Common 0.953 + BD-Prerecorded 0.953:
-//!   1. Mount the disc + locate `AACS/` directory.
-//!   2. Open `AacsVolume` (parses `MKB_RO.inf` + `Unit_Key_RO.inf`).
-//!   3. Resolve a VUK from `KEYDB.cfg`. The KEYDB format keys entries
-//!      by the 20-byte Content-Certificate disc ID, which we don't
-//!      parse yet (the `.cer` file is out of scope for the current
-//!      aacs round). Instead we try each KeyDb entry's VUK in turn,
-//!      unwrap the first CPS Unit's title key with it, attempt to
-//!      decrypt the first Aligned Unit of the first .m2ts clip, and
-//!      check for the BD-AV TS sync-byte pattern (`0x47` every 192
-//!      bytes within the unit, post-decryption). The first VUK that
-//!      produces a valid sync pattern wins.
-//!   4. Wrap the resulting `AacsVolume` (with unwrapped title keys)
-//!      as an `AacsDecryptor` and hand it to `Disc::open_title`.
+//! Flow per AACS Common 0.953 + BD-Prerecorded 0.953:
+//!   1. Mount the disc.
+//!   2. Ask the drive for the 16-byte AACS Volume Identifier via
+//!      [`crate::drive::read_volume_id`] (per AACS Common §3.3 the
+//!      Volume Identifier is stored in the BD-ROM Mark — physically
+//!      protected, not accessible through the filesystem). The drive
+//!      query goes through a platform-specific MMC `READ DISC
+//!      STRUCTURE` command (opcode `0xAD`, format `0x80`).
+//!   3. Derive the libbluray-style 20-byte disc ID:
+//!      `disc_id = SHA-1(volume_id)` via
+//!      [`oxideav_aacs::vuk::disc_id_for_volume_id`].
+//!   4. Stream-scan KEYDB.cfg line-by-line for that exact disc ID —
+//!      no full-file parse, no memory blow-up.
+//!   5. Parse only the matching line via `KeyDb::parse(single_line)`,
+//!      apply its VUK or pre-unwrapped Unit Keys to a freshly-opened
+//!      `AacsVolume`, verify by trial-decrypting the first .m2ts
+//!      Aligned Unit and checking for the BD-AV TS sync pattern.
 
 use crate::decrypt::{DecryptError, StreamDecryptor};
+use crate::drive::{self, DriveError};
 use crate::m2ts::M2TS_PACKET_LEN;
-use oxideav_aacs::{AacsVolume, CpsUnit, KeyDb, TitleKey};
-use std::path::Path;
+use oxideav_aacs::keydb::KeyDbEntry;
+use oxideav_aacs::vuk::disc_id_for_volume_id;
+use oxideav_aacs::{AacsVolume, KeyDb, TitleKey};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 
 /// AES-128-CBC AACS Aligned Unit length (= 6144 bytes), per AACS
-/// Common 0.953 §3.7. Mirrors the constant our `m2ts` module + the
-/// `oxideav_aacs` crate define independently.
+/// Common 0.953 §3.7.
 pub const AACS_UNIT_LEN: usize = 6144;
 
+/// Length of the libbluray-style 20-byte KEYDB.cfg disc identifier.
+/// Derived as `SHA-1(AACS Volume Identifier)` per
+/// [`oxideav_aacs::vuk::disc_id_for_volume_id`].
+const DISC_ID_LEN: usize = 20;
+
 /// [`StreamDecryptor`] backed by an [`AacsVolume`] whose CPS Unit
-/// title keys have already been unwrapped. Phase-1 BD-ROM playback
-/// uses CPS Unit 1 (the "main" feature unit) for every clip; multi-
-/// CPS-Unit titles (e.g. studio bonus content with separate keys
-/// per playlist) will surface as a Phase-2 follow-up that needs the
-/// playlist's CPS Unit assignments threaded through `TitleSource`.
+/// title keys have already been unwrapped.
 pub struct AacsDecryptor {
     volume: AacsVolume,
 }
@@ -73,59 +78,107 @@ impl StreamDecryptor for AacsDecryptor {
     }
 }
 
-/// Try every VUK in `keydb` against the first CPS unit; pick the
-/// first whose decryption of one Aligned Unit of `STREAM/<first_clip>.m2ts`
-/// produces a valid BD-AV TS sync pattern (`0x47` every 192 bytes).
-///
-/// Returns `Ok(Some(decryptor))` on success, `Ok(None)` if no VUK
-/// matched (caller falls back to Identity, which usually means the
-/// pipeline will fail to find packet sync later — that's the user's
-/// cue to fix their KEYDB.cfg). `Err` only on AACS-file-parse errors.
+/// Resolve AACS by querying the drive for the Volume Identifier,
+/// hashing it to the libbluray disc_id, and looking up KEYDB.cfg.
+/// Returns `Ok(None)` cleanly on every failure path with an
+/// actionable stderr line.
 pub fn try_resolve_aacs(disc_root: &Path) -> std::io::Result<Option<Box<dyn StreamDecryptor>>> {
-    // Disc has no AACS/ directory ⇒ not protected; skip cleanly.
     if !disc_root.join("AACS").is_dir() {
         return Ok(None);
     }
+    let debug = std::env::var_os("OXIDEAV_AACS_DEBUG").is_some();
 
-    let keydb = match KeyDb::load_default() {
-        Ok(k) if !k.is_empty() => k,
-        Ok(_) => {
-            eprintln!(
-                "oxideav-bluray: AACS resolution skipped — KEYDB.cfg \
-                 loaded but parsed to zero entries (set \
-                 OXIDEAV_AACS_DEBUG=1 to see per-line parse skips)."
-            );
+    // Step 1 — ask the drive for the AACS Volume Identifier (BD-ROM
+    // Mark, per AACS Common §3.3; only obtainable via MMC `READ
+    // DISC STRUCTURE` opcode 0xAD format 0x80, OR via the
+    // OXIDEAV_AACS_VOLUME_ID env override for now).
+    let volume_id = match drive::read_volume_id(disc_root) {
+        Ok(v) => v,
+        Err(DriveError::Mmc(msg)) => {
+            eprintln!("oxideav-bluray: AACS Volume ID read failed: {msg}");
             return Ok(None);
         }
         Err(e) => {
+            eprintln!("oxideav-bluray: AACS Volume ID read failed: {e}");
+            return Ok(None);
+        }
+    };
+    let disc_id = disc_id_for_volume_id(&volume_id);
+    let disc_id_hex = hex_id(&disc_id);
+    if debug {
+        let vol_hex: String = volume_id.iter().map(|b| format!("{b:02X}")).collect();
+        eprintln!("oxideav-bluray: AACS Volume ID 0x{vol_hex} → disc_id (SHA-1) {disc_id_hex}");
+    }
+
+    // Step 2 — locate KEYDB.cfg and stream-scan for ONE matching line.
+    let keydb_path = match find_keydb_path() {
+        Some(p) => p,
+        None => {
             eprintln!(
-                "oxideav-bluray: AACS resolution skipped — KEYDB.cfg \
-                 not found: {e}. Checked, in order: $OXIDEAV_AACS_KEYDB, \
-                 ~/Library/Preferences/aacs/KEYDB.cfg, \
-                 $XDG_CONFIG_HOME/aacs/KEYDB.cfg, $XDG_CONFIG_DIRS/<dir>/aacs/KEYDB.cfg, \
+                "oxideav-bluray: AACS resolution skipped — KEYDB.cfg not found. \
+                 Checked: $OXIDEAV_AACS_KEYDB, \
+                 ~/Library/Preferences/aacs/KEYDB.cfg (macOS), \
+                 $XDG_CONFIG_HOME/aacs/KEYDB.cfg, \
+                 $XDG_CONFIG_DIRS/<dir>/aacs/KEYDB.cfg, \
                  ~/.config/aacs/KEYDB.cfg."
             );
             return Ok(None);
         }
     };
+    let line = match scan_keydb_for_line(&keydb_path, &disc_id, debug)? {
+        Some(l) => l,
+        None => {
+            eprintln!(
+                "oxideav-bluray: no KEYDB.cfg entry for disc ID {disc_id_hex} \
+                 (searched {}). Either the disc-ID derivation we use is wrong \
+                 for this AACS version (please report the cert head[0..64] \
+                 shown with OXIDEAV_AACS_DEBUG=1), or KEYDB.cfg simply lacks \
+                 a line for this disc.",
+                keydb_path.display()
+            );
+            return Ok(None);
+        }
+    };
 
-    // Early-bail: confirm AACS metadata at least parses before we
-    // spin up the per-VUK trial loop. Discarded; each loop iteration
-    // re-opens because unwrap_title_keys mutates the volume in place
-    // and AacsVolume isn't Clone.
-    if let Err(e) = AacsVolume::open(disc_root) {
-        eprintln!("oxideav-bluray: AACS volume open failed: {e}");
-        return Ok(None);
+    // Step 3 — parse the matched line.
+    let mini = KeyDb::parse(&line).map_err(std::io::Error::other)?;
+    let entry: KeyDbEntry = match mini.entries().next() {
+        Some(e) => e.clone(),
+        None => {
+            eprintln!(
+                "oxideav-bluray: matched KEYDB.cfg line for {disc_id_hex} did \
+                 not parse cleanly. Line: {line}"
+            );
+            return Ok(None);
+        }
+    };
+    if debug {
+        eprintln!(
+            "oxideav-bluray: matched KEYDB entry — vuk {:02X}{:02X}…{:02X}{:02X}, \
+             {} pre-unwrapped unit keys",
+            entry.vuk.as_bytes()[0],
+            entry.vuk.as_bytes()[1],
+            entry.vuk.as_bytes()[14],
+            entry.vuk.as_bytes()[15],
+            entry.unit_keys.len()
+        );
     }
 
-    // First .m2ts clip on disc — used as the trial-decrypt oracle.
+    // Step 4 — open AACS volume, apply keys.
+    let mut volume = match AacsVolume::open(disc_root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("oxideav-bluray: AACS volume open failed: {e}");
+            return Ok(None);
+        }
+    };
+    apply_entry_to_volume(&entry, &mut volume);
+
+    // Step 5 — verify by trial-decrypting the first .m2ts.
     let first_m2ts = match find_first_m2ts(disc_root) {
         Some(p) => p,
         None => {
-            eprintln!(
-                "oxideav-bluray: AACS resolution skipped — no .m2ts \
-                 file found under BDMV/STREAM/"
-            );
+            eprintln!("oxideav-bluray: no .m2ts file found under BDMV/STREAM/");
             return Ok(None);
         }
     };
@@ -133,122 +186,155 @@ pub fn try_resolve_aacs(disc_root: &Path) -> std::io::Result<Option<Box<dyn Stre
         Ok(b) if b.len() >= AACS_UNIT_LEN => b[..AACS_UNIT_LEN].to_vec(),
         Ok(b) => {
             eprintln!(
-                "oxideav-bluray: AACS trial-decrypt skipped — {} is \
-                 only {} bytes (< AACS Aligned Unit {})",
+                "oxideav-bluray: {} too short ({} bytes) for one AACS Aligned Unit",
                 first_m2ts.display(),
-                b.len(),
-                AACS_UNIT_LEN
+                b.len()
             );
             return Ok(None);
         }
         Err(e) => {
             eprintln!(
-                "oxideav-bluray: AACS trial-decrypt skipped — failed to read {}: {e}",
+                "oxideav-bluray: failed to read {}: {e}",
                 first_m2ts.display()
             );
             return Ok(None);
         }
     };
 
-    let mut tried = 0usize;
-    for entry in keydb.entries() {
-        let mut v_try = match AacsVolume::open(disc_root) {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
-        };
-
-        // If the KEYDB.cfg line supplied pre-unwrapped Unit Keys
-        // (libbluray extended format), inject them directly into each
-        // CpsUnit and skip the VUK→title-key unwrap step. Otherwise
-        // unwrap from the VUK via AES-128-ECB.
-        if !entry.unit_keys.is_empty() {
-            for (id, key) in &entry.unit_keys {
-                if let Some(cps) = v_try
-                    .cps_units
-                    .iter_mut()
-                    .find(|c: &&mut CpsUnit| c.id == *id)
-                {
-                    cps.title_key = Some(TitleKey(*key));
-                }
-            }
-        } else if v_try.unwrap_title_keys(&entry.vuk).is_err() {
+    for cps_idx in 0..volume.cps_units.len() {
+        let cps = volume.cps_units[cps_idx];
+        if cps.title_key.is_none() {
             continue;
         }
+        let mut buf = trial_sample.clone();
+        let decrypted = match volume.decrypt_unit(&cps, &buf) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        buf.copy_from_slice(&decrypted);
+        if looks_like_bdav_ts(&buf) {
+            if debug {
+                eprintln!(
+                    "oxideav-bluray: AACS verified with CPS Unit {} ({} CPS units total)",
+                    cps.id,
+                    volume.cps_units.len()
+                );
+            }
+            return Ok(Some(Box::new(AacsDecryptor { volume })));
+        }
+    }
 
-        // Try every CPS Unit's title key against the trial sample —
-        // different clips on the same disc are encrypted under
-        // different CPS Units, and we don't know yet which one wraps
-        // the first .m2ts. First that yields a valid BD-AV TS sync
-        // pattern wins.
-        for cps_idx in 0..v_try.cps_units.len() {
-            tried += 1;
-            let cps = v_try.cps_units[cps_idx];
-            if cps.title_key.is_none() {
+    eprintln!(
+        "oxideav-bluray: matched KEYDB entry for {disc_id_hex} but no CPS unit's \
+         title key produced a valid BD-AV TS sync pattern. Keys may be stale."
+    );
+    Ok(None)
+}
+
+/// Apply a [`KeyDbEntry`]'s keys to an [`AacsVolume`]. If the entry
+/// supplied pre-unwrapped Unit Keys (libbluray extended format), use
+/// those directly. Otherwise AES-128-ECB-unwrap each CPS Unit's
+/// encrypted title key with the VUK.
+fn apply_entry_to_volume(entry: &KeyDbEntry, volume: &mut AacsVolume) {
+    if !entry.unit_keys.is_empty() {
+        for cps in volume.cps_units.iter_mut() {
+            cps.title_key = entry
+                .unit_keys
+                .iter()
+                .find(|(id, _)| *id == cps.id)
+                .map(|(_, k)| TitleKey(*k));
+        }
+    } else {
+        let _ = volume.unwrap_title_keys(&entry.vuk);
+    }
+}
+
+/// Stream-scan `keydb_path` line-by-line for a leading 40-hex disc ID
+/// equal to `disc_id`. Streaming = at most one line in memory at a
+/// time; the KEYDB file size is unbounded by design.
+fn scan_keydb_for_line(
+    keydb_path: &Path,
+    disc_id: &[u8; DISC_ID_LEN],
+    debug: bool,
+) -> std::io::Result<Option<String>> {
+    let target_hex = hex_id(disc_id);
+    let f = std::fs::File::open(keydb_path)?;
+    let reader = BufReader::new(f);
+    let mut scanned = 0usize;
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with(';') {
+            continue;
+        }
+        scanned += 1;
+        let leading = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        if leading.len() < 40 {
+            continue;
+        }
+        if leading[..40].eq_ignore_ascii_case(&target_hex) {
+            if debug {
+                eprintln!("oxideav-bluray: KEYDB line match after scanning {scanned} lines");
+            }
+            return Ok(Some(line));
+        }
+    }
+    if debug {
+        eprintln!(
+            "oxideav-bluray: scanned all {scanned} candidate lines in {}; no match",
+            keydb_path.display()
+        );
+    }
+    Ok(None)
+}
+
+/// Returns the first KEYDB-search path that exists. Mirrors
+/// `KeyDb::load_default`'s order but stops before reading.
+fn find_keydb_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("OXIDEAV_AACS_KEYDB") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(home) = std::env::var("HOME") {
+        let pb = PathBuf::from(home).join("Library/Preferences/aacs/KEYDB.cfg");
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        let pb = PathBuf::from(xdg).join("aacs/KEYDB.cfg");
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    if let Ok(dirs) = std::env::var("XDG_CONFIG_DIRS") {
+        for d in dirs.split(':') {
+            if d.is_empty() {
                 continue;
             }
-            let mut buf = trial_sample.clone();
-            let decrypted = match v_try.decrypt_unit(&cps, &buf) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            buf.copy_from_slice(&decrypted);
-            if looks_like_bdav_ts(&buf) {
-                return Ok(Some(Box::new(AacsDecryptor { volume: v_try })));
+            let pb = PathBuf::from(d).join("aacs/KEYDB.cfg");
+            if pb.exists() {
+                return Some(pb);
             }
         }
     }
-
-    // Dump every actionable diagnostic to stderr so the user can see
-    // at a glance whether (a) KEYDB.cfg loaded, (b) which entries it
-    // holds, (c) what's in the disc's AACS/ directory, (d) what the
-    // disc's Content Certificate's leading 20 bytes look like (which
-    // is the conventional source of the libbluray disc_id).
-    eprintln!("oxideav-bluray: AACS resolution failed.");
-    eprintln!(
-        "  Tried {tried} CPS-unit × VUK combinations against {}; none \
-         produced a valid BD-AV TS sync pattern.",
-        first_m2ts.display()
-    );
-    eprintln!("  KEYDB.cfg: {} entries loaded", keydb.len());
-    for entry in keydb.entries() {
-        let id_hex = entry
-            .disc_id
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<String>();
-        eprintln!(
-            "    {id_hex} (vuk {:02X}{:02X}…{:02X}{:02X}, {} unit keys, label {:?})",
-            entry.vuk.as_bytes()[0],
-            entry.vuk.as_bytes()[1],
-            entry.vuk.as_bytes()[14],
-            entry.vuk.as_bytes()[15],
-            entry.unit_keys.len(),
-            entry.label.as_deref().unwrap_or("")
-        );
-    }
-    eprintln!("  Disc AACS/ contents:");
-    if let Ok(entries) = std::fs::read_dir(disc_root.join("AACS")) {
-        for e in entries.flatten() {
-            let len = e.metadata().map(|m| m.len()).unwrap_or(0);
-            eprintln!("    {} ({len} bytes)", e.file_name().to_string_lossy());
+    if let Ok(home) = std::env::var("HOME") {
+        let pb = PathBuf::from(home).join(".config/aacs/KEYDB.cfg");
+        if pb.exists() {
+            return Some(pb);
         }
     }
-    // Content_Certificate.cer is where the disc_id conventionally
-    // lives; print the leading 40 hex bytes so the user can spot
-    // a mismatch with KEYDB.cfg.
-    let cert_path = disc_root.join("AACS").join("Content_Certificate.cer");
-    if let Ok(bytes) = std::fs::read(&cert_path) {
-        let n = bytes.len().min(40);
-        let hex: String = bytes[..n].iter().map(|b| format!("{b:02X}")).collect();
-        eprintln!("  Content_Certificate.cer head ({n}): {hex}");
-    } else {
-        eprintln!(
-            "  Content_Certificate.cer: not readable at {}",
-            cert_path.display()
-        );
-    }
-    eprintln!("  (Set OXIDEAV_AACS_DEBUG=1 to see KEYDB.cfg per-line parse traces.)");
-    Ok(None)
+    None
+}
+
+fn hex_id(id: &[u8; DISC_ID_LEN]) -> String {
+    id.iter().map(|b| format!("{b:02X}")).collect()
 }
 
 /// Walk `BDMV/STREAM/` for the lowest-numbered `*.m2ts` file.
@@ -262,11 +348,10 @@ fn find_first_m2ts(disc_root: &Path) -> Option<std::path::PathBuf> {
         .find(|p| p.extension().and_then(|e| e.to_str()) == Some("m2ts"))
 }
 
-/// Heuristic: in a decrypted BD-AV Aligned Unit, each 192-byte
-/// source packet is `4-byte TP_extra_header + 188-byte TS packet`,
-/// and a TS packet begins with the `0x47` sync byte. Check that
-/// every packet boundary within the 6144-byte unit (32 packets)
-/// carries the sync byte at offset `4 + i * 192`.
+/// Heuristic: in a decrypted BD-AV Aligned Unit, each 192-byte source
+/// packet is `4-byte TP_extra_header + 188-byte TS packet`, and a TS
+/// packet begins with `0x47`. Check every packet boundary within the
+/// 6144-byte unit (32 packets).
 fn looks_like_bdav_ts(unit: &[u8]) -> bool {
     if unit.len() < AACS_UNIT_LEN {
         return false;
