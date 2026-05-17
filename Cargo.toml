@@ -40,4 +40,4 @@ oxideav-core = { version = "0.1", optional = true }
 # Optional under the `aacs` feature. Provides the AES-128-CBC content
 # scrambling + KEYDB.cfg parser + MKB / Unit_Key_RO.inf parsers the
 # source driver needs to decrypt commercial BD-ROM content.
-oxideav-aacs = { version = "0.0", optional = true }
+oxideav-aacs = { version = "0.1", optional = true }
