@@ -3,27 +3,23 @@
 //!
 //! Flow per AACS Common 0.953 + BD-Prerecorded 0.953:
 //!   1. Mount the disc.
-//!   2. Ask the drive for the 16-byte AACS Volume Identifier via
-//!      [`crate::drive::read_volume_id`] (per AACS Common §3.3 the
-//!      Volume Identifier is stored in the BD-ROM Mark — physically
-//!      protected, not accessible through the filesystem). The drive
-//!      query goes through a platform-specific MMC `READ DISC
-//!      STRUCTURE` command (opcode `0xAD`, format `0x80`).
-//!   3. Derive the libbluray-style 20-byte disc ID:
-//!      `disc_id = SHA-1(volume_id)` via
-//!      [`oxideav_aacs::vuk::disc_id_for_volume_id`].
-//!   4. Stream-scan KEYDB.cfg line-by-line for that exact disc ID —
+//!   2. Compute the libbluray-style 20-byte disc ID as
+//!      `SHA-1(AACS/Unit_Key_RO.inf bytes)` per libaacs's
+//!      `_calc_title_hash` / `aacs_get_disc_id` (with fallback to
+//!      `AACS/DUPLICATE/Unit_Key_RO.inf`). No drive query, no AACS
+//!      host-authentication handshake — the file is plain-text-
+//!      readable through the filesystem.
+//!   3. Stream-scan KEYDB.cfg line-by-line for that exact disc ID —
 //!      no full-file parse, no memory blow-up.
-//!   5. Parse only the matching line via `KeyDb::parse(single_line)`,
+//!   4. Parse only the matching line via `KeyDb::parse(single_line)`,
 //!      apply its VUK or pre-unwrapped Unit Keys to a freshly-opened
 //!      `AacsVolume`, verify by trial-decrypting the first .m2ts
 //!      Aligned Unit and checking for the BD-AV TS sync pattern.
 
 use crate::decrypt::{DecryptError, StreamDecryptor};
-use crate::drive::{self, DriveError};
 use crate::m2ts::M2TS_PACKET_LEN;
 use oxideav_aacs::keydb::KeyDbEntry;
-use oxideav_aacs::vuk::disc_id_for_volume_id;
+use oxideav_aacs::vuk::disc_id_from_unit_key_file_bytes;
 use oxideav_aacs::{AacsVolume, KeyDb, TitleKey};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -34,7 +30,7 @@ pub const AACS_UNIT_LEN: usize = 6144;
 
 /// Length of the libbluray-style 20-byte KEYDB.cfg disc identifier.
 /// Derived as `SHA-1(AACS Volume Identifier)` per
-/// [`oxideav_aacs::vuk::disc_id_for_volume_id`].
+/// [`oxideav_aacs::vuk::disc_id_from_unit_key_file_bytes`].
 const DISC_ID_LEN: usize = 20;
 
 /// [`StreamDecryptor`] backed by an [`AacsVolume`] whose CPS Unit
@@ -88,26 +84,43 @@ pub fn try_resolve_aacs(disc_root: &Path) -> std::io::Result<Option<Box<dyn Stre
     }
     let debug = std::env::var_os("OXIDEAV_AACS_DEBUG").is_some();
 
-    // Step 1 — ask the drive for the AACS Volume Identifier (BD-ROM
-    // Mark, per AACS Common §3.3; only obtainable via MMC `READ
-    // DISC STRUCTURE` opcode 0xAD format 0x80, OR via the
-    // OXIDEAV_AACS_VOLUME_ID env override for now).
-    let volume_id = match drive::read_volume_id(disc_root) {
-        Ok(v) => v,
-        Err(DriveError::Mmc(msg)) => {
-            eprintln!("oxideav-bluray: AACS Volume ID read failed: {msg}");
-            return Ok(None);
-        }
-        Err(e) => {
-            eprintln!("oxideav-bluray: AACS Volume ID read failed: {e}");
-            return Ok(None);
+    // Step 1 — compute the libbluray disc_id per libaacs's
+    // `_calc_title_hash` / `aacs_get_disc_id` convention:
+    //
+    //   disc_id = SHA-1(bytes_of(AACS/Unit_Key_RO.inf))
+    //
+    // No drive query, no AACS host-authentication handshake — the
+    // BD-ROM Mark Volume Identifier is irrelevant for this lookup.
+    // Fallback path is `AACS/DUPLICATE/Unit_Key_RO.inf` (BD-Prerecorded
+    // §2.1 — the duplicate copy mirrors content). The other content-
+    // type variants (BD-Recordable BDMV / BDAV, HD-DVD) use different
+    // files; we don't bother probing them for BD-ROM playback.
+    let unit_key_bytes = {
+        let primary = disc_root.join("AACS").join("Unit_Key_RO.inf");
+        let dup = disc_root
+            .join("AACS")
+            .join("DUPLICATE")
+            .join("Unit_Key_RO.inf");
+        match std::fs::read(&primary).or_else(|_| std::fs::read(&dup)) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "oxideav-bluray: AACS Unit_Key_RO.inf read failed: {e} \
+                     (tried {} and {})",
+                    primary.display(),
+                    dup.display()
+                );
+                return Ok(None);
+            }
         }
     };
-    let disc_id = disc_id_for_volume_id(&volume_id);
+    let disc_id = disc_id_from_unit_key_file_bytes(&unit_key_bytes);
     let disc_id_hex = hex_id(&disc_id);
     if debug {
-        let vol_hex: String = volume_id.iter().map(|b| format!("{b:02X}")).collect();
-        eprintln!("oxideav-bluray: AACS Volume ID 0x{vol_hex} → disc_id (SHA-1) {disc_id_hex}");
+        eprintln!(
+            "oxideav-bluray: disc_id = SHA-1(AACS/Unit_Key_RO.inf, {} bytes) = {disc_id_hex}",
+            unit_key_bytes.len()
+        );
     }
 
     // Step 2 — locate KEYDB.cfg and stream-scan for ONE matching line.
