@@ -319,6 +319,17 @@ impl Read for TitleSource {
         if out.is_empty() {
             return Ok(0);
         }
+        // Hard byte cap: stop reading once we've emitted more than
+        // `output_total` (the precomputed title length). A consumer
+        // that keeps asking past EOF — e.g. an mpeg-ts demuxer
+        // unsuccessfully hunting for the 0x47 sync byte on
+        // AES-scrambled bytes because AACS resolution failed —
+        // would otherwise spin the optical drive reading the entire
+        // title before giving up, putting the kernel I/O in
+        // uninterruptible sleep for minutes.
+        if self.output_pos >= self.output_total {
+            return Ok(0);
+        }
         if self.pending_pos >= self.pending.len() {
             match self.refill() {
                 Ok(true) => {}
