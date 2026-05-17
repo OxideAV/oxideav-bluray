@@ -28,6 +28,13 @@ bluray://                          → auto-detect first BD-ROM mount
   under the default-on `registry` cargo feature.
 - Pluggable [`StreamDecryptor`] trait so `oxideav-aacs` can plug in
   without a hard dep.
+- macOS AACS Volume Identifier reader (`drive::macos`): IOKit
+  SCSITaskDeviceInterface dlopen'd via `libloading`, MMC `READ DISC
+  STRUCTURE` (opcode `0xAD`, format `0x80`) against the BSD whole-disk
+  node resolved via `statfs(disc_root)`. Surfaces an actionable error
+  when Finder still has the volume mounted (run `diskutil unmount`
+  first). Linux SG_IO + Windows SPTI backends still stubbed; use
+  `OXIDEAV_AACS_VOLUME_ID=<32-hex>` as an override there.
 
 ## Deferred
 

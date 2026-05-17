@@ -30,7 +30,7 @@ registry = ["dep:oxideav-core"]
 # every commercial Blu-ray Disc is AACS-encrypted, so this is
 # default-on. Turn it off for BD-R / homemade-disc-only consumers
 # that want a smaller dep tree.
-aacs = ["dep:oxideav-aacs", "dep:thiserror"]
+aacs = ["dep:oxideav-aacs", "dep:thiserror", "dep:libloading"]
 
 [dependencies]
 # Optional under the `registry` feature so consumers can depend on
@@ -43,6 +43,10 @@ oxideav-core = { version = "0.1", optional = true }
 oxideav-aacs = { version = "0.1", optional = true }
 # Optional under the `aacs` feature; powers the per-platform optical-
 # drive query for the AACS Volume Identifier in `drive::macos` /
-# `drive::linux` / `drive::windows` (lazy-loaded; native MMC backends
-# land in follow-up commits).
+# `drive::linux` / `drive::windows`.
 thiserror = { version = "2", optional = true }
+# IOKit / CoreFoundation are loaded at runtime via libloading on
+# macOS (matches oxideplay's SDL2 loader pattern). Linux + Windows
+# backends will use the same crate for SG_IO ioctl handles / SPTI
+# DeviceIoControl.
+libloading = { version = "0.8", optional = true }

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **macOS AACS Volume Identifier reader** — `drive::macos` now drives a
+  real MMC `READ DISC STRUCTURE` (opcode `0xAD`, format `0x80`) against
+  the optical drive via IOKit's SCSITaskDeviceInterface. The
+  `IOKit.framework` + `CoreFoundation.framework` are dlopen'd at runtime
+  via [`libloading`] (same pattern as oxideplay's SDL2 loader) — no
+  `io-kit-sys`, `core-foundation`, `iokit-rs`, or `mach2` dep. Flow:
+  `statfs(disc_root)` → BSD whole-disk name → IORegistry walk against
+  `IOBDServices` / `IODVDServices` matching by child-plane `BSD Name` →
+  `IOCreatePlugInInterfaceForService` →
+  `QueryInterface(kIOSCSITaskDeviceInterfaceID)` →
+  `ObtainExclusiveAccess` → `CreateSCSITask` →
+  `SetCommandDescriptorBlock` + `SetScatterGatherEntries` +
+  `SetTimeoutDuration(5000ms)` → `ExecuteTaskSync`. `kIOReturnExclusiveAccess`
+  gives an actionable error message pointing at `diskutil unmount`.
+  Clean-room from Apple's public SDK headers (Xcode CommandLineTools);
+  no libbluray / libaacs / makemkv / AnyDVD source consulted.
+
 - Bootstrap (Phase 1 — source plug-in): clean-room read-only Blu-ray
   Disc (BD-ROM) support per the BDA whitepapers + ECMA-167 UDF spec.
   - **UDF 2.50 mount** — `udf::UdfDisc` reads the Volume Recognition

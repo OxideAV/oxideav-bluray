@@ -59,7 +59,11 @@
 //! The `Disc` / `TitleSource` / parser surface stays available; only
 //! the `bluray://` source-registry plumbing disappears.
 
-#![forbid(unsafe_code)]
+// `deny(unsafe_code)` rather than `forbid` so the macOS drive backend
+// (`drive::macos`) can opt into raw IOKit / CoreFoundation FFI via a
+// module-scoped `#![allow(unsafe_code)]`. Every other module in the
+// crate stays unsafe-free.
+#![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
 #[cfg(feature = "aacs")]
