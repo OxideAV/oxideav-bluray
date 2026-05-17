@@ -199,10 +199,7 @@ pub fn try_resolve_aacs(disc_root: &Path) -> std::io::Result<Option<Box<dyn Stre
     let cert_path = disc_root.join("AACS").join("Content_Certificate.cer");
     if let Ok(bytes) = std::fs::read(&cert_path) {
         let n = bytes.len().min(40);
-        let hex: String = bytes[..n]
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect();
+        let hex: String = bytes[..n].iter().map(|b| format!("{b:02X}")).collect();
         eprintln!("  Content_Certificate.cer head ({n}): {hex}");
     } else {
         eprintln!(
@@ -210,9 +207,7 @@ pub fn try_resolve_aacs(disc_root: &Path) -> std::io::Result<Option<Box<dyn Stre
             cert_path.display()
         );
     }
-    eprintln!(
-        "  (Set OXIDEAV_AACS_DEBUG=1 to see KEYDB.cfg per-line parse traces.)"
-    );
+    eprintln!("  (Set OXIDEAV_AACS_DEBUG=1 to see KEYDB.cfg per-line parse traces.)");
     Ok(None)
 }
 
