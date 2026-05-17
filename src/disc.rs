@@ -166,6 +166,15 @@ pub struct TitleSource {
     /// read; drained first on the next `read()`.
     pending: Vec<u8>,
     pending_pos: usize,
+    /// Total bytes already emitted to the caller across the whole
+    /// title — i.e. the absolute output position. Tracked separately
+    /// from `clip_offset` (input-side) because the TP_extra-strip
+    /// changes byte counts (192 → 188 per packet).
+    output_pos: u64,
+    /// Estimated total output bytes for the entire title (sum of
+    /// each .m2ts file size * 188 / 192). Computed at construction
+    /// so `seek(End(0))`-style probes don't have to walk the clips.
+    output_total: u64,
 }
 
 impl std::fmt::Debug for TitleSource {
@@ -186,6 +195,21 @@ impl TitleSource {
         clip_stems: Vec<String>,
         decryptor: Option<Box<dyn StreamDecryptor>>,
     ) -> Result<Self> {
+        // Pre-compute estimated output total by summing each clip's
+        // file size and applying the TP_extra strip ratio (188/192).
+        // Round down to a packet boundary so the estimate matches what
+        // a complete linear read would actually emit.
+        let mut output_total: u64 = 0;
+        for stem in &clip_stems {
+            let path = bdmv_root.join("STREAM").join(format!("{stem}.m2ts"));
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let raw = meta.len();
+                let usable = raw - (raw % M2TS_PACKET_LEN as u64);
+                let packets = usable / M2TS_PACKET_LEN as u64;
+                output_total += packets * TS_PACKET_LEN as u64;
+            }
+        }
+
         let mut s = Self {
             bdmv_root,
             clip_stems,
@@ -195,9 +219,23 @@ impl TitleSource {
             decryptor: decryptor.unwrap_or_else(|| Box::new(crate::decrypt::Identity)),
             pending: Vec::new(),
             pending_pos: 0,
+            output_pos: 0,
+            output_total,
         };
         s.open_next_clip()?;
         Ok(s)
+    }
+
+    /// Reset state to the start of the title (clip 0, offset 0,
+    /// no pending). Cheap: just re-opens the first .m2ts file.
+    fn rewind_to_start(&mut self) -> Result<()> {
+        self.clip_idx = 0;
+        self.current = None;
+        self.clip_offset = 0;
+        self.pending.clear();
+        self.pending_pos = 0;
+        self.output_pos = 0;
+        self.open_next_clip()
     }
 
     fn open_next_clip(&mut self) -> Result<()> {
@@ -293,6 +331,7 @@ impl Read for TitleSource {
         let take = avail.min(out.len());
         out[..take].copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + take]);
         self.pending_pos += take;
+        self.output_pos += take as u64;
         Ok(take)
     }
 }
@@ -326,16 +365,60 @@ fn resolve_title_playlist(_bdmv: &Path, entry: &IndexEntry) -> Result<(TitleKind
     }
 }
 
-// `Seek` is implemented as a stub for `SeekFrom::Current(0)` only so
-// callers can probe the current position; full seeking is Phase 2.
+// `Seek` supports the patterns probers + linear pipelines actually
+// use: position query, rewind-to-start, end-position query for size
+// discovery, and forward-skip (read+discard). Backwards-seek to a
+// non-zero offset is the Phase-2 boundary (would need a
+// per-clip output-offset index built from CPI EP_map).
 impl Seek for TitleSource {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        match pos {
-            SeekFrom::Current(0) => Ok(self.clip_offset),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "TitleSource seek (Phase 2)",
-            )),
+        // Resolve every variant to an absolute output offset.
+        let target: i128 = match pos {
+            SeekFrom::Start(n) => n as i128,
+            SeekFrom::Current(d) => self.output_pos as i128 + d as i128,
+            SeekFrom::End(d) => self.output_total as i128 + d as i128,
+        };
+        if target < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TitleSource: seek before start",
+            ));
         }
+        let target = target as u64;
+
+        // No-op seek (common probe pattern).
+        if target == self.output_pos {
+            return Ok(self.output_pos);
+        }
+
+        // Backwards: only rewind-to-zero is cheap. Anything else
+        // needs an EP_map (Phase 2).
+        if target < self.output_pos {
+            if target == 0 {
+                self.rewind_to_start().map_err(|e| match e {
+                    BlurayError::Io(e) => e,
+                    other => io::Error::other(other.to_string()),
+                })?;
+                return Ok(0);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TitleSource: backwards seek to non-zero offset is Phase 2",
+            ));
+        }
+
+        // Forward: read + discard until we reach target. Bounded by
+        // the precomputed total so a runaway seek-past-end caps out
+        // at the end-of-stream rather than spinning forever.
+        let cap = target.min(self.output_total);
+        let mut sink = [0u8; 8192];
+        while self.output_pos < cap {
+            let want = ((cap - self.output_pos) as usize).min(sink.len());
+            let n = Read::read(self, &mut sink[..want])?;
+            if n == 0 {
+                break;
+            }
+        }
+        Ok(self.output_pos)
     }
 }
