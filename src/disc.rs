@@ -391,20 +391,17 @@ impl Seek for TitleSource {
             return Ok(self.output_pos);
         }
 
-        // Backwards: only rewind-to-zero is cheap. Anything else
-        // needs an EP_map (Phase 2).
+        // Backwards seek: rewind to clip 0 then fall through to the
+        // forward-skip path. Slow on large jumps but correct without
+        // a per-clip output-offset index. A proper random-access
+        // implementation built on CPI EP_map (BD-ROM Part 3 §5.5.6)
+        // is the Phase-2 deliverable; this gets probers + scrubbing
+        // working in the meantime.
         if target < self.output_pos {
-            if target == 0 {
-                self.rewind_to_start().map_err(|e| match e {
-                    BlurayError::Io(e) => e,
-                    other => io::Error::other(other.to_string()),
-                })?;
-                return Ok(0);
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "TitleSource: backwards seek to non-zero offset is Phase 2",
-            ));
+            self.rewind_to_start().map_err(|e| match e {
+                BlurayError::Io(e) => e,
+                other => io::Error::other(other.to_string()),
+            })?;
         }
 
         // Forward: read + discard until we reach target. Bounded by
