@@ -130,8 +130,25 @@ pub fn open_bluray(uri: &str) -> oxideav_core::Result<Box<dyn oxideav_core::Byte
         .longest_title()
         .ok_or_else(|| CoreError::invalid("disc has no playable HDMV titles"))?
         .clone();
+    // Auto-resolve AACS decryption when the `aacs` feature is on
+    // (default-on) and the disc carries an `AACS/` directory. Returns
+    // `Ok(None)` cleanly for unprotected discs OR when no KEYDB.cfg
+    // entry matches; the resulting `TitleSource` then runs through
+    // `Identity` and the demuxer will fail to find packet sync — that's
+    // the user's cue that their KEYDB.cfg needs an entry for this disc.
+    let decryptor: Option<Box<dyn crate::StreamDecryptor>> = {
+        #[cfg(feature = "aacs")]
+        {
+            crate::aacs_adapter::try_resolve_aacs(&root)
+                .map_err(|e| CoreError::invalid(format!("AACS resolve: {e}")))?
+        }
+        #[cfg(not(feature = "aacs"))]
+        {
+            None
+        }
+    };
     let src: TitleSource = disc
-        .open_title(&title, None)
+        .open_title(&title, decryptor)
         .map_err(|e| CoreError::invalid(e.to_string()))?;
     Ok(Box::new(src))
 }

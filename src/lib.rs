@@ -62,6 +62,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+#[cfg(feature = "aacs")]
+pub mod aacs_adapter;
 pub mod bdmv;
 pub mod decrypt;
 pub mod disc;

@@ -13,7 +13,7 @@ keywords = ["bluray", "bdmv", "udf", "m2ts", "mpls"]
 categories = ["multimedia", "filesystem", "parser-implementations"]
 
 [features]
-default = ["registry"]
+default = ["registry", "aacs"]
 
 # `registry` wires up the `bluray://` source driver against
 # `oxideav-core::SourceRegistry` so this crate plugs into the broader
@@ -22,8 +22,22 @@ default = ["registry"]
 # + `Disc` / `TitleSource` API without the framework dependency tree.
 registry = ["dep:oxideav-core"]
 
+# `aacs` enables transparent AACS decryption — the `bluray://` source
+# driver detects an `AACS/` directory on the disc, loads
+# `oxideav_aacs::KeyDb` from the per-platform default location, and
+# constructs an AacsDecryptor that handles AES-128-CBC content
+# scrambling per AACS Common 0.953 + BD-Prerecorded 0.953. Almost
+# every commercial Blu-ray Disc is AACS-encrypted, so this is
+# default-on. Turn it off for BD-R / homemade-disc-only consumers
+# that want a smaller dep tree.
+aacs = ["dep:oxideav-aacs"]
+
 [dependencies]
 # Optional under the `registry` feature so consumers can depend on
 # `oxideav-bluray` with `default-features = false` and avoid the
 # framework dependency tree entirely.
 oxideav-core = { version = "0.1", optional = true }
+# Optional under the `aacs` feature. Provides the AES-128-CBC content
+# scrambling + KEYDB.cfg parser + MKB / Unit_Key_RO.inf parsers the
+# source driver needs to decrypt commercial BD-ROM content.
+oxideav-aacs = { version = "0.0", optional = true }
