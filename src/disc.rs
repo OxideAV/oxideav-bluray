@@ -24,8 +24,9 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use crate::bdmv::clpi::ClipInformation;
 use crate::bdmv::index_bdmv::{IndexBdmv, IndexEntry, IndexObjectType};
-use crate::bdmv::mpls::PlayListMpls;
+use crate::bdmv::mpls::{PlayItem, PlayListMpls};
 use crate::decrypt::{StreamDecryptor, AACS_UNIT_LEN};
 use crate::error::{BlurayError, Result};
 use crate::m2ts::{strip_tp_extra, M2TS_PACKET_LEN, TS_PACKET_LEN};
@@ -139,14 +140,38 @@ impl Disc {
         if pl.play_list.play_items.is_empty() {
             return Err(BlurayError::not_bluray("title has no PlayItems"));
         }
-        let clip_stems: Vec<String> = pl
-            .play_list
-            .play_items
-            .iter()
-            .map(|p| p.clip_information_file_name.clone())
-            .collect();
-        TitleSource::new(bdmv, clip_stems, decryptor)
+        let play_items = pl.play_list.play_items.clone();
+        TitleSource::new(bdmv, play_items, decryptor)
     }
+}
+
+/// Per-clip seek metadata, computed once at construction. Lets
+/// [`TitleSource::seek_to`] map a title-relative 90 kHz PTS to a clip,
+/// then to a keyframe-aligned source-packet number via the clip's
+/// CPI EP_map (BD-ROM AV §5.7).
+#[derive(Debug, Clone)]
+struct ClipSeekInfo {
+    /// 5-digit clip stem (e.g. `"00001"`); resolves both the `.m2ts`
+    /// and `.clpi` paths.
+    stem: String,
+    /// Absolute output byte offset (post-TP_extra-strip) at which this
+    /// clip's bytes begin in the concatenated title stream.
+    output_start: u64,
+    /// Number of usable 188-byte TS packets this clip contributes
+    /// (`file_len / 192`, truncated to a packet boundary).
+    packet_count: u64,
+    /// Title-relative 90 kHz PTS at which this clip's playback begins
+    /// (running sum of preceding PlayItem durations).
+    title_pts_start: u64,
+    /// Clip-local 90 kHz PTS of the PlayItem's IN point — the EP_map's
+    /// `pts_ep_start` values are clip-local, so we offset the seek
+    /// target by this before searching. (`PlayItem.in_time_ticks` is
+    /// 45 kHz; doubled to 90 kHz.)
+    in_pts_90k: u64,
+    /// Flat, ascending list of `(pts_ep_start, spn_ep_start)` from the
+    /// clip's primary-video EP_map. Empty when the clip ships no CPI
+    /// (homemade discs) — seeking then falls back to the clip start.
+    entry_points: Vec<(u32, u32)>,
 }
 
 /// A `Read`-able view onto a title: concatenates the title's PlayItem
@@ -154,7 +179,8 @@ impl Disc {
 /// 192-byte source packet to yield a clean 188-byte MPEG-TS stream.
 pub struct TitleSource {
     bdmv_root: PathBuf,
-    clip_stems: Vec<String>,
+    /// Per-clip metadata + EP_map seek index, in playback order.
+    clips: Vec<ClipSeekInfo>,
     clip_idx: usize,
     /// Open file for the current clip, or `None` if EOF / between clips.
     current: Option<File>,
@@ -181,9 +207,11 @@ impl std::fmt::Debug for TitleSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TitleSource")
             .field("bdmv_root", &self.bdmv_root)
-            .field("clip_stems", &self.clip_stems)
+            .field("num_clips", &self.clips.len())
             .field("clip_idx", &self.clip_idx)
             .field("clip_offset", &self.clip_offset)
+            .field("output_pos", &self.output_pos)
+            .field("output_total", &self.output_total)
             .field("pending_len", &(self.pending.len() - self.pending_pos))
             .finish()
     }
@@ -192,27 +220,50 @@ impl std::fmt::Debug for TitleSource {
 impl TitleSource {
     fn new(
         bdmv_root: PathBuf,
-        clip_stems: Vec<String>,
+        play_items: Vec<PlayItem>,
         decryptor: Option<Box<dyn StreamDecryptor>>,
     ) -> Result<Self> {
-        // Pre-compute estimated output total by summing each clip's
-        // file size and applying the TP_extra strip ratio (188/192).
-        // Round down to a packet boundary so the estimate matches what
-        // a complete linear read would actually emit.
+        // Build the per-clip seek index in playback order. For each
+        // PlayItem we:
+        //   - measure the `.m2ts` size → usable packet count → the
+        //     output bytes it contributes (188/192 ratio);
+        //   - parse its `.clpi` (best-effort) to lift the primary
+        //     EP_map into a flat ascending `(pts, spn)` list;
+        //   - record the running output-byte start + title-relative
+        //     90 kHz PTS start so a seek can locate the clip.
+        let mut clips = Vec::with_capacity(play_items.len());
         let mut output_total: u64 = 0;
-        for stem in &clip_stems {
-            let path = bdmv_root.join("STREAM").join(format!("{stem}.m2ts"));
-            if let Ok(meta) = std::fs::metadata(&path) {
-                let raw = meta.len();
-                let usable = raw - (raw % M2TS_PACKET_LEN as u64);
-                let packets = usable / M2TS_PACKET_LEN as u64;
-                output_total += packets * TS_PACKET_LEN as u64;
-            }
+        let mut title_pts_start: u64 = 0;
+        for pi in &play_items {
+            let stem = pi.clip_information_file_name.clone();
+            let m2ts_path = bdmv_root.join("STREAM").join(format!("{stem}.m2ts"));
+            let packet_count = match std::fs::metadata(&m2ts_path) {
+                Ok(meta) => {
+                    let raw = meta.len();
+                    let usable = raw - (raw % M2TS_PACKET_LEN as u64);
+                    usable / M2TS_PACKET_LEN as u64
+                }
+                Err(_) => 0,
+            };
+
+            let entry_points = load_entry_points(&bdmv_root, &stem);
+
+            clips.push(ClipSeekInfo {
+                stem,
+                output_start: output_total,
+                packet_count,
+                title_pts_start,
+                in_pts_90k: u64::from(pi.in_time_ticks) * 2,
+                entry_points,
+            });
+
+            output_total += packet_count * TS_PACKET_LEN as u64;
+            title_pts_start += pi.duration_90k();
         }
 
         let mut s = Self {
             bdmv_root,
-            clip_stems,
+            clips,
             clip_idx: 0,
             current: None,
             clip_offset: 0,
@@ -226,24 +277,126 @@ impl TitleSource {
         Ok(s)
     }
 
-    /// Reset state to the start of the title (clip 0, offset 0,
-    /// no pending). Cheap: just re-opens the first .m2ts file.
-    fn rewind_to_start(&mut self) -> Result<()> {
-        self.clip_idx = 0;
-        self.current = None;
-        self.clip_offset = 0;
+    /// Seek to the keyframe-aligned entry point at or before `pts_90k`
+    /// (a title-relative presentation timestamp in 90 kHz ticks) and
+    /// return the absolute output byte position the next `read()` will
+    /// resume from.
+    ///
+    /// The mapping (BD-ROM AV §5.7 + §3.1):
+    ///
+    /// 1. Locate the PlayItem/clip whose title-relative time window
+    ///    contains `pts_90k`.
+    /// 2. Convert to a clip-local PTS by subtracting the clip's
+    ///    title-start and adding the PlayItem IN-point PTS (the EP_map's
+    ///    `pts_ep_start` values are clip-local).
+    /// 3. Binary-search the clip's EP_map for the largest
+    ///    `pts_ep_start ≤ clip-local target` — i.e. the I-frame at or
+    ///    before the requested time (seeks land on a decodable boundary,
+    ///    never mid-GOP).
+    /// 4. The chosen entry's `spn_ep_start` is a source-packet number;
+    ///    the `.m2ts` byte offset is `spn_ep_start × 192` (§3.1: each
+    ///    source packet is 192 bytes). Output position is
+    ///    `spn_ep_start × 188` within the clip.
+    ///
+    /// Clips with no CPI (homemade discs) seek to the clip start. A
+    /// `pts_90k` past the title end clamps to the final clip's start.
+    pub fn seek_to(&mut self, pts_90k: u64) -> io::Result<u64> {
+        if self.clips.is_empty() {
+            return Ok(0);
+        }
+        // 1. Pick the clip: the last clip whose title window starts at
+        //    or before the target. (Windows are contiguous; a target
+        //    past the last clip's start stays on the last clip.)
+        let clip_idx = self
+            .clips
+            .iter()
+            .rposition(|c| c.title_pts_start <= pts_90k)
+            .unwrap_or(0);
+        let clip = &self.clips[clip_idx];
+
+        // 2. Title-relative → clip-local PTS.
+        let into_clip = pts_90k.saturating_sub(clip.title_pts_start);
+        let clip_local_target = clip.in_pts_90k.saturating_add(into_clip);
+
+        // 3. Binary-search the EP_map for the entry at or before target.
+        let spn = match clip.entry_points.as_slice() {
+            [] => 0u32,
+            eps => {
+                let target = clip_local_target.min(u64::from(u32::MAX)) as u32;
+                // Largest index with pts_ep_start <= target.
+                let idx = match eps.binary_search_by(|&(pts, _)| pts.cmp(&target)) {
+                    Ok(i) => i,
+                    Err(0) => 0,
+                    Err(i) => i - 1,
+                };
+                eps[idx].1
+            }
+        };
+
+        // 4. Land the reader on source-packet `spn` of `clip_idx`.
+        self.position_at(clip_idx, spn).map_err(|e| match e {
+            BlurayError::Io(e) => e,
+            other => io::Error::other(other.to_string()),
+        })
+    }
+
+    /// Position the reader at source-packet `spn` of clip `clip_idx`,
+    /// keeping decryption unit-aligned. Returns the new absolute output
+    /// position.
+    ///
+    /// Decryption happens per 6144-byte AACS unit, so we open the file
+    /// at the unit boundary at or below `spn × 192`, then drain the
+    /// residual packets (output side) up to the exact entry point. This
+    /// keeps the `clip_offset` the decryptor sees on a unit boundary.
+    fn position_at(&mut self, clip_idx: usize, spn: u32) -> Result<u64> {
+        // Copy the fields we need before taking `&mut self` for reads.
+        let (stem, output_start, packet_count) = {
+            let clip = &self.clips[clip_idx];
+            (clip.stem.clone(), clip.output_start, clip.packet_count)
+        };
+        // Clamp the requested packet to the clip's usable range so a
+        // stale / over-large EP_map entry can't seek past EOF.
+        let spn = (spn as u64).min(packet_count.saturating_sub(1));
+
+        // AACS-unit-aligned input byte where we begin reading.
+        let target_byte = spn * M2TS_PACKET_LEN as u64;
+        let unit_byte_start = target_byte - (target_byte % AACS_UNIT_LEN as u64);
+        let unit_packet_start = unit_byte_start / M2TS_PACKET_LEN as u64;
+        let residual_packets = spn - unit_packet_start;
+
+        // Open the clip and seek the file to the unit boundary.
+        self.clip_idx = clip_idx;
+        let path = self.bdmv_root.join("STREAM").join(format!("{stem}.m2ts"));
+        let mut f = File::open(&path).map_err(BlurayError::Io)?;
+        f.seek(SeekFrom::Start(unit_byte_start))
+            .map_err(BlurayError::Io)?;
+        self.current = Some(f);
+        self.clip_offset = unit_byte_start;
         self.pending.clear();
         self.pending_pos = 0;
-        self.output_pos = 0;
-        self.open_next_clip()
+        // Output position at the unit boundary, then advance past the
+        // residual packets to land exactly on the entry point.
+        self.output_pos = output_start + unit_packet_start * TS_PACKET_LEN as u64;
+
+        let mut to_skip = residual_packets * TS_PACKET_LEN as u64;
+        let mut sink = [0u8; 8192];
+        while to_skip > 0 {
+            let want = (to_skip as usize).min(sink.len());
+            let n = Read::read(self, &mut sink[..want]).map_err(BlurayError::Io)?;
+            if n == 0 {
+                break;
+            }
+            to_skip -= n as u64;
+        }
+        Ok(self.output_pos)
     }
 
     fn open_next_clip(&mut self) -> Result<()> {
         self.current = None;
-        if self.clip_idx >= self.clip_stems.len() {
+        if self.clip_idx >= self.clips.len() {
             return Ok(());
         }
-        let stem = &self.clip_stems[self.clip_idx];
+        let stem = &self.clips[self.clip_idx].stem;
         let path = self.bdmv_root.join("STREAM").join(format!("{stem}.m2ts"));
         let f = File::open(&path).map_err(BlurayError::Io)?;
         self.current = Some(f);
@@ -360,6 +513,39 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Best-effort: parse `CLIPINF/<stem>.clpi`, pick the primary EP_map,
+/// and lift it into an ascending `(pts_ep_start, spn_ep_start)` list a
+/// seeker can binary-search. A missing / corrupt / CPI-less `.clpi`
+/// yields an empty list — seeking then falls back to the clip start
+/// rather than failing the whole title.
+///
+/// "Primary" EP_map: the EP_map with the lowest `stream_pid` (the
+/// primary video PID is always the lowest-numbered video elementary
+/// stream on a conformant BD-ROM, so its EP_map carries the I-frame
+/// boundaries we want to land on). The rows are sorted by
+/// `pts_ep_start` defensively — they're already monotonic on a
+/// conformant disc, but a stable sort makes the binary search correct
+/// even on a malformed table.
+fn load_entry_points(bdmv_root: &Path, stem: &str) -> Vec<(u32, u32)> {
+    let path = bdmv_root.join("CLIPINF").join(format!("{stem}.clpi"));
+    let Ok(bytes) = read_file(&path) else {
+        return Vec::new();
+    };
+    let Ok(clpi) = ClipInformation::parse(&bytes) else {
+        return Vec::new();
+    };
+    let Some(ep) = clpi.cpi.ep_map.iter().min_by_key(|m| m.stream_pid) else {
+        return Vec::new();
+    };
+    let mut eps: Vec<(u32, u32)> = ep
+        .entries
+        .iter()
+        .map(|e| (e.pts_ep_start, e.spn_ep_start))
+        .collect();
+    eps.sort_by_key(|&(pts, _)| pts);
+    eps
+}
+
 /// Resolve an `IndexEntry` to (kind, playlist_id). For HDMV we use
 /// the entry's `movie_object_id_ref` as the playlist id heuristic
 /// (this matches the very-common case where movie objects are
@@ -376,11 +562,12 @@ fn resolve_title_playlist(_bdmv: &Path, entry: &IndexEntry) -> Result<(TitleKind
     }
 }
 
-// `Seek` supports the patterns probers + linear pipelines actually
-// use: position query, rewind-to-start, end-position query for size
-// discovery, and forward-skip (read+discard). Backwards-seek to a
-// non-zero offset is the Phase-2 boundary (would need a
-// per-clip output-offset index built from CPI EP_map).
+// `Seek` is the *byte-exact* contract demuxers expect: position query,
+// rewind-to-start, end-position query for size discovery, forward-skip,
+// and (via rewind + forward-skip) backwards-seek to any byte offset.
+// For *keyframe-aligned* time seeks — landing on a decodable I-frame
+// boundary rather than an arbitrary byte — use [`TitleSource::seek_to`],
+// which consults the CPI EP_map (BD-ROM AV §5.7).
 impl Seek for TitleSource {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         // Resolve every variant to an absolute output offset.
@@ -402,14 +589,25 @@ impl Seek for TitleSource {
             return Ok(self.output_pos);
         }
 
-        // Backwards seek: rewind to clip 0 then fall through to the
-        // forward-skip path. Slow on large jumps but correct without
-        // a per-clip output-offset index. A proper random-access
-        // implementation built on CPI EP_map (BD-ROM Part 3 §5.5.6)
-        // is the Phase-2 deliverable; this gets probers + scrubbing
-        // working in the meantime.
+        // Backwards seek (or a forward seek into an earlier clip than
+        // the cursor): jump straight to the start of the clip that
+        // contains `target` using the per-clip output-offset index,
+        // then fall through to the bounded forward-skip below. This
+        // avoids re-reading every preceding clip on a large rewind —
+        // the linear scan is now at most one clip's worth of packets.
         if target < self.output_pos {
-            self.rewind_to_start().map_err(|e| match e {
+            let clip_idx = self
+                .clips
+                .iter()
+                .rposition(|c| c.output_start <= target)
+                .unwrap_or(0);
+            self.clip_idx = clip_idx;
+            self.current = None;
+            self.clip_offset = 0;
+            self.pending.clear();
+            self.pending_pos = 0;
+            self.output_pos = self.clips[clip_idx].output_start;
+            self.open_next_clip().map_err(|e| match e {
                 BlurayError::Io(e) => e,
                 other => io::Error::other(other.to_string()),
             })?;

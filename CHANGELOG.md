@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`TitleSource::seek_to(pts_90k)` — keyframe-aligned random access**
+  (BD-ROM AV §5.7 + §3.1). Builds a per-clip seek index at
+  `open_title` time: each PlayItem's `.clpi` is parsed (best-effort)
+  and its primary-video EP_map (lowest stream PID) lifted into an
+  ascending `(pts_ep_start, spn_ep_start)` list, alongside the clip's
+  running output-byte start + title-relative 90 kHz PTS start.
+  `seek_to` maps a title-relative PTS → clip → clip-local PTS (via the
+  PlayItem IN-point) → binary-search for the I-frame at or before the
+  target → `spn_ep_start × 192` byte offset (AV §3.1: 192-byte source
+  packets). Positioning opens the `.m2ts` at the enclosing 6144-byte
+  AACS unit boundary then drains the residual packets, so decryption
+  stays unit-aligned. Clips with no CPI fall back to the clip start; a
+  past-end target lands on the final clip's last entry point. The
+  byte-exact `Seek` impl now reuses the same per-clip output-offset
+  index to jump straight to the containing clip on a rewind instead of
+  rewinding to clip 0. New `tests/seek_to_keyframe.rs` covers both
+  paths against synthetic 2-clip titles with hand-built EP_maps.
 - **CPI EP_map decode** (BD-ROM AV §5.7 / BD-RE Part 3 §3.1.5.2). The
   `CLIPINF/*.clpi` parser now produces a typed `Cpi { ep_map:
   Vec<EpMap>, ts_type_indicators: Vec<u8> }` instead of the Phase-1

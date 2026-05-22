@@ -24,6 +24,15 @@ bluray://                          → auto-detect first BD-ROM mount
   ready for I-frame-aligned seek).
 - `.m2ts` stream → strip the 4-byte BDAV `TP_extra_header` per
   192-byte source packet, deliver clean 188-byte MPEG-TS bytes.
+- `TitleSource::seek_to(pts_90k)` — keyframe-aligned random access.
+  A title-relative 90 kHz PTS is mapped to a PlayItem/clip, converted
+  to clip-local time, binary-searched against that clip's CPI EP_map
+  for the I-frame at or before the target, and the chosen
+  `spn_ep_start` is turned into a byte offset (`× 192`, per AV §3.1)
+  with AACS-unit-aligned positioning so decryption stays correct.
+  Clips with no CPI fall back to the clip start. The byte-exact `Seek`
+  impl now uses the same per-clip output-offset index to jump straight
+  to the containing clip on a rewind.
 - `Disc::longest_title()` heuristic for autoplay (longest HDMV
   title).
 - `bluray://` URI handler registered with `oxideav_core::SourceRegistry`
@@ -45,9 +54,10 @@ bluray://                          → auto-detect first BD-ROM mount
 - SubPath PiP / secondary-video streams.
 - Raw-block-device mount (`bluray:///dev/sr0`) — UDF mounter exists,
   high-level routing in `Disc::mount_image` is Phase 2.
-- `TitleSource::seek_to(pts_90k)` wiring against the parsed CPI
-  EP_map (the typed `Cpi` accessor lands in Phase 2; keyframe-aligned
-  byte-offset seeking on top of it is the next follow-up).
+- Multi-angle EP_map seeking (`is_angle_change_point` entries are
+  decoded but `seek_to` always uses the primary-video EP_map) and
+  SequenceInfo STC-based PTS remapping across non-seamless PlayItem
+  joins.
 - ICB strategy types other than 4, ExtendedFileEntry, long/extended
   allocation descriptors, multi-extent partition maps.
 
@@ -76,6 +86,9 @@ Blu-ray discs and references no real titles. Test categories:
 - `bluray://` URI parser (auto-detect, absolute path, scheme reject).
 - Mount auto-detect with a synthetic `/tmp/` BDMV tree.
 - End-to-end mount + stream of a hand-rolled BDMV directory (`tests/synthetic_disc.rs`).
+- Keyframe-aligned `seek_to` over a 2-clip title with hand-built CPI
+  EP_maps, plus the no-CPI fallback + byte-exact `Seek` co-existence
+  (`tests/seek_to_keyframe.rs`).
 - End-to-end mount of a synthesised in-memory UDF image (`tests/udf_minimal_image.rs`).
 
 ## Clean-room references
