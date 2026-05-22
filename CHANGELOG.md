@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CPI EP_map decode** (BD-ROM AV §5.7 / BD-RE Part 3 §3.1.5.2). The
+  `CLIPINF/*.clpi` parser now produces a typed `Cpi { ep_map:
+  Vec<EpMap>, ts_type_indicators: Vec<u8> }` instead of the Phase-1
+  empty stub. Each `EpMap` carries the stream PID + 4-bit
+  `EP_stream_type` + a flat list of `EpEntry` rows; the coarse-table
+  context (14-bit `PTS_EP_coarse`, 32-bit `SPN_EP_coarse`) is folded
+  into each entry's `pts_ep_start` / `spn_ep_start` so a seeker can
+  binary-search directly. PTS combine: `(coarse << 19) | (fine << 9)`
+  (low 9 bits truncated, ≈ 5.7 ms granularity); SPN combine:
+  `(coarse_spn & 0xFFFE_0000) | fine_spn`. Five new tests cover the
+  MSB-first bit reader/writer, an empty CPI block, an unknown-CPI-type
+  fallback to empty, and a two-stream multi-coarse round trip.
+- **`Cpi` / `EpMap` / `EpEntry` re-exported** at the crate root.
+  `CpiEpMap` stays as a deprecated alias for one release.
+
+### Changed
+
+- `ClipInformation.cpi` is now `Cpi` (was `CpiEpMap` — same field
+  position, new struct layout). External code that pattern-matches on
+  `Cpi.entries` must migrate to walking `cpi.ep_map[i].entries`.
+
+### Added (previous unreleased entries)
+
 - **macOS AACS Volume Identifier reader** — `drive::macos` now drives a
   real MMC `READ DISC STRUCTURE` (opcode `0xAD`, format `0x80`) against
   the optical drive via IOKit's SCSITaskDeviceInterface. The

@@ -79,7 +79,7 @@ pub mod source;
 pub mod udf;
 
 pub use bdmv::{
-    clpi::{ClipInfo, ClipMark, CpiEpMap, ProgramInfo, SequenceInfo, StreamCodingInfo},
+    clpi::{ClipInfo, ClipMark, Cpi, EpEntry, EpMap, ProgramInfo, SequenceInfo, StreamCodingInfo},
     index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType},
     movie_object::{MovieObject, NavCommand},
     mpls::{

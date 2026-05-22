@@ -19,7 +19,9 @@ bluray://                          → auto-detect first BD-ROM mount
 - BDMV parsers — `index.bdmv` titles, `MovieObject.bdmv` nav-command
   enumeration, `PLAYLIST/*.mpls` PlayList + PlayItem + STN_table
   summary + ClipMark, `CLIPINF/*.clpi` ClipInfo + SequenceInfo +
-  ProgramInfo + CPI placeholder.
+  ProgramInfo + CPI EP_map (per-stream-PID entry-point map — coarse +
+  fine rows decoded into a flat `(pts_ep_start, spn_ep_start)` list
+  ready for I-frame-aligned seek).
 - `.m2ts` stream → strip the 4-byte BDAV `TP_extra_header` per
   192-byte source packet, deliver clean 188-byte MPEG-TS bytes.
 - `Disc::longest_title()` heuristic for autoplay (longest HDMV
@@ -43,8 +45,9 @@ bluray://                          → auto-detect first BD-ROM mount
 - SubPath PiP / secondary-video streams.
 - Raw-block-device mount (`bluray:///dev/sr0`) — UDF mounter exists,
   high-level routing in `Disc::mount_image` is Phase 2.
-- CPI EP_map full decode (the entries Vec stays empty in Phase 1;
-  seek hints will land in Phase 2).
+- `TitleSource::seek_to(pts_90k)` wiring against the parsed CPI
+  EP_map (the typed `Cpi` accessor lands in Phase 2; keyframe-aligned
+  byte-offset seeking on top of it is the next follow-up).
 - ICB strategy types other than 4, ExtendedFileEntry, long/extended
   allocation descriptors, multi-extent partition maps.
 
