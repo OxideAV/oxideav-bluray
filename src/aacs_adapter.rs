@@ -3,9 +3,8 @@
 //!
 //! Flow per AACS Common 0.953 + BD-Prerecorded 0.953:
 //!   1. Mount the disc.
-//!   2. Compute the libbluray-style 20-byte disc ID as
-//!      `SHA-1(AACS/Unit_Key_RO.inf bytes)` per libaacs's
-//!      `_calc_title_hash` / `aacs_get_disc_id` (with fallback to
+//!   2. Compute the 20-byte KEYDB.cfg disc-identifier as
+//!      `SHA-1(AACS/Unit_Key_RO.inf bytes)` (with fallback to
 //!      `AACS/DUPLICATE/Unit_Key_RO.inf`). No drive query, no AACS
 //!      host-authentication handshake — the file is plain-text-
 //!      readable through the filesystem.
@@ -49,7 +48,7 @@ use std::path::{Path, PathBuf};
 /// Common 0.953 §3.7.
 pub const AACS_UNIT_LEN: usize = 6144;
 
-/// Length of the libbluray-style 20-byte KEYDB.cfg disc identifier.
+/// Length of the 20-byte KEYDB.cfg disc identifier.
 /// Derived as `SHA-1(AACS Volume Identifier)` per
 /// [`oxideav_aacs::vuk::disc_id_from_unit_key_file_bytes`].
 const DISC_ID_LEN: usize = 20;
@@ -95,8 +94,8 @@ impl StreamDecryptor for AacsDecryptor {
     }
 }
 
-/// Resolve AACS by querying the drive for the Volume Identifier,
-/// hashing it to the libbluray disc_id, and looking up KEYDB.cfg.
+/// Resolve AACS by computing the 20-byte KEYDB.cfg disc-identifier
+/// from `AACS/Unit_Key_RO.inf` and looking it up in KEYDB.cfg.
 /// Returns `Ok(None)` cleanly on every failure path with an
 /// actionable stderr line.
 pub fn try_resolve_aacs(disc_root: &Path) -> std::io::Result<Option<Box<dyn StreamDecryptor>>> {
@@ -105,8 +104,7 @@ pub fn try_resolve_aacs(disc_root: &Path) -> std::io::Result<Option<Box<dyn Stre
     }
     let debug = std::env::var_os("OXIDEAV_AACS_DEBUG").is_some();
 
-    // Step 1 — compute the libbluray disc_id per libaacs's
-    // `_calc_title_hash` / `aacs_get_disc_id` convention:
+    // Step 1 — compute the 20-byte KEYDB.cfg disc-identifier:
     //
     //   disc_id = SHA-1(bytes_of(AACS/Unit_Key_RO.inf))
     //
@@ -674,7 +672,7 @@ fn civil_from_unix(unix_secs: u64) -> (i32, u8, u8, u8, u8, u8) {
 }
 
 /// Apply a [`KeyDbEntry`]'s keys to an [`AacsVolume`]. If the entry
-/// supplied pre-unwrapped Unit Keys (libbluray extended format), use
+/// supplied pre-unwrapped Unit Keys (KEYDB.cfg extended format), use
 /// those directly. Otherwise AES-128-ECB-unwrap each CPS Unit's
 /// encrypted title key with the VUK.
 fn apply_entry_to_volume(entry: &KeyDbEntry, volume: &mut AacsVolume) {
