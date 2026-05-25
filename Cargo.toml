@@ -13,7 +13,7 @@ keywords = ["bluray", "bdmv", "udf", "m2ts", "mpls"]
 categories = ["multimedia", "filesystem", "parser-implementations"]
 
 [features]
-default = ["registry", "aacs"]
+default = ["registry", "aacs", "aacs-online"]
 
 # `registry` wires up the `bluray://` source driver against
 # `oxideav-core::SourceRegistry` so this crate plugs into the broader
@@ -31,6 +31,26 @@ registry = ["dep:oxideav-core"]
 # default-on. Turn it off for BD-R / homemade-disc-only consumers
 # that want a smaller dep tree.
 aacs = ["dep:oxideav-aacs", "dep:thiserror", "dep:libloading"]
+
+# `aacs-online` extends the AACS resolver with two further fallbacks
+# after the KEYDB.cfg `<disc_id>=V<vuk>` lookup misses:
+#
+#   (1) a local on-disk VUK cache at `~/.cache/oxideav/vuk-cache.cfg`
+#       (same `<disc_id>=V<vuk>` line format as KEYDB.cfg, so
+#        operators can `cat` it back into KEYDB.cfg without
+#        reformatting);
+#   (2) an *online* VUK derivation against the disc's optical drive —
+#       reads the AACS Volume Identifier via MMC `READ DISC STRUCTURE`
+#       and walks the disc's MKB Subset-Difference tree with each
+#       Device Key parsed from KEYDB.cfg's extended `| DK |` records
+#       (`oxideav_aacs::AacsVolume::derive_vuk_from_device_key`).
+#
+# A successful (2) writes the resolved VUK back to the cache with an
+# `online-<RFC3339>` provenance tag so subsequent mounts skip the
+# drive query. Gating this behind a feature lets headless / docker /
+# CI builds that have no optical drive opt out cleanly with
+# `--no-default-features --features registry,aacs`.
+aacs-online = ["aacs"]
 
 [dependencies]
 # Optional under the `registry` feature so consumers can depend on

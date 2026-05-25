@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AACS VUK lookup cascade: KEYDB.cfg → on-disk cache → online
+  derivation** (`aacs_adapter::try_resolve_aacs`). On a KEYDB.cfg
+  legacy-entry miss for a given disc ID, the resolver now falls
+  through to a local cache at
+  `${XDG_CACHE_HOME:-${HOME}/.cache}/oxideav/vuk-cache.cfg`
+  (override with `OXIDEAV_AACS_VUK_CACHE=<file>`) using the same
+  `<40-hex DISCID> = V <32-hex VUK> | <label>` format as KEYDB.cfg —
+  so the cache stays human-readable and `cat`-shareable. A second
+  miss triggers an **online** VUK derivation (gated by the new
+  `aacs-online` cargo feature, default-on): the disc's AACS Volume
+  Identifier is read via MMC `READ DISC STRUCTURE` through the
+  existing `drive::read_volume_id` backend, and each `| DK |` Device
+  Key parsed from KEYDB.cfg's extended format is walked through the
+  disc's MKB Subset-Difference tree via
+  `oxideav_aacs::AacsVolume::derive_vuk_from_device_key`. The first
+  Device Key whose derived Media Key satisfies the MKB
+  Verify-Media-Key record wins; revoked DKs are skipped. A
+  successful derivation is appended back to the cache with an
+  `online-<RFC3339-UTC>` provenance stamp so subsequent mounts skip
+  the drive query (idempotent — re-running for the same disc ID
+  doesn't duplicate the line). The new `aacs-online` cargo feature
+  cleanly disables the drive-query path for headless / CI builds
+  that have no optical hardware; the KEYDB.cfg + cache fallbacks
+  stay available without it. Six unit tests cover the cache
+  round-trip, idempotency, the civil-from-Unix date helper, and the
+  `DeviceKeyRecord` → `DeviceKey` adapter.
 - **`TitleSource::seek_to(pts_90k)` — keyframe-aligned random access**
   (BD-ROM AV §5.7 + §3.1). Builds a per-clip seek index at
   `open_title` time: each PlayItem's `.clpi` is parsed (best-effort)

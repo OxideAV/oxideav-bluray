@@ -46,6 +46,18 @@ bluray://                          → auto-detect first BD-ROM mount
   when Finder still has the volume mounted (run `diskutil unmount`
   first). Linux SG_IO + Windows SPTI backends still stubbed; use
   `OXIDEAV_AACS_VOLUME_ID=<32-hex>` as an override there.
+- **AACS VUK lookup cascade** (`aacs_adapter::try_resolve_aacs`):
+  KEYDB.cfg legacy entry → on-disk cache
+  (`${XDG_CACHE_HOME:-${HOME}/.cache}/oxideav/vuk-cache.cfg`, same
+  line format as KEYDB.cfg, override with `OXIDEAV_AACS_VUK_CACHE`)
+  → **online** derivation gated by the default-on `aacs-online`
+  cargo feature. The online path reads the drive's AACS Volume
+  Identifier and walks every `| DK |` Device Key from KEYDB.cfg
+  through the disc's MKB via
+  `oxideav_aacs::AacsVolume::derive_vuk_from_device_key`; on success
+  the derived VUK is written back to the cache with an
+  `online-<RFC3339>` provenance stamp. Headless / CI builds opt out
+  with `--no-default-features --features registry,aacs`.
 
 ## Deferred
 
