@@ -24,6 +24,15 @@ bluray://                          → auto-detect first BD-ROM mount
   ready for I-frame-aligned seek).
 - `.m2ts` stream → strip the 4-byte BDAV `TP_extra_header` per
   192-byte source packet, deliver clean 188-byte MPEG-TS bytes.
+  Three call shapes: the in-place `strip_tp_extra(input, &mut out)`
+  (zero-alloc, used internally by `TitleSource`), the convenience
+  `strip_tp_extra_to_vec(input) -> Vec<u8>` for one-shot callers, and
+  a borrowing `iter_source_packets(input) -> M2tsIter` that yields
+  one `M2tsSourcePacket { tp_extra, ts_payload: &[u8; 188] }` per
+  192-byte chunk — letting callers consume the 27 MHz arrival
+  timestamps + CCI bits without re-parsing the 4-byte header out of
+  band. The TS payload stays opaque; downstream MPEG-TS demuxers own
+  ISO/IEC 13818-1 parsing.
 - `TitleSource::seek_to(pts_90k)` — keyframe-aligned random access.
   A title-relative 90 kHz PTS is mapped to a PlayItem/clip, converted
   to clip-local time, binary-searched against that clip's CPI EP_map

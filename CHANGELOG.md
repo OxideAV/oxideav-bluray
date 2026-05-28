@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`iter_source_packets` — borrowing M2TS source-packet iterator
+  + `strip_tp_extra_to_vec` convenience wrapper** (`m2ts`). Adds two
+  call shapes complementing the existing in-place
+  `strip_tp_extra(input, &mut out)` worker: `strip_tp_extra_to_vec`
+  is a one-shot allocation-returning wrapper, and
+  `iter_source_packets` yields one
+  `M2tsSourcePacket { tp_extra: TpExtraHeader, ts_payload: &[u8; 188] }`
+  per 192-byte chunk — the iterator borrows into the input buffer (no
+  copy), exposes `ExactSizeIterator`, and lets callers consume the
+  27 MHz arrival timestamps + CCI bits without re-decoding the 4-byte
+  `TP_extra_header` out of band. The 188-byte TS payload stays opaque
+  per the crate's container/codec split — ISO/IEC 13818-1 parsing
+  belongs to the downstream MPEG-TS demuxer, not here. Both new
+  entry points panic on a non-192-byte-multiple input matching the
+  existing helper's contract. Eight new unit tests cover the
+  one-packet borrow, multi-packet ordering against deterministic
+  arrival-time + payload-tail markers, `ExactSizeIterator::len`
+  decreasing on each `next()`, the empty-buffer case, the
+  misalignment panic on both new helpers, and a byte-for-byte
+  equivalence check between iterator-exposed payloads and the
+  linearised `strip_tp_extra_to_vec` output (the two views are
+  guaranteed to agree). Grounded in BD-ROM Part 3 §5.6.2.1 source-
+  packet layout — no new spec dependency.
 - **AACS VUK lookup cascade: KEYDB.cfg → on-disk cache → online
   derivation** (`aacs_adapter::try_resolve_aacs`). On a KEYDB.cfg
   legacy-entry miss for a given disc ID, the resolver now falls

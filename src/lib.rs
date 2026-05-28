@@ -90,7 +90,10 @@ pub use bdmv::{
 pub use decrypt::{DecryptError, StreamDecryptor};
 pub use disc::{Disc, TitleInfo, TitleKind, TitleSource};
 pub use error::{BlurayError, Result};
-pub use m2ts::{strip_tp_extra, M2TS_PACKET_LEN, TP_EXTRA_HEADER_LEN, TS_PACKET_LEN};
+pub use m2ts::{
+    iter_source_packets, strip_tp_extra, strip_tp_extra_to_vec, M2tsIter, M2tsSourcePacket,
+    TpExtraHeader, M2TS_PACKET_LEN, TP_EXTRA_HEADER_LEN, TS_PACKET_LEN,
+};
 pub use source::{detect_disc_root, parse_bluray_uri, BlurayUri};
 
 #[cfg(feature = "registry")]
