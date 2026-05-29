@@ -126,12 +126,39 @@ impl Disc {
             .max_by_key(|t| t.duration_ticks)
     }
 
-    /// Open a title as a [`TitleSource`]. The optional `decryptor`
-    /// lets an AACS adapter plug in; pass `None` for unprotected
-    /// homemade discs and for the crate's own tests.
+    /// Open a title as a [`TitleSource`] on the primary angle. The
+    /// optional `decryptor` lets an AACS adapter plug in; pass `None`
+    /// for unprotected homemade discs and for the crate's own tests.
+    ///
+    /// Equivalent to [`Self::open_title_with_angle`] with `angle = 0`.
     pub fn open_title(
         &self,
         title: &TitleInfo,
+        decryptor: Option<Box<dyn StreamDecryptor>>,
+    ) -> Result<TitleSource> {
+        self.open_title_with_angle(title, 0, decryptor)
+    }
+
+    /// Open a title on a specific angle. `angle` is 0-based: `0` is the
+    /// primary angle (the clip on each PlayItem itself), `k >= 1` picks
+    /// the `k`-th alternate angle from each PlayItem's
+    /// [`PlayItem::angles`] list.
+    ///
+    /// Multi-angle Blu-ray titles store every angle's source packets in
+    /// a separate `.m2ts` / `.clpi` pair; only the PlayItem timing
+    /// (IN/OUT) is shared. Per BD-ROM AV §5.2.3.3, each angle's clip
+    /// list is interleaved on disc so any one angle can be played
+    /// end-to-end without seeking against the others.
+    ///
+    /// Returns an error when `angle` exceeds the smallest
+    /// `multi_clip_count` across the title's PlayItems (a single-angle
+    /// PlayItem in the middle would leave the seeker without a target
+    /// clip for the rest of the title — we surface that conflict at
+    /// `open` time rather than mid-stream).
+    pub fn open_title_with_angle(
+        &self,
+        title: &TitleInfo,
+        angle: u8,
         decryptor: Option<Box<dyn StreamDecryptor>>,
     ) -> Result<TitleSource> {
         let bdmv = self.root.join("BDMV");
@@ -140,8 +167,45 @@ impl Disc {
         if pl.play_list.play_items.is_empty() {
             return Err(BlurayError::not_bluray("title has no PlayItems"));
         }
+        // Reject angle values that would leave at least one PlayItem
+        // without a target clip — the resulting stream would have a
+        // hole in the middle, which is worse than a clean error at
+        // open time.
+        for (idx, pi) in pl.play_list.play_items.iter().enumerate() {
+            if pi.angle_clip(angle).is_none() {
+                return Err(BlurayError::not_bluray(format!(
+                    "angle {angle} unavailable on PlayItem {idx} (has {} angles)",
+                    pi.num_angles()
+                )));
+            }
+        }
         let play_items = pl.play_list.play_items.clone();
-        TitleSource::new(bdmv, play_items, decryptor)
+        TitleSource::new(bdmv, play_items, angle, decryptor)
+    }
+
+    /// Maximum angle index `k` such that every PlayItem in `title`'s
+    /// PlayList offers an angle-`k` clip — i.e. the largest value that
+    /// is safe to pass to [`Self::open_title_with_angle`]. Returns 0
+    /// when at least one PlayItem is single-clip (only the primary
+    /// angle is universally available).
+    ///
+    /// Reads the title's `.mpls` once. Returns 0 on parse failure
+    /// rather than propagating the error — a caller that needs precise
+    /// diagnostics can [`PlayListMpls::parse`] directly.
+    pub fn max_angle(&self, title: &TitleInfo) -> u8 {
+        let bdmv = self.root.join("BDMV");
+        let Ok(pl_bytes) = read_file(&playlist_path(&bdmv, title.playlist_id)) else {
+            return 0;
+        };
+        let Ok(pl) = PlayListMpls::parse(&pl_bytes) else {
+            return 0;
+        };
+        pl.play_list
+            .play_items
+            .iter()
+            .map(|pi| pi.num_angles().saturating_sub(1))
+            .min()
+            .unwrap_or(0)
     }
 }
 
@@ -221,10 +285,13 @@ impl TitleSource {
     fn new(
         bdmv_root: PathBuf,
         play_items: Vec<PlayItem>,
+        angle: u8,
         decryptor: Option<Box<dyn StreamDecryptor>>,
     ) -> Result<Self> {
         // Build the per-clip seek index in playback order. For each
         // PlayItem we:
+        //   - select the requested angle's clip stem (caller has
+        //     already validated `angle` against every PlayItem);
         //   - measure the `.m2ts` size → usable packet count → the
         //     output bytes it contributes (188/192 ratio);
         //   - parse its `.clpi` (best-effort) to lift the primary
@@ -235,7 +302,10 @@ impl TitleSource {
         let mut output_total: u64 = 0;
         let mut title_pts_start: u64 = 0;
         for pi in &play_items {
-            let stem = pi.clip_information_file_name.clone();
+            let stem = pi
+                .angle_clip(angle)
+                .map(|a| a.clip_information_file_name.to_string())
+                .unwrap_or_else(|| pi.clip_information_file_name.clone());
             let m2ts_path = bdmv_root.join("STREAM").join(format!("{stem}.m2ts"));
             let packet_count = match std::fs::metadata(&m2ts_path) {
                 Ok(meta) => {

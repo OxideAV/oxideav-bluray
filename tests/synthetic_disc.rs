@@ -70,6 +70,7 @@ fn synthetic_bdmv_mount_and_stream() {
                 in_time_ticks: 0,
                 out_time_ticks: 45_000 * 10, // 10 s
                 multi_clip_count: 1,
+                angles: Vec::new(),
                 stn_table: StnTableSummary {
                     num_primary_video: 1,
                     num_primary_audio: 1,

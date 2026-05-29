@@ -135,6 +135,7 @@ fn seek_to_lands_on_keyframe_packet() {
                     in_time_ticks: in_a,
                     out_time_ticks: out_a,
                     multi_clip_count: 1,
+                    angles: Vec::new(),
                     stn_table: StnTableSummary {
                         num_primary_video: 1,
                         num_primary_audio: 1,
@@ -149,6 +150,7 @@ fn seek_to_lands_on_keyframe_packet() {
                     in_time_ticks: in_b,
                     out_time_ticks: out_b,
                     multi_clip_count: 1,
+                    angles: Vec::new(),
                     stn_table: StnTableSummary {
                         num_primary_video: 1,
                         num_primary_audio: 1,
@@ -287,6 +289,7 @@ fn seek_to_without_cpi_falls_back_to_clip_start() {
                 in_time_ticks: 0,
                 out_time_ticks: 45_000 * 10,
                 multi_clip_count: 1,
+                angles: Vec::new(),
                 stn_table: StnTableSummary {
                     num_primary_video: 1,
                     num_primary_audio: 1,

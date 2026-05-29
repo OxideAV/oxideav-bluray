@@ -83,8 +83,8 @@ pub use bdmv::{
     index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType},
     movie_object::{MovieObject, NavCommand},
     mpls::{
-        AppInfoPlayList, ConnectionCondition, PlayItem, PlayList, PlayListMark, PlayListMpls,
-        StnTableSummary, SubPath,
+        AngleClip, AngleClipRef, AppInfoPlayList, ConnectionCondition, PlayItem, PlayList,
+        PlayListMark, PlayListMpls, StnTableSummary, SubPath,
     },
 };
 pub use decrypt::{DecryptError, StreamDecryptor};

@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Multi-angle PlayItem parsing + per-angle title open** (`mpls` +
+  `disc`). Per BD-ROM Part 3 §5.4.4.1, a PlayItem with the
+  `is_multi_angle` bit set carries an `(N - 1) × 11`-byte block of
+  alternate-angle clip references (5-byte clip stem + 4-byte codec id +
+  1-byte `stc_id_ref` + 1 reserved per alt entry). The parser used to
+  read `multi_clip_count` and then `r.skip(11 * (N-1))` past the alt
+  entries — the round trip preserved the count but discarded every alt
+  clip's name. This round captures the lot: `PlayItem` grows an
+  `angles: Vec<AngleClip>` field (each `AngleClip` carrying
+  `{ clip_information_file_name, clip_codec_identifier, stc_id_ref }`),
+  the encoder writes those entries back at exactly the same byte
+  offsets, and a new `PlayItem::angle_clip(angle: u8) -> Option<AngleClipRef>`
+  selector maps a 0-based angle index to the right clip reference
+  (angle 0 → the primary clip on the PlayItem itself; angle k ≥ 1 →
+  `angles[k - 1]`). A new `PlayItem::num_angles()` returns the unfolded
+  count (1 for single-clip items). The new types `AngleClip` /
+  `AngleClipRef` are re-exported at the crate root.
+- **`Disc::open_title_with_angle(title, angle, decryptor)` —
+  angle-selecting title open**, plus `Disc::max_angle(title)` for the
+  largest safely-openable angle across every PlayItem (the smallest
+  PlayItem-angle-count minus one). `open_title` now delegates to
+  `open_title_with_angle(title, 0, decryptor)` — same observable
+  behaviour, so existing callers (including `bluray://` URI handler +
+  every test) stay byte-for-byte identical. The new entry point rejects
+  an out-of-range `angle` *at open time* by checking every PlayItem's
+  `angle_clip(angle)` up front: surfacing the mismatch cleanly is
+  strictly better than leaving the streamer to discover mid-clip that
+  one PlayItem in the middle of the title has fewer angles than the
+  caller asked for. Internally `TitleSource::new` now takes the angle
+  index and selects each PlayItem's `.m2ts` / `.clpi` stem via
+  `angle_clip(angle)`, so the resulting source-packet seek index,
+  EP_map lookup, and AACS-unit-aligned seek path all operate on the
+  selected angle's bytes.
+- **9 new tests** (3 unit + 6 integration in `tests/multi_angle.rs`):
+  multi-angle MPLS round trip preserves the two alt-angle clip stems
+  with the right `stc_id_ref`s; the `angle_clip` selector maps 0/1/2
+  to the correct refs and returns `None` for out-of-range; a single-
+  angle PlayItem keeps the empty `angles` vec + `num_angles() == 1`
+  invariant; end-to-end mount + open_title_with_angle(0/1/2) streams
+  the right `.m2ts` (verified via per-clip 4-byte fingerprints at the
+  TS-payload head); `open_title` defaults to the primary angle;
+  out-of-range angle is rejected with a diagnostic naming the angle;
+  `max_angle` reports 2 for the 3-angle synthetic title. Spec basis:
+  BD-ROM Part 3 §5.4.4.1 (is_multi_angle block) + AV §5.2.3.3 (per-
+  angle interleaved clip layout on disc). No new spec dependency.
 - **`iter_source_packets` — borrowing M2TS source-packet iterator
   + `strip_tp_extra_to_vec` convenience wrapper** (`m2ts`). Adds two
   call shapes complementing the existing in-place

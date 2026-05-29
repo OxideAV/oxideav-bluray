@@ -87,6 +87,20 @@ pub struct StnTableSummary {
     pub num_pip_pg: u8,
 }
 
+/// One per-angle alternate clip reference inside a multi-angle PlayItem
+/// (§5.4.4.1). The primary angle's clip name/codec/STC live on
+/// [`PlayItem::clip_information_file_name`] /
+/// [`PlayItem::clip_codec_identifier`] / [`PlayItem::stc_id_ref`]; this
+/// struct carries the corresponding fields for each additional angle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AngleClip {
+    /// 5-char ASCII clip filename stem (e.g. `"00002"`).
+    pub clip_information_file_name: String,
+    /// 4-char codec id (typically `b"M2TS"`).
+    pub clip_codec_identifier: [u8; 4],
+    pub stc_id_ref: u8,
+}
+
 /// One PlayItem (§5.4.4.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayItem {
@@ -98,20 +112,68 @@ pub struct PlayItem {
     pub stc_id_ref: u8,
     pub in_time_ticks: u32,  // 45 kHz (§5.4.4.1 "PTS in 45 kHz units")
     pub out_time_ticks: u32, // 45 kHz
-    /// Number of multi-clip entries (additional angles) — 0 means a
-    /// single primary clip. We don't enumerate the alt clips in
-    /// Phase 1; just preserve the count.
+    /// Number of multi-clip entries — including the primary clip. `1`
+    /// means a single primary clip (no alternate angles); `N > 1` means
+    /// `N - 1` entries are listed in [`Self::angles`].
     pub multi_clip_count: u8,
+    /// Alternate-angle clip references (angles 2..N) per §5.4.4.1's
+    /// `is_multi_angle` block. Empty when `multi_clip_count <= 1`.
+    /// Indexing: `angles[0]` is the second angle (the first angle is
+    /// the primary `clip_information_file_name` on the PlayItem
+    /// itself), so the user-facing 0-based angle index maps as:
+    ///   angle 0 → PlayItem primary clip
+    ///   angle k → `angles[k - 1]` for k ≥ 1
+    pub angles: Vec<AngleClip>,
     pub stn_table: StnTableSummary,
 }
 
 impl PlayItem {
+    /// Resolve a 0-based angle index to the corresponding clip
+    /// reference. `angle == 0` returns the primary clip; `angle >= 1`
+    /// returns the matching entry from [`Self::angles`]. Returns
+    /// `None` when the requested angle is out of range.
+    pub fn angle_clip(&self, angle: u8) -> Option<AngleClipRef<'_>> {
+        if angle == 0 {
+            return Some(AngleClipRef {
+                clip_information_file_name: &self.clip_information_file_name,
+                clip_codec_identifier: &self.clip_codec_identifier,
+                stc_id_ref: self.stc_id_ref,
+            });
+        }
+        let idx = (angle as usize).checked_sub(1)?;
+        self.angles.get(idx).map(|a| AngleClipRef {
+            clip_information_file_name: &a.clip_information_file_name,
+            clip_codec_identifier: &a.clip_codec_identifier,
+            stc_id_ref: a.stc_id_ref,
+        })
+    }
+
+    /// Number of angles this PlayItem advertises (1 for single-clip
+    /// items; the unfolded count for multi-angle items).
+    pub fn num_angles(&self) -> u8 {
+        if self.multi_clip_count == 0 {
+            1
+        } else {
+            self.multi_clip_count
+        }
+    }
+
     /// Duration of this PlayItem in 90 kHz ticks. BD timing is
     /// uniformly given in 45 kHz units inside MPLS; doubling lifts it
     /// onto the 90 kHz PTS scale used by the rest of the stack.
     pub fn duration_90k(&self) -> u64 {
         (self.out_time_ticks.saturating_sub(self.in_time_ticks)) as u64 * 2
     }
+}
+
+/// Borrowed view of a single angle's clip reference, returned by
+/// [`PlayItem::angle_clip`]. Lets a streamer look up an angle's `.m2ts`
+/// / `.clpi` stem without cloning the underlying `String`.
+#[derive(Debug, Clone, Copy)]
+pub struct AngleClipRef<'a> {
+    pub clip_information_file_name: &'a str,
+    pub clip_codec_identifier: &'a [u8; 4],
+    pub stc_id_ref: u8,
 }
 
 /// A SubPath placeholder — we count them and preserve their type but
@@ -365,17 +427,35 @@ fn parse_play_item(r: &mut Reader<'_>) -> Result<PlayItem> {
     r.skip(1)?;
     // still_mode 1 byte + still_time u16
     r.skip(3)?;
-    let multi_clip_count = if is_multi_angle != 0 {
+    let (multi_clip_count, angles) = if is_multi_angle != 0 {
         let num_angles = r.read_u8()?;
         // flags byte
         r.skip(1)?;
-        // (num_angles - 1) repeated entries of (5-byte name + 4-byte codec + 1-byte stc_id_ref + 1 reserved) = 11 bytes each
-        for _ in 1..num_angles.max(1) {
-            r.skip(11)?;
+        // (num_angles - 1) repeated entries of
+        //   5-byte clip_information_file_name + 4-byte codec id +
+        //   1-byte stc_id_ref + 1 reserved
+        // = 11 bytes each (§5.4.4.1 `is_multi_angle` block).
+        let alt_count = num_angles.saturating_sub(1) as usize;
+        let mut angles = Vec::with_capacity(alt_count);
+        for _ in 0..alt_count {
+            let stem_bytes = r.slice(5)?;
+            let clip_information_file_name = std::str::from_utf8(stem_bytes)
+                .map_err(|_| BlurayError::malformed("PlayItem angle clip name not ASCII"))?
+                .to_string();
+            let codec_bytes = r.slice(4)?;
+            let mut clip_codec_identifier = [0u8; 4];
+            clip_codec_identifier.copy_from_slice(codec_bytes);
+            let stc_id_ref = r.read_u8()?;
+            r.skip(1)?; // reserved
+            angles.push(AngleClip {
+                clip_information_file_name,
+                clip_codec_identifier,
+                stc_id_ref,
+            });
         }
-        num_angles
+        (num_angles, angles)
     } else {
-        1
+        (1, Vec::new())
     };
 
     // STN_table() — read length + skip body (we summarise from the
@@ -420,6 +500,7 @@ fn parse_play_item(r: &mut Reader<'_>) -> Result<PlayItem> {
         in_time_ticks,
         out_time_ticks,
         multi_clip_count,
+        angles,
         stn_table,
     })
 }
@@ -457,8 +538,26 @@ fn encode_play_item(out: &mut Vec<u8>, pi: &PlayItem) {
     if pi.multi_clip_count > 1 {
         out.push(pi.multi_clip_count);
         out.push(0);
-        for _ in 1..pi.multi_clip_count {
-            out.extend_from_slice(&[0u8; 11]);
+        // Write `multi_clip_count - 1` alt-angle entries. If the
+        // `angles` vec is shorter than that (e.g. a hand-built
+        // PlayItem that forgot to populate the alt slots), zero-fill
+        // the missing entries — the round-trip parser will still see
+        // valid 5/4/1/1-byte fields.
+        for i in 1..pi.multi_clip_count {
+            let idx = (i as usize) - 1;
+            match pi.angles.get(idx) {
+                Some(angle) => {
+                    let mut name = [b'0'; 5];
+                    let bytes = angle.clip_information_file_name.as_bytes();
+                    let take = bytes.len().min(5);
+                    name[..take].copy_from_slice(&bytes[..take]);
+                    out.extend_from_slice(&name);
+                    out.extend_from_slice(&angle.clip_codec_identifier);
+                    out.push(angle.stc_id_ref);
+                    out.push(0); // reserved
+                }
+                None => out.extend_from_slice(&[0u8; 11]),
+            }
         }
     }
 
@@ -534,6 +633,7 @@ mod tests {
                         in_time_ticks: 0,
                         out_time_ticks: 45_000 * 60, // 60 s at 45 kHz
                         multi_clip_count: 1,
+                        angles: Vec::new(),
                         stn_table: StnTableSummary {
                             num_primary_video: 1,
                             num_primary_audio: 1,
@@ -548,6 +648,7 @@ mod tests {
                         in_time_ticks: 45_000 * 30,
                         out_time_ticks: 45_000 * 30 + 45_000 * 45, // 45 s
                         multi_clip_count: 1,
+                        angles: Vec::new(),
                         stn_table: StnTableSummary {
                             num_primary_video: 1,
                             num_primary_audio: 2,
@@ -609,5 +710,103 @@ mod tests {
             ConnectionCondition::from_raw(0x09),
             ConnectionCondition::Other(9)
         );
+    }
+
+    /// Build a single-PlayItem MPLS where the PlayItem carries
+    /// `multi_clip_count = 3` and two alt-angle clip entries —
+    /// exercise the round-trip + the [`PlayItem::angle_clip`] selector.
+    fn multi_angle_mpls() -> PlayListMpls {
+        PlayListMpls {
+            version: *b"0200",
+            app_info: AppInfoPlayList {
+                playback_type: 1,
+                playback_count: 0,
+                random_access_flag: 1,
+                audio_mix_app_flag: 0,
+                lossless_may_bypass_mixer_flag: 0,
+            },
+            play_list: PlayList {
+                play_items: vec![PlayItem {
+                    clip_information_file_name: "00100".into(),
+                    clip_codec_identifier: *b"M2TS",
+                    connection_condition: ConnectionCondition::NonSeamless,
+                    stc_id_ref: 0,
+                    in_time_ticks: 0,
+                    out_time_ticks: 45_000 * 5,
+                    multi_clip_count: 3,
+                    angles: vec![
+                        AngleClip {
+                            clip_information_file_name: "00101".into(),
+                            clip_codec_identifier: *b"M2TS",
+                            stc_id_ref: 1,
+                        },
+                        AngleClip {
+                            clip_information_file_name: "00102".into(),
+                            clip_codec_identifier: *b"M2TS",
+                            stc_id_ref: 2,
+                        },
+                    ],
+                    stn_table: StnTableSummary {
+                        num_primary_video: 1,
+                        num_primary_audio: 1,
+                        ..StnTableSummary::default()
+                    },
+                }],
+                sub_paths: vec![],
+            },
+            marks: vec![],
+        }
+    }
+
+    #[test]
+    fn multi_angle_round_trip_preserves_alt_clip_stems() {
+        let m = multi_angle_mpls();
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        assert_eq!(parsed.play_list.play_items.len(), 1);
+        let pi = &parsed.play_list.play_items[0];
+        assert_eq!(pi.multi_clip_count, 3);
+        assert_eq!(pi.num_angles(), 3);
+        assert_eq!(pi.angles.len(), 2);
+        assert_eq!(pi.angles[0].clip_information_file_name, "00101");
+        assert_eq!(pi.angles[0].stc_id_ref, 1);
+        assert_eq!(pi.angles[1].clip_information_file_name, "00102");
+        assert_eq!(pi.angles[1].stc_id_ref, 2);
+    }
+
+    #[test]
+    fn angle_clip_selector_maps_to_correct_clip() {
+        let m = multi_angle_mpls();
+        let pi = &m.play_list.play_items[0];
+
+        // Primary angle: the PlayItem's own clip.
+        let primary = pi.angle_clip(0).unwrap();
+        assert_eq!(primary.clip_information_file_name, "00100");
+        assert_eq!(primary.stc_id_ref, 0);
+
+        // Alt angles map by 1-based offset into `angles`.
+        let a1 = pi.angle_clip(1).unwrap();
+        assert_eq!(a1.clip_information_file_name, "00101");
+        let a2 = pi.angle_clip(2).unwrap();
+        assert_eq!(a2.clip_information_file_name, "00102");
+
+        // Out-of-range angle returns None — `open_title_with_angle`
+        // relies on this to reject a bad selector at open time.
+        assert!(pi.angle_clip(3).is_none());
+        assert!(pi.angle_clip(255).is_none());
+    }
+
+    #[test]
+    fn single_angle_play_item_has_empty_angle_list() {
+        // A regression-shaped check: the standard single-clip path
+        // round-trips with `angles == []` and `num_angles() == 1`.
+        let m = sample_mpls();
+        for pi in &m.play_list.play_items {
+            assert_eq!(pi.multi_clip_count, 1);
+            assert!(pi.angles.is_empty());
+            assert_eq!(pi.num_angles(), 1);
+            assert!(pi.angle_clip(0).is_some());
+            assert!(pi.angle_clip(1).is_none());
+        }
     }
 }

@@ -44,6 +44,12 @@ bluray://                          → auto-detect first BD-ROM mount
   to the containing clip on a rewind.
 - `Disc::longest_title()` heuristic for autoplay (longest HDMV
   title).
+- **Multi-angle PlayItem parsing + per-angle title open** — `PlayItem`
+  carries an `angles: Vec<AngleClip>` list of the per-angle clip
+  references the disc lists for the `is_multi_angle` block (§5.4.4.1);
+  `Disc::open_title_with_angle(title, angle, decryptor)` streams a
+  chosen angle's `.m2ts` chain; `Disc::max_angle(title)` reports the
+  largest angle that's available on every PlayItem.
 - `bluray://` URI handler registered with `oxideav_core::SourceRegistry`
   under the default-on `registry` cargo feature.
 - Pluggable [`StreamDecryptor`] trait so `oxideav-aacs` can plug in
@@ -75,10 +81,11 @@ bluray://                          → auto-detect first BD-ROM mount
 - SubPath PiP / secondary-video streams.
 - Raw-block-device mount (`bluray:///dev/sr0`) — UDF mounter exists,
   high-level routing in `Disc::mount_image` is Phase 2.
-- Multi-angle EP_map seeking (`is_angle_change_point` entries are
-  decoded but `seek_to` always uses the primary-video EP_map) and
-  SequenceInfo STC-based PTS remapping across non-seamless PlayItem
-  joins.
+- Mid-stream angle switching at an `is_angle_change_point` boundary
+  (`open_title_with_angle` fixes the angle at open time; the EP_map
+  rows do flag angle-change points but switching live still requires a
+  re-open) and SequenceInfo STC-based PTS remapping across non-seamless
+  PlayItem joins.
 - ICB strategy types other than 4, ExtendedFileEntry, long/extended
   allocation descriptors, multi-extent partition maps.
 
@@ -111,6 +118,10 @@ Blu-ray discs and references no real titles. Test categories:
   EP_maps, plus the no-CPI fallback + byte-exact `Seek` co-existence
   (`tests/seek_to_keyframe.rs`).
 - End-to-end mount of a synthesised in-memory UDF image (`tests/udf_minimal_image.rs`).
+- Multi-angle BDMV mount + per-angle streaming (`tests/multi_angle.rs`):
+  primary + two alt angles each streamed from their own fingerprinted
+  `.m2ts`, out-of-range angle rejected at open time, `max_angle`
+  reporting the smallest PlayItem-angle-count minus one.
 
 ## Clean-room references
 
