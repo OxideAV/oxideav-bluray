@@ -73,6 +73,38 @@ impl ConnectionCondition {
     }
 }
 
+/// `mark_type` of a [`PlayListMark`] (§5.4.5). BD-ROM uses entry marks
+/// to delimit the chapter points a player's "chapter search" navigates
+/// between; link points are author-private cue points that are not
+/// surfaced as chapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkType {
+    /// `0x01` — Entry mark. The boundaries of a chapter; a player's
+    /// chapter-search jumps land on these.
+    EntryMark,
+    /// `0x02` — Link point. An author-private cue not exposed as a
+    /// user-visible chapter.
+    LinkPoint,
+    /// Any other value, preserved for diagnostics.
+    Other(u8),
+}
+
+impl MarkType {
+    pub fn from_raw(v: u8) -> Self {
+        match v {
+            0x01 => Self::EntryMark,
+            0x02 => Self::LinkPoint,
+            other => Self::Other(other),
+        }
+    }
+
+    /// True for entry marks — the ones that delimit user-visible
+    /// chapters.
+    pub fn is_chapter(self) -> bool {
+        matches!(self, Self::EntryMark)
+    }
+}
+
 /// Lightweight summary of an STN_table — Phase 1 only needs the
 /// stream-type counts and the elementary PIDs so the demuxer knows
 /// what's on the wire.
@@ -206,9 +238,36 @@ pub struct PlayList {
 pub struct PlayListMark {
     pub mark_type: u8,
     pub ref_play_item_id: u16,
-    pub mark_time_ticks: u32, // 45 kHz
+    /// Clip-local timestamp of the mark, in 45 kHz ticks. Lies on the
+    /// same time axis as the referenced PlayItem's
+    /// [`PlayItem::in_time_ticks`] / [`PlayItem::out_time_ticks`].
+    pub mark_time_ticks: u32,
     pub entry_es_pid: u16,
     pub duration_ticks: u32,
+}
+
+impl PlayListMark {
+    /// Decode the raw [`Self::mark_type`] byte into a [`MarkType`].
+    pub fn kind(&self) -> MarkType {
+        MarkType::from_raw(self.mark_type)
+    }
+}
+
+/// A user-visible chapter, derived from an entry-mark in a PlayList by
+/// [`PlayListMpls::chapters`]. Carries a **title-relative** 90 kHz
+/// presentation timestamp ready to hand to
+/// [`crate::TitleSource::seek_to`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chapter {
+    /// 0-based chapter index in playback order (chapter 1 is index 0).
+    pub index: usize,
+    /// Title-relative start time of the chapter in 90 kHz ticks — the
+    /// sum of every preceding PlayItem's duration plus the mark's offset
+    /// into its own PlayItem. Directly seekable via
+    /// [`crate::TitleSource::seek_to`].
+    pub start_pts_90k: u64,
+    /// Index of the PlayItem this chapter's entry-mark references.
+    pub ref_play_item_id: u16,
 }
 
 /// Parsed `.mpls` file.
@@ -334,6 +393,61 @@ impl PlayListMpls {
             .iter()
             .map(|p| p.duration_90k())
             .sum()
+    }
+
+    /// Title-relative chapter list, in playback order.
+    ///
+    /// Each entry-mark (`mark_type == 0x01`, §5.4.5) becomes one
+    /// [`Chapter`]. The mark's `mark_time_ticks` is a *clip-local* 45 kHz
+    /// timestamp on the referenced PlayItem's own time axis (the same
+    /// axis as [`PlayItem::in_time_ticks`]); a player's chapter search
+    /// instead navigates the *title* timeline, which concatenates every
+    /// PlayItem's `[IN, OUT]` window end-to-end. We therefore convert:
+    ///
+    /// ```text
+    ///   chapter_pts = Σ duration_90k(items before ref) +
+    ///                 (mark_time_90k − in_time_90k of ref item)
+    /// ```
+    ///
+    /// The result is directly seekable via
+    /// [`crate::TitleSource::seek_to`]. Marks whose `ref_play_item_id`
+    /// is out of range, or whose timestamp falls before the referenced
+    /// PlayItem's IN point, are skipped (malformed authoring). Link
+    /// points (`mark_type == 0x02`) are not chapters and are excluded.
+    pub fn chapters(&self) -> Vec<Chapter> {
+        let items = &self.play_list.play_items;
+        // Running title-relative start (90 kHz) of each PlayItem.
+        let mut item_start_90k = Vec::with_capacity(items.len());
+        let mut acc: u64 = 0;
+        for pi in items {
+            item_start_90k.push(acc);
+            acc += pi.duration_90k();
+        }
+
+        let mut out = Vec::new();
+        for m in &self.marks {
+            if !m.kind().is_chapter() {
+                continue;
+            }
+            let ref_id = m.ref_play_item_id as usize;
+            let Some(pi) = items.get(ref_id) else {
+                continue;
+            };
+            let mark_90k = u64::from(m.mark_time_ticks) * 2;
+            let in_90k = u64::from(pi.in_time_ticks) * 2;
+            // A mark before its PlayItem's IN point is malformed; skip it
+            // rather than wrapping into a bogus huge offset.
+            if mark_90k < in_90k {
+                continue;
+            }
+            let start_pts_90k = item_start_90k[ref_id] + (mark_90k - in_90k);
+            out.push(Chapter {
+                index: out.len(),
+                start_pts_90k,
+                ref_play_item_id: m.ref_play_item_id,
+            });
+        }
+        out
     }
 
     /// Test-only encoder. Produces a minimally-conformant `.mpls`
@@ -690,6 +804,116 @@ mod tests {
         // Item 2: (45*45000) ticks @ 45kHz → *2 for 90kHz.
         let want = 60u64 * 45_000 * 2 + 45u64 * 45_000 * 2;
         assert_eq!(m.duration_90k(), want);
+    }
+
+    #[test]
+    fn mark_type_from_raw() {
+        assert_eq!(MarkType::from_raw(0x01), MarkType::EntryMark);
+        assert_eq!(MarkType::from_raw(0x02), MarkType::LinkPoint);
+        assert_eq!(MarkType::from_raw(0x07), MarkType::Other(7));
+        assert!(MarkType::EntryMark.is_chapter());
+        assert!(!MarkType::LinkPoint.is_chapter());
+        assert!(!MarkType::Other(7).is_chapter());
+    }
+
+    #[test]
+    fn chapters_lift_marks_onto_title_timeline() {
+        // PlayItem 0 spans title [0, 60s); IN = 0.
+        // PlayItem 1 spans title [60s, 105s); IN = 30s (clip-local).
+        let mut m = sample_mpls();
+        m.marks = vec![
+            // Entry mark at clip-local IN of item 0 → title 0.
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 0,
+                mark_time_ticks: 0,
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+            // Entry mark 10s into item 0 → title 10s.
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 0,
+                mark_time_ticks: 45_000 * 10,
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+            // Link point (not a chapter) — must be excluded.
+            PlayListMark {
+                mark_type: 2,
+                ref_play_item_id: 0,
+                mark_time_ticks: 45_000 * 20,
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+            // Entry mark at clip-local 35s in item 1 (IN = 30s) → 5s
+            // into item 1 → title 60s + 5s = 65s.
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 1,
+                mark_time_ticks: 45_000 * 35,
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+            // Out-of-range PlayItem reference — must be skipped.
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 9,
+                mark_time_ticks: 0,
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+            // Mark before its PlayItem's IN point — malformed, skipped.
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 1,
+                mark_time_ticks: 45_000 * 10, // < IN (30s)
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+        ];
+
+        let ch = m.chapters();
+        assert_eq!(ch.len(), 3, "two from item 0 + one from item 1");
+
+        assert_eq!(ch[0].index, 0);
+        assert_eq!(ch[0].start_pts_90k, 0);
+        assert_eq!(ch[0].ref_play_item_id, 0);
+
+        assert_eq!(ch[1].index, 1);
+        assert_eq!(ch[1].start_pts_90k, 10 * 90_000); // 10s @ 90kHz
+
+        assert_eq!(ch[2].index, 2);
+        assert_eq!(ch[2].ref_play_item_id, 1);
+        // title 60s + 5s into item 1 = 65s @ 90kHz.
+        assert_eq!(ch[2].start_pts_90k, 65 * 90_000);
+    }
+
+    #[test]
+    fn chapters_survive_round_trip() {
+        let mut m = sample_mpls();
+        m.marks = vec![
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 0,
+                mark_time_ticks: 45_000 * 5,
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 1,
+                mark_time_ticks: 45_000 * 40,
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+        ];
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        assert_eq!(parsed.chapters(), m.chapters());
+        // 5s into item 0 = 5s; 10s into item 1 = 70s.
+        assert_eq!(parsed.chapters()[0].start_pts_90k, 5 * 90_000);
+        assert_eq!(parsed.chapters()[1].start_pts_90k, 70 * 90_000);
     }
 
     #[test]

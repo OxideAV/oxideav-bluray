@@ -18,7 +18,8 @@ use oxideav_bluray::bdmv::clpi::{
 };
 use oxideav_bluray::bdmv::index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType};
 use oxideav_bluray::bdmv::mpls::{
-    AppInfoPlayList, ConnectionCondition, PlayItem, PlayList, PlayListMpls, StnTableSummary,
+    AppInfoPlayList, ConnectionCondition, PlayItem, PlayList, PlayListMark, PlayListMpls,
+    StnTableSummary,
 };
 use oxideav_bluray::{Disc, M2TS_PACKET_LEN, TS_PACKET_LEN};
 
@@ -351,6 +352,163 @@ fn seek_to_without_cpi_falls_back_to_clip_start() {
         5,
         "byte-exact seek landed on packet 5"
     );
+}
+
+#[test]
+fn disc_chapters_map_to_seekable_keyframes() {
+    let tmp = tempdir_for_test();
+    let root = tmp.path();
+    let bdmv = root.join("BDMV");
+
+    // Two PlayItems each spanning 10 s @ 45 kHz. Item 0 IN = 0; item 1
+    // IN = 5 s (clip-local), so a mark at clip-local 7 s in item 1 sits
+    // 2 s into the PlayItem → title 10 s + 2 s = 12 s.
+    let pl = PlayListMpls {
+        version: *b"0200",
+        app_info: AppInfoPlayList {
+            playback_type: 1,
+            playback_count: 0,
+            random_access_flag: 1,
+            audio_mix_app_flag: 0,
+            lossless_may_bypass_mixer_flag: 0,
+        },
+        play_list: PlayList {
+            play_items: vec![
+                PlayItem {
+                    clip_information_file_name: "00001".into(),
+                    clip_codec_identifier: *b"M2TS",
+                    connection_condition: ConnectionCondition::NonSeamless,
+                    stc_id_ref: 0,
+                    in_time_ticks: 0,
+                    out_time_ticks: 45_000 * 10,
+                    multi_clip_count: 1,
+                    angles: Vec::new(),
+                    stn_table: StnTableSummary {
+                        num_primary_video: 1,
+                        num_primary_audio: 1,
+                        ..StnTableSummary::default()
+                    },
+                },
+                PlayItem {
+                    clip_information_file_name: "00002".into(),
+                    clip_codec_identifier: *b"M2TS",
+                    connection_condition: ConnectionCondition::SeamlessContinuation,
+                    stc_id_ref: 0,
+                    in_time_ticks: 45_000 * 5,
+                    out_time_ticks: 45_000 * 15,
+                    multi_clip_count: 1,
+                    angles: Vec::new(),
+                    stn_table: StnTableSummary {
+                        num_primary_video: 1,
+                        num_primary_audio: 1,
+                        ..StnTableSummary::default()
+                    },
+                },
+            ],
+            sub_paths: vec![],
+        },
+        marks: vec![
+            // Chapter 1: item 0 IN → title 0.
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 0,
+                mark_time_ticks: 0,
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+            // Link point (excluded): clip-local 3 s in item 0.
+            PlayListMark {
+                mark_type: 2,
+                ref_play_item_id: 0,
+                mark_time_ticks: 45_000 * 3,
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+            // Chapter 2: clip-local 7 s in item 1 (IN 5 s) → title 12 s.
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 1,
+                mark_time_ticks: 45_000 * 7,
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+        ],
+    };
+    write_file(&bdmv.join("PLAYLIST/00000.mpls"), &pl.encode());
+
+    // Clip A: 64 packets, EP at title-0 spn 0.
+    let n_a = 64u32;
+    let eps_a = [(0u32, 0u32), (90_000, 16)];
+    write_file(&bdmv.join("STREAM/00001.m2ts"), &make_m2ts(n_a as usize, 0));
+    write_file(&bdmv.join("CLIPINF/00001.clpi"), &make_clpi(&eps_a, n_a));
+
+    // Clip B: 64 packets, fingerprint base 0x1000. IN = 5 s = 450_000
+    // clip-local ticks; the 12 s chapter is clip-local 7 s = 630_000.
+    // EP entry at (630_000, spn 32) is the keyframe at-or-before it.
+    let n_b = 64u32;
+    let eps_b = [(450_000u32, 0u32), (630_000, 32)];
+    write_file(
+        &bdmv.join("STREAM/00002.m2ts"),
+        &make_m2ts(n_b as usize, 0x1000),
+    );
+    write_file(&bdmv.join("CLIPINF/00002.clpi"), &make_clpi(&eps_b, n_b));
+
+    let idx = IndexBdmv {
+        version: *b"0200",
+        app_info: AppInfoBdmv {
+            initial_output_mode_preference: 0,
+            content_exist_flag: 1,
+            video_format: 6,
+            frame_rate: 4,
+        },
+        first_playback_title: IndexEntry {
+            object: IndexObjectType::Hdmv {
+                playback_type: 0,
+                movie_object_id_ref: 0,
+            },
+        },
+        menu_title: IndexEntry {
+            object: IndexObjectType::Hdmv {
+                playback_type: 1,
+                movie_object_id_ref: 0,
+            },
+        },
+        titles: vec![IndexEntry {
+            object: IndexObjectType::Hdmv {
+                playback_type: 0,
+                movie_object_id_ref: 0,
+            },
+        }],
+    };
+    write_file(&bdmv.join("index.bdmv"), &idx.encode());
+
+    let disc = Disc::mount(root).expect("mount synthetic disc");
+    let title = disc.longest_title().expect("title").clone();
+
+    // Two entry marks → two chapters; the link point is excluded.
+    let chapters = disc.chapters(&title);
+    assert_eq!(chapters.len(), 2, "link point excluded from chapters");
+    assert_eq!(chapters[0].index, 0);
+    assert_eq!(chapters[0].start_pts_90k, 0);
+    assert_eq!(chapters[1].index, 1);
+    assert_eq!(chapters[1].ref_play_item_id, 1);
+    assert_eq!(chapters[1].start_pts_90k, 12 * 90_000, "title 12 s");
+
+    // Each chapter's PTS is directly seekable to the right keyframe.
+    let mut src = disc.open_title(&title, None).expect("open title");
+    let clip_a_out = n_a as u64 * TS_PACKET_LEN as u64;
+
+    let pos = src.seek_to(chapters[0].start_pts_90k).unwrap();
+    assert_eq!(pos, 0, "chapter 1 lands at clip A start");
+    assert_eq!(next_fingerprint(&mut src), 0);
+
+    let pos = src.seek_to(chapters[1].start_pts_90k).unwrap();
+    assert_eq!(
+        pos,
+        clip_a_out + 32 * TS_PACKET_LEN as u64,
+        "chapter 2 lands on clip B keyframe spn=32"
+    );
+    assert_eq!(next_fingerprint(&mut src), 0x1000 + 32);
 }
 
 /// Tempdir helper (mirrors synthetic_disc.rs).

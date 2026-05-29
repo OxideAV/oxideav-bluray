@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use crate::bdmv::clpi::ClipInformation;
 use crate::bdmv::index_bdmv::{IndexBdmv, IndexEntry, IndexObjectType};
-use crate::bdmv::mpls::{PlayItem, PlayListMpls};
+use crate::bdmv::mpls::{Chapter, PlayItem, PlayListMpls};
 use crate::decrypt::{StreamDecryptor, AACS_UNIT_LEN};
 use crate::error::{BlurayError, Result};
 use crate::m2ts::{strip_tp_extra, M2TS_PACKET_LEN, TS_PACKET_LEN};
@@ -206,6 +206,28 @@ impl Disc {
             .map(|pi| pi.num_angles().saturating_sub(1))
             .min()
             .unwrap_or(0)
+    }
+
+    /// Title-relative chapter list for `title`, in playback order.
+    ///
+    /// Reads the title's `.mpls` once and lifts every entry-mark
+    /// (§5.4.5) onto the title timeline via
+    /// [`PlayListMpls::chapters`]. Each [`Chapter::start_pts_90k`] is
+    /// directly seekable with [`TitleSource::seek_to`], so a chapter
+    /// menu can jump to the nearest keyframe at a chapter boundary.
+    ///
+    /// Returns an empty list on read / parse failure rather than
+    /// propagating the error — a caller needing precise diagnostics can
+    /// [`PlayListMpls::parse`] directly.
+    pub fn chapters(&self, title: &TitleInfo) -> Vec<Chapter> {
+        let bdmv = self.root.join("BDMV");
+        let Ok(pl_bytes) = read_file(&playlist_path(&bdmv, title.playlist_id)) else {
+            return Vec::new();
+        };
+        let Ok(pl) = PlayListMpls::parse(&pl_bytes) else {
+            return Vec::new();
+        };
+        pl.chapters()
     }
 }
 

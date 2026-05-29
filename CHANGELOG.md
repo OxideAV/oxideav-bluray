@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Title-relative chapter list from PlayListMark entry marks** (`mpls`
+  + `disc`). The `.mpls` parser already read each `PlayListMark`
+  (`mark_type`, `ref_play_item_id`, clip-local `mark_time_ticks` …, BD-ROM
+  Part 3 §5.4.5), but nothing turned them into a navigable chapter list:
+  a mark's timestamp lies on its referenced PlayItem's *clip-local* time
+  axis, while a player's chapter search navigates the *title* timeline
+  (every PlayItem's `[IN, OUT]` window concatenated). New
+  `PlayListMpls::chapters() -> Vec<Chapter>` lifts every entry mark
+  (`mark_type == 0x01`) onto the title timeline via
+  `Σ duration_90k(items before ref) + (mark_time_90k − in_time_90k)`,
+  yielding a `Chapter { index, start_pts_90k, ref_play_item_id }` whose
+  `start_pts_90k` is directly seekable with `TitleSource::seek_to`. Link
+  points (`mark_type == 0x02`) are excluded; out-of-range PlayItem refs
+  and marks before their PlayItem's IN point are skipped as malformed
+  authoring. A new `MarkType` enum (`EntryMark` / `LinkPoint` /
+  `Other(u8)`, with `from_raw` + `is_chapter`) and a
+  `PlayListMark::kind()` decode the raw `mark_type` byte. `Disc::chapters(title)`
+  reads the title's `.mpls` once and returns the same list (empty on
+  read/parse failure, mirroring `max_angle`). New types `Chapter` /
+  `MarkType` are re-exported at the crate root. Verified end-to-end: a
+  synthetic 2-clip disc with two entry marks (one offset into the second
+  PlayItem past its non-zero IN point) plus a link point yields exactly
+  two chapters whose PTS round-trip through `seek_to` onto the correct
+  keyframe source packets.
 - **Multi-angle PlayItem parsing + per-angle title open** (`mpls` +
   `disc`). Per BD-ROM Part 3 §5.4.4.1, a PlayItem with the
   `is_multi_angle` bit set carries an `(N - 1) × 11`-byte block of

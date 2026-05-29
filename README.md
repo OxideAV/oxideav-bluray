@@ -50,6 +50,15 @@ bluray://                          → auto-detect first BD-ROM mount
   `Disc::open_title_with_angle(title, angle, decryptor)` streams a
   chosen angle's `.m2ts` chain; `Disc::max_angle(title)` reports the
   largest angle that's available on every PlayItem.
+- **Chapter list from PlayListMark entry marks** (§5.4.5) —
+  `PlayListMpls::chapters()` / `Disc::chapters(title)` lift every entry
+  mark (`mark_type == 0x01`) off its clip-local time axis onto the title
+  timeline (summing preceding PlayItem durations + the mark's offset
+  past its PlayItem IN point), returning a `Chapter { index,
+  start_pts_90k, ref_play_item_id }` whose 90 kHz PTS feeds straight into
+  `TitleSource::seek_to`. Link points (`mark_type == 0x02`) and
+  malformed refs are excluded. A `MarkType` enum + `PlayListMark::kind()`
+  classify the raw `mark_type` byte.
 - `bluray://` URI handler registered with `oxideav_core::SourceRegistry`
   under the default-on `registry` cargo feature.
 - Pluggable [`StreamDecryptor`] trait so `oxideav-aacs` can plug in
@@ -115,7 +124,10 @@ Blu-ray discs and references no real titles. Test categories:
 - Mount auto-detect with a synthetic `/tmp/` BDMV tree.
 - End-to-end mount + stream of a hand-rolled BDMV directory (`tests/synthetic_disc.rs`).
 - Keyframe-aligned `seek_to` over a 2-clip title with hand-built CPI
-  EP_maps, plus the no-CPI fallback + byte-exact `Seek` co-existence
+  EP_maps, plus the no-CPI fallback + byte-exact `Seek` co-existence,
+  and a chapter test (`Disc::chapters` lifts entry marks to title PTS,
+  excludes a link point, and each chapter PTS seeks onto the right
+  keyframe — including a mark offset past a non-zero PlayItem IN point)
   (`tests/seek_to_keyframe.rs`).
 - End-to-end mount of a synthesised in-memory UDF image (`tests/udf_minimal_image.rs`).
 - Multi-angle BDMV mount + per-angle streaming (`tests/multi_angle.rs`):
