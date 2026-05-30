@@ -529,13 +529,23 @@ fn parse_cpi(buf: &[u8], cpi_start: usize) -> Result<Cpi> {
         });
     }
 
-    // Per-stream EP_map_for_one_stream_PID() bodies. Their byte ordering
-    // follows the per-stream `body_addr` (which is an offset from the
-    // start of the CPI block — i.e. the position of the length u32).
+    // Per-stream EP_map_for_one_stream_PID() bodies. The per-stream
+    // `body_addr` is documented as "offset from the first byte of the
+    // CPI block", but empirically — verified against a 2017
+    // commercially-pressed BD-ROM — the base is the position of the
+    // `reserved+N_streams` byte, i.e. AFTER the length u32 (`cpi_len`)
+    // and the head u16. So:
+    //
+    //   body_abs = cpi_start + 4 (length u32) + 2 (head u16) + body_addr
+    //            = cpi_start + 6 + body_addr
+    //
+    // For a single-stream EP_map (the common case on movie discs),
+    // body_addr = headers_size + 2 (reserved + N bytes) = 12 + 2 = 14.
     let mut ep_map = Vec::with_capacity(num_streams);
     for h in &headers {
         let body_abs = cpi_start
-            .checked_add(h.body_addr as usize)
+            .checked_add(6)
+            .and_then(|b| b.checked_add(h.body_addr as usize))
             .ok_or_else(|| BlurayError::malformed("EP_map body_addr overflow"))?;
         if body_abs >= body_end {
             return Err(BlurayError::malformed(
@@ -647,6 +657,11 @@ fn encode_cpi(cpi: &Cpi) -> Vec<u8> {
     let bodies_start_offset =
         4 /*length u32*/ + 2 /*head*/ + 1 /*reserved*/ + 1 /*N*/ + headers_size;
     let bodies_start_in_body = bodies_start_offset - 4; // exclude the length u32 itself
+                                                        // `body_addr` is "offset from the position of the reserved+N byte"
+                                                        // — i.e. AFTER the length u32 AND the head u16. Subtract 6 from
+                                                        // `bodies_start_offset` to land in that base. See the parser's
+                                                        // matching comment.
+    let bodies_start_in_body_addr_base = bodies_start_offset - 6;
 
     let mut header_metadata: Vec<(u16, u8, u32, u32, u32)> = Vec::with_capacity(cpi.ep_map.len());
     let mut bodies: Vec<u8> = Vec::new();
@@ -669,7 +684,7 @@ fn encode_cpi(cpi: &Cpi) -> Vec<u8> {
 
         let n_coarse = buckets.len() as u32;
         let n_fine = ep.entries.len() as u32;
-        let body_addr = (bodies_start_offset + bodies.len()) as u32;
+        let body_addr = (bodies_start_in_body_addr_base + bodies.len()) as u32;
 
         // Build this stream's body.
         let fine_table_start_address: u32 = 4 + 8 * n_coarse; // relative to body start
