@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-bluray/compare/v0.0.1...v0.0.2) - 2026-05-29
+
+### Other
+
+- title-relative chapter list from PlayListMark entry marks
+- multi-angle PlayItem parsing + Disc::open_title_with_angle
+- add iter_source_packets + strip_tp_extra_to_vec
+- scrub libaacs/libbluray function-name citations from doc-comments
+- VUK lookup cascade — KEYDB → on-disk cache → online derivation
+- keyframe-aligned TitleSource::seek_to over CPI EP_map (Phase 2b)
+- decode CPI EP_map per BD-ROM AV §5.7
+- derive disc_id by hashing AACS/Unit_Key_RO.inf, not the drive Volume ID
+- macos drive: add MMCDeviceInterface fallback when SCSITaskUserClient is unavailable
+- macos drive: walk parent chain when SCSITaskUserClient plugin isn't on the matched service
+- real IOKit/MMC AACS Volume Identifier reader
+- add platform module + rewire AACS adapter for drive→disc_id flow
+- hard EOF at output_total to bound runaway readers
+- oxideav-aacs 0.1 (was 0.0 — release-plz bumped aacs to 0.1.0)
+- surface every early-bail path with stderr diagnostic
+- rustfmt 1.95 collapse on aacs_adapter
+- dump KEYDB entries + AACS/ contents + cert head on failure
+- trial every CPS Unit + consume pre-unwrapped Unit Keys
+- hard-fail when AACS/ dir present but no VUK matches
+- integrate decryption into bluray:// source driver
+- support backwards seek via rewind + forward-skip
+- seek for rewind / end-position / forward-skip
+
 ### Added
 
 - **Title-relative chapter list from PlayListMark entry marks** (`mpls`
