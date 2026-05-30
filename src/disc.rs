@@ -117,6 +117,27 @@ impl Disc {
         &self.titles
     }
 
+    /// Best-effort UDF volume label, decoded from the Primary Volume
+    /// Descriptor's `volume_identifier` d-string (ECMA-167 §10.1) when
+    /// `disc_root` happens to be a raw UDF image / block device.
+    ///
+    /// Most callers reach `Disc` via [`Self::mount`], which today only
+    /// accepts a *mounted filesystem* directory (the BDMV tree already
+    /// exposed by the OS). For those mounts the volume identifier lives
+    /// in the underlying block device's PVD, which the filesystem
+    /// driver has already consumed and discarded — there's nothing left
+    /// at `self.root` for us to parse, and this method returns `None`.
+    ///
+    /// When `self.root` *is* a regular file (an `.iso` / `.img` UDF
+    /// image), we open it, walk AVDP → main VDS → PVD, and return the
+    /// decoded label. Any I/O or parse error fails over to `None` so a
+    /// downstream muxer can fall back to a "untitled disc" label rather
+    /// than aborting.
+    pub fn volume_label(&self) -> Option<String> {
+        let f = File::open(&self.root).ok()?;
+        crate::udf::read_volume_label(f).ok()
+    }
+
     /// Pick the longest HDMV title. BD-J titles are skipped because
     /// Phase 1 cannot execute their navigation script.
     pub fn longest_title(&self) -> Option<&TitleInfo> {

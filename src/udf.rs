@@ -1055,6 +1055,19 @@ pub struct DirEntry {
     pub is_directory: bool,
 }
 
+/// Best-effort read of the UDF volume identifier (the Primary Volume
+/// Descriptor's `volume_identifier` d-string, §10.1) from a raw UDF
+/// image / block device.
+///
+/// Walks the AVDP at sector 256 → main Volume Descriptor Sequence →
+/// PVD. Returns the decoded `volume_identifier` on success. Any I/O or
+/// parse error surfaces as a [`BlurayError`]; the caller can decide
+/// whether to fall through to `None` at the high-level surface.
+pub fn read_volume_label<R: Read + Seek>(reader: R) -> Result<String> {
+    let disc = UdfDisc::open(reader)?;
+    Ok(disc.volume_identifier)
+}
+
 // ─────────────────────── sector helpers ───────────────────────
 
 fn read_sector<R: Read + Seek>(r: &mut R, sector: u64) -> Result<[u8; SECTOR_SIZE as usize]> {

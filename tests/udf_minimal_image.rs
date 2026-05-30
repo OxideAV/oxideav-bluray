@@ -221,8 +221,10 @@ fn make_fid(name: &str, block: u32, partition_ref: u16, is_dir: bool) -> Vec<u8>
     out
 }
 
-#[test]
-fn mount_synthetic_udf_and_walk_root() {
+/// Build the synthetic UDF image used by both the mount/walk test and
+/// the volume-label extraction test. The PVD encodes the 8-bit
+/// d-string `"SYN"` as `volume_identifier`.
+fn build_synthetic_udf_image() -> Vec<u8> {
     // Image: 512 sectors × 2048 bytes = 1 MiB.
     let mut image = vec![0u8; 512 * SECTOR];
 
@@ -322,6 +324,13 @@ fn mount_synthetic_udf_and_walk_root() {
     test_fe[176..181].copy_from_slice(b"HELLO");
     place(&mut image, 302, &test_fe);
 
+    image
+}
+
+#[test]
+fn mount_synthetic_udf_and_walk_root() {
+    let image = build_synthetic_udf_image();
+
     // Mount it.
     let mut disc = UdfDisc::open(Cursor::new(image)).expect("mount synthetic UDF");
     assert_eq!(disc.partition_start_sector, 300);
@@ -353,4 +362,66 @@ fn mount_synthetic_udf_and_walk_root() {
         std::any::type_name::<PrimaryVolumeDescriptor>(),
         std::any::type_name::<ShortAd>(),
     );
+}
+
+#[test]
+fn read_volume_label_extracts_pvd_identifier() {
+    // The synthetic image's PVD encodes the d-string "SYN".
+    let image = build_synthetic_udf_image();
+    let label = oxideav_bluray::udf::read_volume_label(Cursor::new(image))
+        .expect("read_volume_label on synthetic image");
+    assert_eq!(label, "SYN");
+}
+
+#[test]
+fn disc_volume_label_returns_none_for_filesystem_root() {
+    // `Disc::volume_label()` returns `None` when `self.root` is a
+    // directory (the canonical filesystem-mount case) — the underlying
+    // block device's PVD has already been consumed by the OS driver,
+    // there's nothing for us to parse. Build a minimal BDMV/ tree so
+    // `Disc::mount` succeeds, then assert the label probe falls through
+    // cleanly to `None` instead of erroring.
+    use std::fs;
+    use std::io::Write;
+
+    use oxideav_bluray::bdmv::index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType};
+
+    let pid = std::process::id();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = std::env::temp_dir().join(format!("oxideav-bluray-vol-label-{pid}-{nonce}"));
+    fs::create_dir_all(tmp.join("BDMV")).unwrap();
+
+    let idx = IndexBdmv {
+        version: *b"0200",
+        app_info: AppInfoBdmv {
+            initial_output_mode_preference: 0,
+            content_exist_flag: 1,
+            video_format: 6,
+            frame_rate: 4,
+        },
+        first_playback_title: IndexEntry {
+            object: IndexObjectType::Hdmv {
+                playback_type: 0,
+                movie_object_id_ref: 0,
+            },
+        },
+        menu_title: IndexEntry {
+            object: IndexObjectType::Hdmv {
+                playback_type: 1,
+                movie_object_id_ref: 0,
+            },
+        },
+        titles: vec![],
+    };
+    let mut f = fs::File::create(tmp.join("BDMV/index.bdmv")).unwrap();
+    f.write_all(&idx.encode()).unwrap();
+    drop(f);
+
+    let disc = oxideav_bluray::Disc::mount(&tmp).expect("mount filesystem-style BDMV");
+    assert_eq!(disc.volume_label(), None);
+
+    let _ = fs::remove_dir_all(&tmp);
 }
