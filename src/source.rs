@@ -421,10 +421,227 @@ pub fn open_bluray(uri: &str) -> oxideav_core::Result<Box<dyn oxideav_core::Byte
     Ok(Box::new(src))
 }
 
+/// `bluray://` opener that returns a [`oxideav_core::MultiTitleSource`]
+/// — one "title" per emitted chapter (when `?chapters=...` is set)
+/// or a single title carrying the whole BD title bytes (when only
+/// `?title=N` or nothing is set).
+///
+/// This is the registry opener `bluray://` is registered under. The
+/// older byte-shape [`open_bluray`] stays available for callers that
+/// just want one byte stream and don't go through the registry.
+#[cfg(feature = "registry")]
+pub fn open_bluray_multi_title(
+    uri: &str,
+) -> oxideav_core::Result<Box<dyn oxideav_core::MultiTitleSource>> {
+    use oxideav_core::Error as CoreError;
+    let parsed = parse_bluray_uri(uri).map_err(|e| CoreError::invalid(e.to_string()))?;
+    let root = match parsed.target {
+        BlurayUriTarget::AutoDetect => detect_disc_root()
+            .map_err(|e| CoreError::invalid(e.to_string()))?
+            .ok_or_else(|| CoreError::invalid("no BD-ROM mount found"))?,
+        BlurayUriTarget::Path(p) => {
+            if !p.is_dir() {
+                return Err(CoreError::invalid(format!(
+                    "bluray:// path {} is not a directory (raw-device support is Phase 2)",
+                    p.display()
+                )));
+            }
+            p
+        }
+    };
+    let disc = Disc::mount(&root).map_err(|e| CoreError::invalid(e.to_string()))?;
+    let title = match parsed.title_id {
+        Some(id) => {
+            let idx = (id as usize).checked_sub(1).ok_or_else(|| {
+                CoreError::invalid(format!("bluray://?title={id} — titles are 1-based"))
+            })?;
+            disc.titles()
+                .get(idx)
+                .ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "bluray://?title={id} — disc only has {} title(s)",
+                        disc.titles().len()
+                    ))
+                })?
+                .clone()
+        }
+        None => disc
+            .longest_title()
+            .ok_or_else(|| CoreError::invalid("disc has no playable HDMV titles"))?
+            .clone(),
+    };
+
+    // Resolve which chapter indices we emit. `ChapterSelector::All`
+    // collapses to "one segment = whole title"; the other variants
+    // produce one segment per chapter id.
+    let chapter_list = match &parsed.chapter_selector {
+        ChapterSelector::All => None,
+        ChapterSelector::Range { start, end } => {
+            let total = disc.chapters(&title).len() as u32;
+            let end = end.unwrap_or(total);
+            if *start == 0 || end == 0 {
+                return Err(CoreError::invalid(
+                    "bluray://?chapters= — chapter ids are 1-based",
+                ));
+            }
+            if *start > end {
+                return Err(CoreError::invalid(format!(
+                    "bluray://?chapters={start}-{end} — start > end"
+                )));
+            }
+            Some((*start..=end).collect::<Vec<u32>>())
+        }
+        ChapterSelector::List(ids) => Some(ids.clone()),
+    };
+
+    // Disc-level metadata — surface the volume label and the BDMT
+    // `<di:name>` when present so a downstream menu can use them.
+    let mut metadata: Vec<(String, String)> = Vec::new();
+    if let Some(label) = disc.volume_label() {
+        metadata.push(("volume_label".to_string(), label));
+    }
+    if let Some(m) = disc.title_meta() {
+        metadata.push(("disc_title".to_string(), m.title));
+        if let Some(lang) = m.language {
+            metadata.push(("disc_title_language".to_string(), lang));
+        }
+    }
+
+    Ok(Box::new(BluRayMultiTitleSource {
+        disc_root: root,
+        title,
+        chapter_list,
+        metadata,
+    }))
+}
+
+/// Concrete implementor of [`oxideav_core::MultiTitleSource`] for the
+/// `bluray://` scheme. Holds the parsed disc root + BD title +
+/// resolved chapter-emit plan. AACS decryption is re-resolved on
+/// each `open_title` call (the trait method is `&mut self` but the
+/// decryptor isn't cloneable, so we can't cache one).
+#[cfg(feature = "registry")]
+struct BluRayMultiTitleSource {
+    disc_root: std::path::PathBuf,
+    title: crate::TitleInfo,
+    /// `None` → emit one segment = whole title.
+    /// `Some(ids)` → emit one segment per chapter id, in the given order.
+    chapter_list: Option<Vec<u32>>,
+    metadata: Vec<(String, String)>,
+}
+
+#[cfg(feature = "registry")]
+impl BluRayMultiTitleSource {
+    /// Mount the disc fresh + resolve a decryptor — done once per
+    /// `open_title` call. Keeps the trait method's lifetime simple
+    /// (no shared mutable Disc state).
+    fn fresh_disc_and_decryptor(
+        &self,
+    ) -> oxideav_core::Result<(crate::Disc, Option<Box<dyn crate::StreamDecryptor>>)> {
+        use oxideav_core::Error as CoreError;
+        let disc =
+            crate::Disc::mount(&self.disc_root).map_err(|e| CoreError::invalid(e.to_string()))?;
+        let decryptor: Option<Box<dyn crate::StreamDecryptor>> = {
+            #[cfg(feature = "aacs")]
+            {
+                crate::aacs_adapter::try_resolve_aacs(&self.disc_root)
+                    .map_err(|e| CoreError::invalid(format!("AACS resolve: {e}")))?
+            }
+            #[cfg(not(feature = "aacs"))]
+            {
+                None
+            }
+        };
+        Ok((disc, decryptor))
+    }
+}
+
+#[cfg(feature = "registry")]
+impl oxideav_core::MultiTitleSource for BluRayMultiTitleSource {
+    fn title_count(&self) -> usize {
+        match &self.chapter_list {
+            None => 1,
+            Some(ids) => ids.len(),
+        }
+    }
+
+    fn open_title(
+        &mut self,
+        index: usize,
+    ) -> oxideav_core::Result<Box<dyn oxideav_core::BytesSource>> {
+        use oxideav_core::Error as CoreError;
+        let (disc, decryptor) = self.fresh_disc_and_decryptor()?;
+        match &self.chapter_list {
+            None => {
+                if index != 0 {
+                    return Err(CoreError::invalid(format!(
+                        "bluray:// MultiTitleSource: index {index} out of range (have 1 title)"
+                    )));
+                }
+                let src = disc
+                    .open_title(&self.title, decryptor)
+                    .map_err(|e| CoreError::invalid(e.to_string()))?;
+                Ok(Box::new(src))
+            }
+            Some(ids) => {
+                let id = *ids.get(index).ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "bluray:// MultiTitleSource: index {index} out of range (have {} titles)",
+                        ids.len()
+                    ))
+                })?;
+                let segments = disc
+                    .open_title_chapters(&self.title, &ChapterSelector::List(vec![id]), decryptor)
+                    .map_err(|e| CoreError::invalid(e.to_string()))?;
+                // `List(vec![id])` yields exactly one ChapterSegment.
+                let mut it = segments;
+                let seg = it
+                    .next()
+                    .ok_or_else(|| CoreError::invalid("chapter segments iter empty"))?
+                    .map_err(|e| CoreError::invalid(e.to_string()))?;
+                Ok(Box::new(std::io::Cursor::new(seg.bytes)))
+            }
+        }
+    }
+
+    fn title_label(&self, index: usize) -> String {
+        match &self.chapter_list {
+            None => format!("t{:02}", self.title.id),
+            Some(ids) => format!("c{:02}", ids[index]),
+        }
+    }
+
+    fn title_display_name(&self, index: usize) -> Option<String> {
+        match &self.chapter_list {
+            None => Some(format!("Title {}", self.title.id)),
+            Some(ids) => Some(format!("Chapter {}", ids[index])),
+        }
+    }
+
+    fn title_container_hint(&self, _index: usize) -> Option<&'static str> {
+        // Every BD title is BDAV-wrapped MPEG-TS. The chapter-segment
+        // bytes are already TP_extra-stripped clean MPEG-TS; the
+        // whole-title byte stream is a sequence of 192-byte source
+        // packets that downstream callers strip themselves.
+        Some("mpegts")
+    }
+
+    fn metadata(&self) -> &[(String, String)] {
+        &self.metadata
+    }
+}
+
 /// Register the `bluray` scheme with a [`oxideav_core::RuntimeContext`].
+///
+/// Registers as a [`oxideav_core::MultiTitleSource`] opener — the
+/// scheme can emit one byte stream per chapter (or one for the whole
+/// title when `?chapters=` is absent). Single-byte-stream callers
+/// can still use [`open_bluray`] directly to get a [`TitleSource`]
+/// without going through the registry.
 #[cfg(feature = "registry")]
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
-    ctx.sources.register_bytes("bluray", open_bluray);
+    ctx.sources
+        .register_multi_title("bluray", open_bluray_multi_title);
 }
 
 #[cfg(test)]
