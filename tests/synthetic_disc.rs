@@ -13,7 +13,8 @@ use std::path::Path;
 
 use oxideav_bluray::bdmv::index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType};
 use oxideav_bluray::bdmv::mpls::{
-    AppInfoPlayList, ConnectionCondition, PlayItem, PlayList, PlayListMpls, StnTableSummary,
+    AppInfoPlayList, ConnectionCondition, PlayItem, PlayList, PlayListMpls, PrimaryAudioStream,
+    PrimaryVideoStream, StnTable, StreamCodingType,
 };
 use oxideav_bluray::{Disc, TitleKind, M2TS_PACKET_LEN, TS_PACKET_LEN};
 
@@ -71,10 +72,22 @@ fn synthetic_bdmv_mount_and_stream() {
                 out_time_ticks: 45_000 * 10, // 10 s
                 multi_clip_count: 1,
                 angles: Vec::new(),
-                stn_table: StnTableSummary {
-                    num_primary_video: 1,
-                    num_primary_audio: 1,
-                    ..StnTableSummary::default()
+                stn_table: StnTable {
+                    primary_video: vec![PrimaryVideoStream {
+                        elementary_pid: 0x1011,
+                        coding_type: StreamCodingType::AvcVideo,
+                        video_format: 0x06,
+                        frame_rate: 0x03,
+                        aspect_ratio: 0x03,
+                    }],
+                    primary_audio: vec![PrimaryAudioStream {
+                        elementary_pid: 0x1100,
+                        coding_type: StreamCodingType::Ac3Audio,
+                        audio_format: 0x03,
+                        sample_rate: 0x01,
+                        language_code: *b"eng",
+                    }],
+                    ..StnTable::default()
                 },
             }],
             sub_paths: vec![],

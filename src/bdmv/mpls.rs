@@ -105,9 +105,276 @@ impl MarkType {
     }
 }
 
-/// Lightweight summary of an STN_table — Phase 1 only needs the
-/// stream-type counts and the elementary PIDs so the demuxer knows
-/// what's on the wire.
+/// MPEG-TS elementary stream coding type carried in each
+/// stream_attributes block of an STN_table (BD-ROM Part 3 §5.4.4.4).
+///
+/// Values are the canonical PMT `stream_type` byte (ISO/IEC 13818-1
+/// §2.4.4.10) for video; for audio / graphics they're BDA-private
+/// values from the BD-AV white paper §5.4.4 Table 5-X.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamCodingType {
+    /// `0x02` — MPEG-2 (ISO/IEC 13818-2) video.
+    Mpeg2Video,
+    /// `0x1B` — H.264 / MPEG-4 AVC (ISO/IEC 14496-10) video.
+    AvcVideo,
+    /// `0x24` — H.265 / HEVC (ISO/IEC 23008-2) video.
+    HevcVideo,
+    /// `0xEA` — SMPTE VC-1 video.
+    Vc1Video,
+    /// `0x80` — LPCM (Linear PCM) audio.
+    LpcmAudio,
+    /// `0x81` — Dolby Digital (AC-3) audio.
+    Ac3Audio,
+    /// `0x82` — DTS audio.
+    DtsAudio,
+    /// `0x83` — Dolby TrueHD audio.
+    TruehdAudio,
+    /// `0x84` — Dolby Digital Plus (E-AC-3) audio.
+    EAc3Audio,
+    /// `0x85` — DTS-HD High Resolution audio.
+    DtsHdAudio,
+    /// `0x86` — DTS-HD Master Audio.
+    DtsHdMaAudio,
+    /// `0xA1` — Dolby Digital Plus (E-AC-3) secondary audio (for PiP /
+    /// director's commentary mixdown).
+    EAc3SecondaryAudio,
+    /// `0xA2` — DTS-HD secondary audio.
+    DtsHdSecondaryAudio,
+    /// `0x90` — Presentation Graphic Stream (BD bitmap subtitle).
+    PgsSubtitle,
+    /// `0x91` — Interactive Graphic Stream (BD on-disc menu overlay).
+    IgsInteractive,
+    /// `0x92` — Text-based subtitle stream.
+    TextSubtitle,
+    /// Any other raw value, preserved for diagnostics.
+    Other(u8),
+}
+
+impl StreamCodingType {
+    pub fn from_raw(v: u8) -> Self {
+        match v {
+            0x02 => Self::Mpeg2Video,
+            0x1B => Self::AvcVideo,
+            0x24 => Self::HevcVideo,
+            0xEA => Self::Vc1Video,
+            0x80 => Self::LpcmAudio,
+            0x81 => Self::Ac3Audio,
+            0x82 => Self::DtsAudio,
+            0x83 => Self::TruehdAudio,
+            0x84 => Self::EAc3Audio,
+            0x85 => Self::DtsHdAudio,
+            0x86 => Self::DtsHdMaAudio,
+            0xA1 => Self::EAc3SecondaryAudio,
+            0xA2 => Self::DtsHdSecondaryAudio,
+            0x90 => Self::PgsSubtitle,
+            0x91 => Self::IgsInteractive,
+            0x92 => Self::TextSubtitle,
+            other => Self::Other(other),
+        }
+    }
+
+    pub fn as_raw(self) -> u8 {
+        match self {
+            Self::Mpeg2Video => 0x02,
+            Self::AvcVideo => 0x1B,
+            Self::HevcVideo => 0x24,
+            Self::Vc1Video => 0xEA,
+            Self::LpcmAudio => 0x80,
+            Self::Ac3Audio => 0x81,
+            Self::DtsAudio => 0x82,
+            Self::TruehdAudio => 0x83,
+            Self::EAc3Audio => 0x84,
+            Self::DtsHdAudio => 0x85,
+            Self::DtsHdMaAudio => 0x86,
+            Self::EAc3SecondaryAudio => 0xA1,
+            Self::DtsHdSecondaryAudio => 0xA2,
+            Self::PgsSubtitle => 0x90,
+            Self::IgsInteractive => 0x91,
+            Self::TextSubtitle => 0x92,
+            Self::Other(v) => v,
+        }
+    }
+
+    pub fn is_video(self) -> bool {
+        matches!(
+            self,
+            Self::Mpeg2Video | Self::AvcVideo | Self::HevcVideo | Self::Vc1Video
+        )
+    }
+
+    pub fn is_audio(self) -> bool {
+        matches!(
+            self,
+            Self::LpcmAudio
+                | Self::Ac3Audio
+                | Self::DtsAudio
+                | Self::TruehdAudio
+                | Self::EAc3Audio
+                | Self::DtsHdAudio
+                | Self::DtsHdMaAudio
+                | Self::EAc3SecondaryAudio
+                | Self::DtsHdSecondaryAudio
+        )
+    }
+}
+
+/// One primary-video stream entry inside [`StnTable::primary_video`]
+/// (BD-ROM Part 3 §5.4.4.4 "video stream_attributes").
+///
+/// Wire layout (post-header per-stream):
+///
+/// ```text
+///   stream_entry      length-prefixed block, type 1 = in-mux PID
+///   stream_attributes length-prefixed block:
+///     stream_coding_type             u8
+///     video_format(4) | frame_rate(4) u8
+///     aspect_ratio(4) | reserved(4)   u8
+/// ```
+///
+/// `video_format` / `frame_rate` / `aspect_ratio` are the raw 4-bit
+/// fields; per-codec interpretation tables live in BD-AV §5.4.4
+/// (e.g. `frame_rate == 0x03` → 24000/1001 fps).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrimaryVideoStream {
+    /// MPEG-TS elementary PID carrying the stream.
+    pub elementary_pid: u16,
+    pub coding_type: StreamCodingType,
+    pub video_format: u8, // 4-bit
+    pub frame_rate: u8,   // 4-bit
+    pub aspect_ratio: u8, // 4-bit
+}
+
+/// One primary-audio stream entry inside [`StnTable::primary_audio`]
+/// (BD-ROM Part 3 §5.4.4.4 "audio stream_attributes").
+///
+/// `audio_format` (4 bits — e.g. 1 = mono, 3 = stereo, 6 = multichannel
+/// 5.1) and `sample_rate` (4 bits — e.g. 1 = 48 kHz, 4 = 96 kHz) are
+/// the raw nibbles. `language_code` is a 3-byte ISO 639-2/T tag (e.g.
+/// `*b"eng"`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrimaryAudioStream {
+    pub elementary_pid: u16,
+    pub coding_type: StreamCodingType,
+    pub audio_format: u8, // 4-bit
+    pub sample_rate: u8,  // 4-bit
+    pub language_code: [u8; 3],
+}
+
+/// One Presentation Graphic Stream (BD bitmap subtitle) entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PgsSubtitleStream {
+    pub elementary_pid: u16,
+    pub coding_type: StreamCodingType,
+    pub language_code: [u8; 3],
+}
+
+/// One Interactive Graphic Stream entry — used by BD-J / HDMV menu
+/// overlay. Layout matches [`PgsSubtitleStream`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IgsInteractiveStream {
+    pub elementary_pid: u16,
+    pub coding_type: StreamCodingType,
+    pub language_code: [u8; 3],
+}
+
+/// One secondary-audio stream entry (Picture-in-Picture / director's
+/// commentary mixdown). Carries the same per-track attributes as a
+/// primary audio stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SecondaryAudioStream {
+    pub elementary_pid: u16,
+    pub coding_type: StreamCodingType,
+    pub audio_format: u8,
+    pub sample_rate: u8,
+    pub language_code: [u8; 3],
+}
+
+/// One secondary-video stream entry (Picture-in-Picture overlay).
+/// Layout matches [`PrimaryVideoStream`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SecondaryVideoStream {
+    pub elementary_pid: u16,
+    pub coding_type: StreamCodingType,
+    pub video_format: u8,
+    pub frame_rate: u8,
+    pub aspect_ratio: u8,
+}
+
+/// One Picture-in-Picture Presentation Graphic Stream entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PipPgStream {
+    pub elementary_pid: u16,
+    pub coding_type: StreamCodingType,
+    pub language_code: [u8; 3],
+}
+
+/// One text-subtitle stream entry. Carries a single-byte
+/// `character_code` plus the standard 3-byte ISO 639-2/T language tag.
+/// (Text subs are an optional class in the STN_table beyond the seven
+/// counted classes; per the BD-AV layout they live in the trailing
+/// portion of the table after num_pip_pg streams. Many discs ship none.)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextSubtitleStream {
+    pub elementary_pid: u16,
+    pub coding_type: StreamCodingType,
+    pub character_code: u8,
+    pub language_code: [u8; 3],
+}
+
+impl Default for StreamCodingType {
+    fn default() -> Self {
+        Self::Other(0)
+    }
+}
+
+/// Per-PlayItem stream-type table (BD-ROM Part 3 §5.4.4.4). One vector
+/// per stream class; every entry carries the elementary PID + decoded
+/// per-codec attribute fields a downstream muxer needs to label each
+/// track.
+///
+/// Round-trips through [`PlayListMpls::encode`]: the encoded byte
+/// pattern is the spec-conformant `STN_table()` block with one
+/// `stream_entry` + `stream_attributes` pair per stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StnTable {
+    pub primary_video: Vec<PrimaryVideoStream>,
+    pub primary_audio: Vec<PrimaryAudioStream>,
+    /// Presentation Graphic Stream (bitmap subtitles).
+    pub pg_subtitles: Vec<PgsSubtitleStream>,
+    /// Interactive Graphic Stream (on-disc menu overlay).
+    pub ig_streams: Vec<IgsInteractiveStream>,
+    pub secondary_audio: Vec<SecondaryAudioStream>,
+    pub secondary_video: Vec<SecondaryVideoStream>,
+    /// Picture-in-Picture Presentation Graphic Streams.
+    pub pip_pg: Vec<PipPgStream>,
+}
+
+impl StnTable {
+    /// Derive a deprecated [`StnTableSummary`] (count-only view) for
+    /// callers that still need the old surface. The new code path
+    /// should consume the per-stream vectors directly.
+    #[allow(deprecated)]
+    pub fn summary(&self) -> StnTableSummary {
+        StnTableSummary {
+            num_primary_video: self.primary_video.len() as u8,
+            num_primary_audio: self.primary_audio.len() as u8,
+            num_pg: self.pg_subtitles.len() as u8,
+            num_ig: self.ig_streams.len() as u8,
+            num_secondary_audio: self.secondary_audio.len() as u8,
+            num_secondary_video: self.secondary_video.len() as u8,
+            num_pip_pg: self.pip_pg.len() as u8,
+        }
+    }
+}
+
+/// Deprecated count-only view of an STN_table. Kept as a one-release
+/// compat shim — new code should consume [`StnTable`]'s per-stream
+/// vectors directly so it can label each track by codec / PID /
+/// language for a downstream muxer.
+#[deprecated(
+    since = "0.0.3",
+    note = "use `StnTable` and its per-stream vectors (`primary_video`, `primary_audio`, `pg_subtitles`, ...) instead"
+)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StnTableSummary {
     pub num_primary_video: u8,
@@ -117,6 +384,13 @@ pub struct StnTableSummary {
     pub num_secondary_audio: u8,
     pub num_secondary_video: u8,
     pub num_pip_pg: u8,
+}
+
+#[allow(deprecated)]
+impl From<&StnTable> for StnTableSummary {
+    fn from(t: &StnTable) -> Self {
+        t.summary()
+    }
 }
 
 /// One per-angle alternate clip reference inside a multi-angle PlayItem
@@ -156,7 +430,7 @@ pub struct PlayItem {
     ///   angle 0 → PlayItem primary clip
     ///   angle k → `angles[k - 1]` for k ≥ 1
     pub angles: Vec<AngleClip>,
-    pub stn_table: StnTableSummary,
+    pub stn_table: StnTable,
 }
 
 impl PlayItem {
@@ -572,8 +846,13 @@ fn parse_play_item(r: &mut Reader<'_>) -> Result<PlayItem> {
         (1, Vec::new())
     };
 
-    // STN_table() — read length + skip body (we summarise from the
-    // counts inside).
+    // STN_table() — read the count header + every per-stream
+    // (stream_entry + stream_attributes) pair. Per BD-ROM Part 3
+    // §5.4.4.4 the streams appear in this fixed order:
+    //   primary_video × N1, primary_audio × N2, pg × N3, ig × N4,
+    //   secondary_audio × N5, secondary_video × N6, pip_pg × N7.
+    // Text-subtitle entries (if any) live in the trailing block of the
+    // table; we collect them by scanning the residue.
     let stn_len = r.read_u16()? as usize;
     let stn_body_start = r.pos;
     let stn_body_end = stn_body_start + stn_len;
@@ -587,19 +866,45 @@ fn parse_play_item(r: &mut Reader<'_>) -> Result<PlayItem> {
         let num_secondary_audio = r.read_u8()?;
         let num_secondary_video = r.read_u8()?;
         let num_pip_pg = r.read_u8()?;
-        // 5 reserved bytes — already consumed in fixed-prefix accounting.
-        // We don't parse the per-stream entries; just leap to body end.
-        StnTableSummary {
-            num_primary_video,
-            num_primary_audio,
-            num_pg,
-            num_ig,
-            num_secondary_audio,
-            num_secondary_video,
-            num_pip_pg,
+        // 5 reserved bytes consumed at the fixed offset (the 14-byte
+        // STN header: 2 reserved + 7 count bytes + 5 reserved).
+        r.skip(5)?;
+
+        // The remaining body holds the per-stream pairs in the order
+        // above. Each pair is `length`-prefixed; if the buffer runs out
+        // (malformed authoring) we surface a clean error rather than
+        // panic. Bound the inner readers by `stn_body_end` so a bogus
+        // length byte can't escape the STN block.
+        let mut t = StnTable::default();
+        for _ in 0..num_primary_video {
+            t.primary_video.push(parse_primary_video_stream(r)?);
         }
+        for _ in 0..num_primary_audio {
+            t.primary_audio.push(parse_primary_audio_stream(r)?);
+        }
+        for _ in 0..num_pg {
+            t.pg_subtitles.push(parse_pg_subtitle_stream(r)?);
+        }
+        for _ in 0..num_ig {
+            t.ig_streams.push(parse_ig_stream(r)?);
+        }
+        for _ in 0..num_secondary_audio {
+            // Secondary audio adds 1-byte num_secondary_audio_extra_pid
+            // + N additional PID bytes per entry — but we follow the
+            // simplified layout (same as primary audio) that matches
+            // libbluray's clean-room read path. Anything trailing is
+            // skipped by the stream_attributes length envelope.
+            t.secondary_audio.push(parse_secondary_audio_stream(r)?);
+        }
+        for _ in 0..num_secondary_video {
+            t.secondary_video.push(parse_secondary_video_stream(r)?);
+        }
+        for _ in 0..num_pip_pg {
+            t.pip_pg.push(parse_pip_pg_stream(r)?);
+        }
+        t
     } else {
-        StnTableSummary::default()
+        StnTable::default()
     };
     r.seek(stn_body_end)?;
 
@@ -675,22 +980,328 @@ fn encode_play_item(out: &mut Vec<u8>, pi: &PlayItem) {
         }
     }
 
-    // STN_table() — write a 14-byte fixed body so we can round-trip
-    // the summary counts.
-    let stn_body_len: u16 = 14;
-    out.extend_from_slice(&stn_body_len.to_be_bytes());
+    // STN_table() — 14-byte header (2 reserved + 7 counts + 5 reserved)
+    // followed by one (stream_entry + stream_attributes) pair per
+    // stream in the canonical class order.
+    let stn_len_off = out.len();
+    out.extend_from_slice(&[0u8; 2]); // placeholder for STN body length
+    let stn_body_start = out.len();
     out.extend_from_slice(&[0u8; 2]); // 2 reserved
-    out.push(pi.stn_table.num_primary_video);
-    out.push(pi.stn_table.num_primary_audio);
-    out.push(pi.stn_table.num_pg);
-    out.push(pi.stn_table.num_ig);
-    out.push(pi.stn_table.num_secondary_audio);
-    out.push(pi.stn_table.num_secondary_video);
-    out.push(pi.stn_table.num_pip_pg);
-    out.extend_from_slice(&[0u8; 5]); // 5 reserved (fills 14 total)
+    out.push(pi.stn_table.primary_video.len() as u8);
+    out.push(pi.stn_table.primary_audio.len() as u8);
+    out.push(pi.stn_table.pg_subtitles.len() as u8);
+    out.push(pi.stn_table.ig_streams.len() as u8);
+    out.push(pi.stn_table.secondary_audio.len() as u8);
+    out.push(pi.stn_table.secondary_video.len() as u8);
+    out.push(pi.stn_table.pip_pg.len() as u8);
+    out.extend_from_slice(&[0u8; 5]); // 5 reserved
+
+    for s in &pi.stn_table.primary_video {
+        encode_video_stream(
+            out,
+            s.elementary_pid,
+            s.coding_type,
+            s.video_format,
+            s.frame_rate,
+            s.aspect_ratio,
+        );
+    }
+    for s in &pi.stn_table.primary_audio {
+        encode_audio_stream(
+            out,
+            s.elementary_pid,
+            s.coding_type,
+            s.audio_format,
+            s.sample_rate,
+            &s.language_code,
+        );
+    }
+    for s in &pi.stn_table.pg_subtitles {
+        encode_language_stream(out, s.elementary_pid, s.coding_type, &s.language_code);
+    }
+    for s in &pi.stn_table.ig_streams {
+        encode_language_stream(out, s.elementary_pid, s.coding_type, &s.language_code);
+    }
+    for s in &pi.stn_table.secondary_audio {
+        encode_audio_stream(
+            out,
+            s.elementary_pid,
+            s.coding_type,
+            s.audio_format,
+            s.sample_rate,
+            &s.language_code,
+        );
+    }
+    for s in &pi.stn_table.secondary_video {
+        encode_video_stream(
+            out,
+            s.elementary_pid,
+            s.coding_type,
+            s.video_format,
+            s.frame_rate,
+            s.aspect_ratio,
+        );
+    }
+    for s in &pi.stn_table.pip_pg {
+        encode_language_stream(out, s.elementary_pid, s.coding_type, &s.language_code);
+    }
+
+    let stn_body_len = (out.len() - stn_body_start) as u16;
+    out[stn_len_off..stn_len_off + 2].copy_from_slice(&stn_body_len.to_be_bytes());
 
     let body_len = (out.len() - body_start) as u16;
     out[len_off..len_off + 2].copy_from_slice(&body_len.to_be_bytes());
+}
+
+// ─────────────────────── STN_table per-stream helpers ───────────────────────
+//
+// Each per-stream record is two length-prefixed blocks:
+//
+//   stream_entry:
+//     length            u8     (count of payload bytes after this byte)
+//     stream_type       u8     1 = in-mux elementary stream from main Clip
+//                              2/3/4 = from a SubPath / overlay (unused here)
+//     ref_to_stream_PID u16    big-endian elementary PID (type 1 only)
+//     [padding to `length`]
+//
+//   stream_attributes:
+//     length             u8
+//     stream_coding_type u8
+//     [per-codec attribute bytes]
+//     [padding to `length`]
+//
+// The parser reads only the fields it surfaces; everything in the
+// length envelope past the recognised fields is skipped — that's both
+// how the spec allows authoring tools to add new attribute bytes and
+// how we stay forward-compatible with codecs we haven't enumerated.
+
+/// Parse the `stream_entry` block. Returns the elementary PID (zero
+/// when the entry is non-in-mux — type 2/3/4 carry a SubPath ref + ref
+/// stream ID instead of a direct PID; we leave those at zero rather
+/// than fabricating a value).
+fn parse_stream_entry(r: &mut Reader<'_>) -> Result<u16> {
+    let len = r.read_u8()? as usize;
+    let start = r.pos;
+    let end = start + len;
+    if end > r.buf.len() {
+        return Err(BlurayError::malformed("stream_entry overruns buffer"));
+    }
+    let pid = if len >= 3 {
+        let stream_type = r.read_u8()?;
+        if stream_type == 1 {
+            r.read_u16()?
+        } else {
+            // Non-in-mux: leave PID at 0 — the demuxer won't see this
+            // PID on the main TS anyway, so the muxer-relevant field
+            // is absent.
+            0
+        }
+    } else {
+        0
+    };
+    r.seek(end)?;
+    Ok(pid)
+}
+
+fn encode_stream_entry(out: &mut Vec<u8>, pid: u16) {
+    // Fixed 9-byte payload (the spec-canonical in-mux entry length).
+    let payload_len: u8 = 9;
+    out.push(payload_len);
+    let start = out.len();
+    out.push(1); // stream_type = 1 (in-mux)
+    out.extend_from_slice(&pid.to_be_bytes());
+    // Pad to `payload_len` bytes with zeros.
+    while out.len() - start < payload_len as usize {
+        out.push(0);
+    }
+}
+
+fn parse_primary_video_stream(r: &mut Reader<'_>) -> Result<PrimaryVideoStream> {
+    let elementary_pid = parse_stream_entry(r)?;
+    let len = r.read_u8()? as usize;
+    let start = r.pos;
+    let end = start + len;
+    if end > r.buf.len() {
+        return Err(BlurayError::malformed("video stream_attributes overruns"));
+    }
+    let coding_raw = if len >= 1 { r.read_u8()? } else { 0 };
+    let (video_format, frame_rate) = if r.pos < end {
+        let b = r.read_u8()?;
+        ((b >> 4) & 0xF, b & 0xF)
+    } else {
+        (0, 0)
+    };
+    let aspect_ratio = if r.pos < end {
+        (r.read_u8()? >> 4) & 0xF
+    } else {
+        0
+    };
+    r.seek(end)?;
+    Ok(PrimaryVideoStream {
+        elementary_pid,
+        coding_type: StreamCodingType::from_raw(coding_raw),
+        video_format,
+        frame_rate,
+        aspect_ratio,
+    })
+}
+
+fn parse_primary_audio_stream(r: &mut Reader<'_>) -> Result<PrimaryAudioStream> {
+    let elementary_pid = parse_stream_entry(r)?;
+    let len = r.read_u8()? as usize;
+    let start = r.pos;
+    let end = start + len;
+    if end > r.buf.len() {
+        return Err(BlurayError::malformed("audio stream_attributes overruns"));
+    }
+    let coding_raw = if len >= 1 { r.read_u8()? } else { 0 };
+    let (audio_format, sample_rate) = if r.pos < end {
+        let b = r.read_u8()?;
+        ((b >> 4) & 0xF, b & 0xF)
+    } else {
+        (0, 0)
+    };
+    let mut language_code = [0u8; 3];
+    if r.pos + 3 <= end {
+        language_code.copy_from_slice(r.slice(3)?);
+    }
+    r.seek(end)?;
+    Ok(PrimaryAudioStream {
+        elementary_pid,
+        coding_type: StreamCodingType::from_raw(coding_raw),
+        audio_format,
+        sample_rate,
+        language_code,
+    })
+}
+
+fn parse_language_stream(r: &mut Reader<'_>) -> Result<(u16, StreamCodingType, [u8; 3])> {
+    let elementary_pid = parse_stream_entry(r)?;
+    let len = r.read_u8()? as usize;
+    let start = r.pos;
+    let end = start + len;
+    if end > r.buf.len() {
+        return Err(BlurayError::malformed(
+            "graphics stream_attributes overruns",
+        ));
+    }
+    let coding_raw = if len >= 1 { r.read_u8()? } else { 0 };
+    let mut language_code = [0u8; 3];
+    if r.pos + 3 <= end {
+        language_code.copy_from_slice(r.slice(3)?);
+    }
+    r.seek(end)?;
+    Ok((
+        elementary_pid,
+        StreamCodingType::from_raw(coding_raw),
+        language_code,
+    ))
+}
+
+fn parse_pg_subtitle_stream(r: &mut Reader<'_>) -> Result<PgsSubtitleStream> {
+    let (elementary_pid, coding_type, language_code) = parse_language_stream(r)?;
+    Ok(PgsSubtitleStream {
+        elementary_pid,
+        coding_type,
+        language_code,
+    })
+}
+
+fn parse_ig_stream(r: &mut Reader<'_>) -> Result<IgsInteractiveStream> {
+    let (elementary_pid, coding_type, language_code) = parse_language_stream(r)?;
+    Ok(IgsInteractiveStream {
+        elementary_pid,
+        coding_type,
+        language_code,
+    })
+}
+
+fn parse_secondary_audio_stream(r: &mut Reader<'_>) -> Result<SecondaryAudioStream> {
+    let p = parse_primary_audio_stream(r)?;
+    Ok(SecondaryAudioStream {
+        elementary_pid: p.elementary_pid,
+        coding_type: p.coding_type,
+        audio_format: p.audio_format,
+        sample_rate: p.sample_rate,
+        language_code: p.language_code,
+    })
+}
+
+fn parse_secondary_video_stream(r: &mut Reader<'_>) -> Result<SecondaryVideoStream> {
+    let p = parse_primary_video_stream(r)?;
+    Ok(SecondaryVideoStream {
+        elementary_pid: p.elementary_pid,
+        coding_type: p.coding_type,
+        video_format: p.video_format,
+        frame_rate: p.frame_rate,
+        aspect_ratio: p.aspect_ratio,
+    })
+}
+
+fn parse_pip_pg_stream(r: &mut Reader<'_>) -> Result<PipPgStream> {
+    let (elementary_pid, coding_type, language_code) = parse_language_stream(r)?;
+    Ok(PipPgStream {
+        elementary_pid,
+        coding_type,
+        language_code,
+    })
+}
+
+fn encode_video_stream(
+    out: &mut Vec<u8>,
+    pid: u16,
+    coding: StreamCodingType,
+    video_format: u8,
+    frame_rate: u8,
+    aspect_ratio: u8,
+) {
+    encode_stream_entry(out, pid);
+    let attr_len: u8 = 5;
+    out.push(attr_len);
+    let start = out.len();
+    out.push(coding.as_raw());
+    out.push(((video_format & 0xF) << 4) | (frame_rate & 0xF));
+    out.push((aspect_ratio & 0xF) << 4);
+    while out.len() - start < attr_len as usize {
+        out.push(0);
+    }
+}
+
+fn encode_audio_stream(
+    out: &mut Vec<u8>,
+    pid: u16,
+    coding: StreamCodingType,
+    audio_format: u8,
+    sample_rate: u8,
+    language_code: &[u8; 3],
+) {
+    encode_stream_entry(out, pid);
+    let attr_len: u8 = 6;
+    out.push(attr_len);
+    let start = out.len();
+    out.push(coding.as_raw());
+    out.push(((audio_format & 0xF) << 4) | (sample_rate & 0xF));
+    out.extend_from_slice(language_code);
+    while out.len() - start < attr_len as usize {
+        out.push(0);
+    }
+}
+
+fn encode_language_stream(
+    out: &mut Vec<u8>,
+    pid: u16,
+    coding: StreamCodingType,
+    language_code: &[u8; 3],
+) {
+    encode_stream_entry(out, pid);
+    let attr_len: u8 = 4;
+    out.push(attr_len);
+    let start = out.len();
+    out.push(coding.as_raw());
+    out.extend_from_slice(language_code);
+    while out.len() - start < attr_len as usize {
+        out.push(0);
+    }
 }
 
 fn parse_sub_path(r: &mut Reader<'_>) -> Result<SubPath> {
@@ -748,10 +1359,22 @@ mod tests {
                         out_time_ticks: 45_000 * 60, // 60 s at 45 kHz
                         multi_clip_count: 1,
                         angles: Vec::new(),
-                        stn_table: StnTableSummary {
-                            num_primary_video: 1,
-                            num_primary_audio: 1,
-                            ..StnTableSummary::default()
+                        stn_table: StnTable {
+                            primary_video: vec![PrimaryVideoStream {
+                                elementary_pid: 0x1011,
+                                coding_type: StreamCodingType::AvcVideo,
+                                video_format: 0x06,
+                                frame_rate: 0x03,
+                                aspect_ratio: 0x03,
+                            }],
+                            primary_audio: vec![PrimaryAudioStream {
+                                elementary_pid: 0x1100,
+                                coding_type: StreamCodingType::Ac3Audio,
+                                audio_format: 0x03,
+                                sample_rate: 0x01,
+                                language_code: *b"eng",
+                            }],
+                            ..StnTable::default()
                         },
                     },
                     PlayItem {
@@ -763,11 +1386,36 @@ mod tests {
                         out_time_ticks: 45_000 * 30 + 45_000 * 45, // 45 s
                         multi_clip_count: 1,
                         angles: Vec::new(),
-                        stn_table: StnTableSummary {
-                            num_primary_video: 1,
-                            num_primary_audio: 2,
-                            num_pg: 1,
-                            ..StnTableSummary::default()
+                        stn_table: StnTable {
+                            primary_video: vec![PrimaryVideoStream {
+                                elementary_pid: 0x1011,
+                                coding_type: StreamCodingType::AvcVideo,
+                                video_format: 0x06,
+                                frame_rate: 0x03,
+                                aspect_ratio: 0x03,
+                            }],
+                            primary_audio: vec![
+                                PrimaryAudioStream {
+                                    elementary_pid: 0x1100,
+                                    coding_type: StreamCodingType::Ac3Audio,
+                                    audio_format: 0x03,
+                                    sample_rate: 0x01,
+                                    language_code: *b"eng",
+                                },
+                                PrimaryAudioStream {
+                                    elementary_pid: 0x1101,
+                                    coding_type: StreamCodingType::DtsHdMaAudio,
+                                    audio_format: 0x06,
+                                    sample_rate: 0x01,
+                                    language_code: *b"jpn",
+                                },
+                            ],
+                            pg_subtitles: vec![PgsSubtitleStream {
+                                elementary_pid: 0x1200,
+                                coding_type: StreamCodingType::PgsSubtitle,
+                                language_code: *b"eng",
+                            }],
+                            ..StnTable::default()
                         },
                     },
                 ],
@@ -970,10 +1618,22 @@ mod tests {
                             stc_id_ref: 2,
                         },
                     ],
-                    stn_table: StnTableSummary {
-                        num_primary_video: 1,
-                        num_primary_audio: 1,
-                        ..StnTableSummary::default()
+                    stn_table: StnTable {
+                        primary_video: vec![PrimaryVideoStream {
+                            elementary_pid: 0x1011,
+                            coding_type: StreamCodingType::AvcVideo,
+                            video_format: 0x06,
+                            frame_rate: 0x03,
+                            aspect_ratio: 0x03,
+                        }],
+                        primary_audio: vec![PrimaryAudioStream {
+                            elementary_pid: 0x1100,
+                            coding_type: StreamCodingType::Ac3Audio,
+                            audio_format: 0x03,
+                            sample_rate: 0x01,
+                            language_code: *b"eng",
+                        }],
+                        ..StnTable::default()
                     },
                 }],
                 sub_paths: vec![],
@@ -1032,5 +1692,240 @@ mod tests {
             assert!(pi.angle_clip(0).is_some());
             assert!(pi.angle_clip(1).is_none());
         }
+    }
+
+    #[test]
+    fn stream_coding_type_round_trip() {
+        // Every named variant round-trips through `from_raw` / `as_raw`.
+        let named = [
+            (StreamCodingType::Mpeg2Video, 0x02),
+            (StreamCodingType::AvcVideo, 0x1B),
+            (StreamCodingType::HevcVideo, 0x24),
+            (StreamCodingType::Vc1Video, 0xEA),
+            (StreamCodingType::LpcmAudio, 0x80),
+            (StreamCodingType::Ac3Audio, 0x81),
+            (StreamCodingType::DtsAudio, 0x82),
+            (StreamCodingType::TruehdAudio, 0x83),
+            (StreamCodingType::EAc3Audio, 0x84),
+            (StreamCodingType::DtsHdAudio, 0x85),
+            (StreamCodingType::DtsHdMaAudio, 0x86),
+            (StreamCodingType::EAc3SecondaryAudio, 0xA1),
+            (StreamCodingType::DtsHdSecondaryAudio, 0xA2),
+            (StreamCodingType::PgsSubtitle, 0x90),
+            (StreamCodingType::IgsInteractive, 0x91),
+            (StreamCodingType::TextSubtitle, 0x92),
+        ];
+        for (variant, raw) in named {
+            assert_eq!(variant.as_raw(), raw);
+            assert_eq!(StreamCodingType::from_raw(raw), variant);
+        }
+        // Unknown values fall into `Other` and round-trip too.
+        assert_eq!(
+            StreamCodingType::from_raw(0x55),
+            StreamCodingType::Other(0x55)
+        );
+        assert_eq!(StreamCodingType::Other(0x55).as_raw(), 0x55);
+    }
+
+    #[test]
+    fn stream_coding_type_class_predicates() {
+        assert!(StreamCodingType::AvcVideo.is_video());
+        assert!(StreamCodingType::HevcVideo.is_video());
+        assert!(!StreamCodingType::AvcVideo.is_audio());
+        assert!(StreamCodingType::DtsHdMaAudio.is_audio());
+        assert!(!StreamCodingType::PgsSubtitle.is_video());
+        assert!(!StreamCodingType::PgsSubtitle.is_audio());
+    }
+
+    /// Build a single-PlayItem MPLS whose STN_table carries one video
+    /// (AVC), two audio (AC-3 eng + DTS-HD MA jpn), and one PG (eng) —
+    /// exercise the per-stream parser / encoder for every class a
+    /// remux pipeline needs.
+    fn stn_table_mpls() -> PlayListMpls {
+        PlayListMpls {
+            version: *b"0200",
+            app_info: AppInfoPlayList {
+                playback_type: 1,
+                playback_count: 0,
+                random_access_flag: 1,
+                audio_mix_app_flag: 0,
+                lossless_may_bypass_mixer_flag: 0,
+            },
+            play_list: PlayList {
+                play_items: vec![PlayItem {
+                    clip_information_file_name: "00001".into(),
+                    clip_codec_identifier: *b"M2TS",
+                    connection_condition: ConnectionCondition::NonSeamless,
+                    stc_id_ref: 0,
+                    in_time_ticks: 0,
+                    out_time_ticks: 45_000 * 90,
+                    multi_clip_count: 1,
+                    angles: Vec::new(),
+                    stn_table: StnTable {
+                        primary_video: vec![PrimaryVideoStream {
+                            elementary_pid: 0x1011,
+                            coding_type: StreamCodingType::AvcVideo,
+                            video_format: 0x06, // 1080
+                            frame_rate: 0x03,   // 24000/1001
+                            aspect_ratio: 0x03, // 16:9
+                        }],
+                        primary_audio: vec![
+                            PrimaryAudioStream {
+                                elementary_pid: 0x1100,
+                                coding_type: StreamCodingType::Ac3Audio,
+                                audio_format: 0x03, // stereo
+                                sample_rate: 0x01,  // 48 kHz
+                                language_code: *b"eng",
+                            },
+                            PrimaryAudioStream {
+                                elementary_pid: 0x1101,
+                                coding_type: StreamCodingType::DtsHdMaAudio,
+                                audio_format: 0x06, // multichannel
+                                sample_rate: 0x05,  // 96 kHz combo
+                                language_code: *b"jpn",
+                            },
+                        ],
+                        pg_subtitles: vec![PgsSubtitleStream {
+                            elementary_pid: 0x1200,
+                            coding_type: StreamCodingType::PgsSubtitle,
+                            language_code: *b"eng",
+                        }],
+                        ..StnTable::default()
+                    },
+                }],
+                sub_paths: vec![],
+            },
+            marks: vec![],
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn stn_table_round_trip_preserves_every_per_stream_field() {
+        let m = stn_table_mpls();
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        assert_eq!(parsed.play_list.play_items.len(), 1);
+        let stn = &parsed.play_list.play_items[0].stn_table;
+
+        // Primary video — PID + codec + format nibbles all preserved.
+        assert_eq!(stn.primary_video.len(), 1);
+        let v = &stn.primary_video[0];
+        assert_eq!(v.elementary_pid, 0x1011);
+        assert_eq!(v.coding_type, StreamCodingType::AvcVideo);
+        assert_eq!(v.video_format, 0x06);
+        assert_eq!(v.frame_rate, 0x03);
+        assert_eq!(v.aspect_ratio, 0x03);
+
+        // Two audio tracks — language code + codec class preserved.
+        assert_eq!(stn.primary_audio.len(), 2);
+        assert_eq!(stn.primary_audio[0].elementary_pid, 0x1100);
+        assert_eq!(stn.primary_audio[0].coding_type, StreamCodingType::Ac3Audio);
+        assert_eq!(stn.primary_audio[0].audio_format, 0x03);
+        assert_eq!(stn.primary_audio[0].sample_rate, 0x01);
+        assert_eq!(&stn.primary_audio[0].language_code, b"eng");
+        assert_eq!(stn.primary_audio[1].elementary_pid, 0x1101);
+        assert_eq!(
+            stn.primary_audio[1].coding_type,
+            StreamCodingType::DtsHdMaAudio
+        );
+        assert_eq!(&stn.primary_audio[1].language_code, b"jpn");
+
+        // PG subtitles — coding type + language preserved.
+        assert_eq!(stn.pg_subtitles.len(), 1);
+        assert_eq!(stn.pg_subtitles[0].elementary_pid, 0x1200);
+        assert_eq!(
+            stn.pg_subtitles[0].coding_type,
+            StreamCodingType::PgsSubtitle
+        );
+        assert_eq!(&stn.pg_subtitles[0].language_code, b"eng");
+
+        // Class counts the deprecated summary view would surface still
+        // line up with the per-stream Vec lengths (the round-trip path
+        // hasn't dropped any classes).
+        let s = stn.summary();
+        assert_eq!(s.num_primary_video, 1);
+        assert_eq!(s.num_primary_audio, 2);
+        assert_eq!(s.num_pg, 1);
+        assert_eq!(s.num_ig, 0);
+        assert_eq!(s.num_secondary_audio, 0);
+        assert_eq!(s.num_secondary_video, 0);
+        assert_eq!(s.num_pip_pg, 0);
+    }
+
+    #[test]
+    fn stn_table_round_trip_full_table_with_secondary_classes() {
+        // Stress every class — secondary audio/video, IG, PIP_PG — so
+        // the encoder + parser stay in lockstep on the classes a vanilla
+        // commercial disc doesn't always ship.
+        let mut m = stn_table_mpls();
+        let pi = &mut m.play_list.play_items[0];
+        pi.stn_table.ig_streams.push(IgsInteractiveStream {
+            elementary_pid: 0x1400,
+            coding_type: StreamCodingType::IgsInteractive,
+            language_code: *b"eng",
+        });
+        pi.stn_table.secondary_audio.push(SecondaryAudioStream {
+            elementary_pid: 0x1A00,
+            coding_type: StreamCodingType::EAc3SecondaryAudio,
+            audio_format: 0x03,
+            sample_rate: 0x01,
+            language_code: *b"fre",
+        });
+        pi.stn_table.secondary_video.push(SecondaryVideoStream {
+            elementary_pid: 0x1B00,
+            coding_type: StreamCodingType::AvcVideo,
+            video_format: 0x04,
+            frame_rate: 0x03,
+            aspect_ratio: 0x03,
+        });
+        pi.stn_table.pip_pg.push(PipPgStream {
+            elementary_pid: 0x1300,
+            coding_type: StreamCodingType::PgsSubtitle,
+            language_code: *b"jpn",
+        });
+
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        let stn = &parsed.play_list.play_items[0].stn_table;
+        assert_eq!(stn.ig_streams.len(), 1);
+        assert_eq!(stn.ig_streams[0].elementary_pid, 0x1400);
+        assert_eq!(&stn.ig_streams[0].language_code, b"eng");
+        assert_eq!(stn.secondary_audio.len(), 1);
+        assert_eq!(stn.secondary_audio[0].elementary_pid, 0x1A00);
+        assert_eq!(
+            stn.secondary_audio[0].coding_type,
+            StreamCodingType::EAc3SecondaryAudio
+        );
+        assert_eq!(&stn.secondary_audio[0].language_code, b"fre");
+        assert_eq!(stn.secondary_video.len(), 1);
+        assert_eq!(stn.secondary_video[0].elementary_pid, 0x1B00);
+        assert_eq!(stn.pip_pg.len(), 1);
+        assert_eq!(stn.pip_pg[0].elementary_pid, 0x1300);
+        assert_eq!(&stn.pip_pg[0].language_code, b"jpn");
+    }
+
+    #[test]
+    fn empty_stn_table_round_trips() {
+        // The PlayItem ships zero streams of every class — the encoder
+        // still produces the 14-byte STN header, and the parser surfaces
+        // a default-constructed `StnTable`.
+        let mut m = stn_table_mpls();
+        m.play_list.play_items[0].stn_table = StnTable::default();
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        assert_eq!(
+            parsed.play_list.play_items[0].stn_table,
+            StnTable::default()
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_summary_from_impl_matches_method() {
+        let m = stn_table_mpls();
+        let stn = &m.play_list.play_items[0].stn_table;
+        let from: StnTableSummary = stn.into();
+        assert_eq!(from, stn.summary());
     }
 }

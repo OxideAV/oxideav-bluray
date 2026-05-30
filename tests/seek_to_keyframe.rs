@@ -19,7 +19,7 @@ use oxideav_bluray::bdmv::clpi::{
 use oxideav_bluray::bdmv::index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType};
 use oxideav_bluray::bdmv::mpls::{
     AppInfoPlayList, ConnectionCondition, PlayItem, PlayList, PlayListMark, PlayListMpls,
-    StnTableSummary,
+    PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
 };
 use oxideav_bluray::{Disc, M2TS_PACKET_LEN, TS_PACKET_LEN};
 
@@ -137,10 +137,22 @@ fn seek_to_lands_on_keyframe_packet() {
                     out_time_ticks: out_a,
                     multi_clip_count: 1,
                     angles: Vec::new(),
-                    stn_table: StnTableSummary {
-                        num_primary_video: 1,
-                        num_primary_audio: 1,
-                        ..StnTableSummary::default()
+                    stn_table: StnTable {
+                        primary_video: vec![PrimaryVideoStream {
+                            elementary_pid: 0x1011,
+                            coding_type: StreamCodingType::AvcVideo,
+                            video_format: 0x06,
+                            frame_rate: 0x03,
+                            aspect_ratio: 0x03,
+                        }],
+                        primary_audio: vec![PrimaryAudioStream {
+                            elementary_pid: 0x1100,
+                            coding_type: StreamCodingType::Ac3Audio,
+                            audio_format: 0x03,
+                            sample_rate: 0x01,
+                            language_code: *b"eng",
+                        }],
+                        ..StnTable::default()
                     },
                 },
                 PlayItem {
@@ -152,10 +164,22 @@ fn seek_to_lands_on_keyframe_packet() {
                     out_time_ticks: out_b,
                     multi_clip_count: 1,
                     angles: Vec::new(),
-                    stn_table: StnTableSummary {
-                        num_primary_video: 1,
-                        num_primary_audio: 1,
-                        ..StnTableSummary::default()
+                    stn_table: StnTable {
+                        primary_video: vec![PrimaryVideoStream {
+                            elementary_pid: 0x1011,
+                            coding_type: StreamCodingType::AvcVideo,
+                            video_format: 0x06,
+                            frame_rate: 0x03,
+                            aspect_ratio: 0x03,
+                        }],
+                        primary_audio: vec![PrimaryAudioStream {
+                            elementary_pid: 0x1100,
+                            coding_type: StreamCodingType::Ac3Audio,
+                            audio_format: 0x03,
+                            sample_rate: 0x01,
+                            language_code: *b"eng",
+                        }],
+                        ..StnTable::default()
                     },
                 },
             ],
@@ -291,10 +315,22 @@ fn seek_to_without_cpi_falls_back_to_clip_start() {
                 out_time_ticks: 45_000 * 10,
                 multi_clip_count: 1,
                 angles: Vec::new(),
-                stn_table: StnTableSummary {
-                    num_primary_video: 1,
-                    num_primary_audio: 1,
-                    ..StnTableSummary::default()
+                stn_table: StnTable {
+                    primary_video: vec![PrimaryVideoStream {
+                        elementary_pid: 0x1011,
+                        coding_type: StreamCodingType::AvcVideo,
+                        video_format: 0x06,
+                        frame_rate: 0x03,
+                        aspect_ratio: 0x03,
+                    }],
+                    primary_audio: vec![PrimaryAudioStream {
+                        elementary_pid: 0x1100,
+                        coding_type: StreamCodingType::Ac3Audio,
+                        audio_format: 0x03,
+                        sample_rate: 0x01,
+                        language_code: *b"eng",
+                    }],
+                    ..StnTable::default()
                 },
             }],
             sub_paths: vec![],
@@ -383,10 +419,22 @@ fn disc_chapters_map_to_seekable_keyframes() {
                     out_time_ticks: 45_000 * 10,
                     multi_clip_count: 1,
                     angles: Vec::new(),
-                    stn_table: StnTableSummary {
-                        num_primary_video: 1,
-                        num_primary_audio: 1,
-                        ..StnTableSummary::default()
+                    stn_table: StnTable {
+                        primary_video: vec![PrimaryVideoStream {
+                            elementary_pid: 0x1011,
+                            coding_type: StreamCodingType::AvcVideo,
+                            video_format: 0x06,
+                            frame_rate: 0x03,
+                            aspect_ratio: 0x03,
+                        }],
+                        primary_audio: vec![PrimaryAudioStream {
+                            elementary_pid: 0x1100,
+                            coding_type: StreamCodingType::Ac3Audio,
+                            audio_format: 0x03,
+                            sample_rate: 0x01,
+                            language_code: *b"eng",
+                        }],
+                        ..StnTable::default()
                     },
                 },
                 PlayItem {
@@ -398,10 +446,22 @@ fn disc_chapters_map_to_seekable_keyframes() {
                     out_time_ticks: 45_000 * 15,
                     multi_clip_count: 1,
                     angles: Vec::new(),
-                    stn_table: StnTableSummary {
-                        num_primary_video: 1,
-                        num_primary_audio: 1,
-                        ..StnTableSummary::default()
+                    stn_table: StnTable {
+                        primary_video: vec![PrimaryVideoStream {
+                            elementary_pid: 0x1011,
+                            coding_type: StreamCodingType::AvcVideo,
+                            video_format: 0x06,
+                            frame_rate: 0x03,
+                            aspect_ratio: 0x03,
+                        }],
+                        primary_audio: vec![PrimaryAudioStream {
+                            elementary_pid: 0x1100,
+                            coding_type: StreamCodingType::Ac3Audio,
+                            audio_format: 0x03,
+                            sample_rate: 0x01,
+                            language_code: *b"eng",
+                        }],
+                        ..StnTable::default()
                     },
                 },
             ],
