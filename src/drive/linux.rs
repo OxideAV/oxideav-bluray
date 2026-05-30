@@ -1,5 +1,15 @@
-//! Linux AACS Volume Identifier reader via `ioctl(SG_IO)` on a
-//! `/dev/sr*` SCSI generic device.
+//! Linux AACS Volume Identifier reader via `ioctl(CDROM_SEND_PACKET)`
+//! on a `/dev/sr*` optical-disc device.
+//!
+//! Why CDROM_SEND_PACKET and not SG_IO: SG_IO is the SCSI Generic v3
+//! transport — fine for SCSI / USB-mass-storage / ATAPI-bridge
+//! optical drives, but not exposed for legacy IDE optical drives that
+//! the kernel registers only through its CD-ROM subsystem.
+//! `CDROM_SEND_PACKET` (defined in `<linux/cdrom.h>`,
+//! [`CDROM_SEND_PACKET`] = `0x5393`) is the older, more portable
+//! interface: it takes a 12-byte MMC CDB plus a `cdrom_generic_command`
+//! envelope and the kernel's CD-ROM driver routes it to whatever
+//! transport backs the device. libaacs uses this for the same reason.
 //!
 //! Flow:
 //!
@@ -11,31 +21,28 @@
 //!    the mount-point field (#5) and the source field (the first
 //!    token after the ` - ` separator).
 //! 2. Open the block device with `O_RDONLY | O_NONBLOCK | O_CLOEXEC`.
-//!    `O_NONBLOCK` is required by the SG_IO ioctl interface so the
-//!    kernel doesn't block waiting for the device to spin up.
 //! 3. Build a 12-byte MMC `READ DISC STRUCTURE` CDB (opcode `0xAD`)
 //!    with Media Type = `0x01` (BD), Format = `0x80`
 //!    (AACS Volume Identifier), Allocation Length = `0x0024` (36),
 //!    AGID = 0. The CDB layout matches AACS Common §4.14.3 / MMC-6
 //!    Table 381 — exactly the bytes the `mmc::ReadDiscStructure`
 //!    builder in `oxideav-aacs` emits.
-//! 4. Wrap the CDB in a `sg_io_hdr_v3` struct (`<scsi/sg.h>`) and
-//!    issue `ioctl(fd, SG_IO, &hdr)`. SG_IO is the Linux SCSI
-//!    Generic v3 interface — a single round-trip command that
-//!    takes a CDB, optional data-in/data-out buffer, and returns
-//!    SCSI status + sense data.
+//! 4. Wrap the CDB in a `cdrom_generic_command` struct and issue
+//!    `ioctl(fd, CDROM_SEND_PACKET, &cgc)`. The kernel returns the
+//!    SCSI status byte in `cgc.stat` and writes any sense data to
+//!    `cgc.sense`.
 //! 5. Parse the 36-byte response via
 //!    `oxideav_aacs::mmc::parse_volume_id_response` — 4-byte header
 //!    + 16-byte Volume Identifier + 16-byte MAC.
 //!
-//! The transport-level [`SgDrive`] implements `oxideav_aacs::mmc::
-//! DriveCommand` so an AACS-AKE-authenticated flow can layer on top
-//! later (`oxideav_aacs::ake::read_verified_volume_id`) by reusing
-//! the same handle.
+//! The transport-level [`CdromDrive`] implements `oxideav_aacs::mmc::
+//! DriveCommand` so the AKE flow can reuse the same handle for the
+//! REPORT KEY ↔ SEND KEY ↔ READ DISC STRUCTURE round-trips.
 //!
-//! Reference material (publicly licensed / spec): Linux kernel
-//! `Documentation/scsi/scsi-generic.rst` for SG_IO; T10 MMC-6 r02g
-//! for the CDB; AACS LA Common Final 0.953 §4.14.3 for the response.
+//! Reference material (publicly licensed): Linux kernel
+//! `include/uapi/linux/cdrom.h` for the ioctl + struct layout;
+//! T10 MMC-6 r02g for the CDB; AACS LA Common Final 0.953 §4.14.3
+//! for the response.
 
 // Lib-root lint is `deny(unsafe_code)` — this module needs raw
 // `ioctl(SG_IO)` + `close(fd)`, so opt the whole module in.
@@ -51,63 +58,56 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
-/// `SG_IO` ioctl number — defined as `_IOWR('S', 0x85, sg_io_hdr_t)` in
-/// `<scsi/sg.h>`. On every Linux architecture this resolves to
-/// `0x2285`.
-const SG_IO: libc::c_ulong = 0x2285;
+/// `CDROM_SEND_PACKET` ioctl number — defined in `<linux/cdrom.h>`.
+const CDROM_SEND_PACKET: libc::c_ulong = 0x5393;
 
-/// `dxfer_direction` constants from `<scsi/sg.h>`.
-const SG_DXFER_NONE: libc::c_int = -1;
-const SG_DXFER_TO_DEV: libc::c_int = -2;
-const SG_DXFER_FROM_DEV: libc::c_int = -3;
+/// `data_direction` constants from `<linux/cdrom.h>`.
+const CGC_DATA_WRITE: u8 = 1;
+const CGC_DATA_READ: u8 = 2;
+const CGC_DATA_NONE: u8 = 3;
 
 /// Default per-command timeout (milliseconds).
 const SG_TIMEOUT_MS: u32 = 10_000;
 
-/// Maximum sense-data length we'll accept from the drive (`<scsi/sg.h>`
-/// historically uses 32 bytes; SPC-4 caps fixed-format sense at 18 and
-/// descriptor-format at 252 — 32 is the documented Linux convention).
-const SG_SENSE_BUF_LEN: usize = 32;
+/// Sense-buffer size we hand the kernel. SPC-4 caps fixed-format sense
+/// at 18 bytes and descriptor-format at 252; 32 covers both with
+/// margin and matches `<scsi/sg.h>` convention.
+const SENSE_BUF_LEN: usize = 32;
 
-/// `sg_io_hdr_v3` from `<scsi/sg.h>` — the v3 ABI is stable since
-/// 2.4 and is what SG_IO consumes. Layout matches the C struct on
-/// 64-bit Linux; #[repr(C)] keeps field order + alignment in sync.
+/// `cdrom_generic_command` from `<linux/cdrom.h>`. The kernel only
+/// reads the fields we set and writes back `stat`, the buffer, and
+/// the sense bytes; `quiet` suppresses the kernel's printk on a
+/// CHECK CONDITION reply.
 #[repr(C)]
-struct SgIoHdr {
-    interface_id: libc::c_int,
-    dxfer_direction: libc::c_int,
-    cmd_len: libc::c_uchar,
-    mx_sb_len: libc::c_uchar,
-    iovec_count: libc::c_ushort,
-    dxfer_len: libc::c_uint,
-    dxferp: *mut libc::c_void,
-    cmdp: *const libc::c_uchar,
-    sbp: *mut libc::c_uchar,
-    timeout: libc::c_uint,
-    flags: libc::c_uint,
-    pack_id: libc::c_int,
-    usr_ptr: *mut libc::c_void,
-    status: libc::c_uchar,
-    masked_status: libc::c_uchar,
-    msg_status: libc::c_uchar,
-    sb_len_wr: libc::c_uchar,
-    host_status: libc::c_ushort,
-    driver_status: libc::c_ushort,
-    resid: libc::c_int,
-    duration: libc::c_uint,
-    info: libc::c_uint,
+struct CdromGenericCommand {
+    cmd: [u8; 12],
+    buffer: *mut u8,
+    buflen: u32,
+    stat: i32,
+    sense: *mut u8,
+    data_direction: u8,
+    quiet: i32,
+    timeout: i32,
+    unused: *mut libc::c_void,
 }
 
-/// Linux SCSI-Generic SG_IO transport for MMC commands.
+/// Linux optical-drive transport for MMC commands.
 ///
 /// Owns an open file descriptor on `/dev/sr*` and implements
 /// [`DriveCommand`] by translating each `execute` call into a single
-/// `ioctl(SG_IO)` round-trip.
-pub struct SgDrive {
+/// `ioctl(CDROM_SEND_PACKET)` round-trip. Works on SCSI / USB /
+/// ATAPI-bridge / IDE drives transparently — the kernel's CD-ROM
+/// driver routes the packet to whichever transport backs the device.
+pub struct CdromDrive {
     fd: RawFd,
 }
 
-impl SgDrive {
+/// Alias kept for callers that still reference `SgDrive`. The
+/// transport is `CDROM_SEND_PACKET` now (more portable than SG_IO);
+/// the rename is the only visible difference.
+pub type SgDrive = CdromDrive;
+
+impl CdromDrive {
     /// Open the given block device for SG_IO traffic. The path is
     /// typically `/dev/sr0`.
     pub fn open(dev_path: &Path) -> Result<Self, DriveError> {
@@ -127,7 +127,7 @@ impl SgDrive {
     }
 }
 
-impl Drop for SgDrive {
+impl Drop for CdromDrive {
     fn drop(&mut self) {
         // Safety: we own the fd from open(); ignore close errors.
         unsafe {
@@ -136,7 +136,7 @@ impl Drop for SgDrive {
     }
 }
 
-impl DriveCommand for SgDrive {
+impl DriveCommand for CdromDrive {
     fn execute(
         &mut self,
         cdb: &[u8; MMC_CDB_LEN],
@@ -144,10 +144,10 @@ impl DriveCommand for SgDrive {
         data_out: &[u8],
         allocation_length: u16,
     ) -> Result<ScsiResponse, AacsError> {
-        let dxfer_direction = match direction {
-            DataDirection::None => SG_DXFER_NONE,
-            DataDirection::FromDevice => SG_DXFER_FROM_DEV,
-            DataDirection::ToDevice => SG_DXFER_TO_DEV,
+        let data_direction = match direction {
+            DataDirection::None => CGC_DATA_NONE,
+            DataDirection::FromDevice => CGC_DATA_READ,
+            DataDirection::ToDevice => CGC_DATA_WRITE,
         };
 
         let mut data_buf: Vec<u8> = match direction {
@@ -155,96 +155,66 @@ impl DriveCommand for SgDrive {
             DataDirection::FromDevice => vec![0u8; allocation_length as usize],
             DataDirection::ToDevice => data_out.to_vec(),
         };
-        let mut sense = [0u8; SG_SENSE_BUF_LEN];
+        let mut sense = [0u8; SENSE_BUF_LEN];
 
-        let dxferp = if data_buf.is_empty() {
+        let buffer = if data_buf.is_empty() {
             std::ptr::null_mut()
         } else {
-            data_buf.as_mut_ptr() as *mut libc::c_void
+            data_buf.as_mut_ptr()
         };
 
-        let mut hdr = SgIoHdr {
-            interface_id: b'S' as libc::c_int,
-            dxfer_direction,
-            cmd_len: MMC_CDB_LEN as u8,
-            mx_sb_len: SG_SENSE_BUF_LEN as u8,
-            iovec_count: 0,
-            dxfer_len: data_buf.len() as u32,
-            dxferp,
-            cmdp: cdb.as_ptr(),
-            sbp: sense.as_mut_ptr(),
-            timeout: SG_TIMEOUT_MS,
-            flags: 0,
-            pack_id: 0,
-            usr_ptr: std::ptr::null_mut(),
-            status: 0,
-            masked_status: 0,
-            msg_status: 0,
-            sb_len_wr: 0,
-            host_status: 0,
-            driver_status: 0,
-            resid: 0,
-            duration: 0,
-            info: 0,
+        let mut cmd = [0u8; 12];
+        cmd.copy_from_slice(cdb);
+
+        let mut cgc = CdromGenericCommand {
+            cmd,
+            buffer,
+            buflen: data_buf.len() as u32,
+            stat: 0,
+            sense: sense.as_mut_ptr(),
+            data_direction,
+            quiet: 1,
+            timeout: SG_TIMEOUT_MS as i32,
+            unused: std::ptr::null_mut(),
         };
 
-        // Safety: `hdr` is a valid `sg_io_hdr_v3` with stable pointers
-        // (`cdb`, `data_buf`, `sense`) that all outlive the ioctl call.
-        let rc = unsafe { libc::ioctl(self.fd, SG_IO, &mut hdr as *mut SgIoHdr) };
+        // Safety: `cgc` is a valid `cdrom_generic_command` with stable
+        // pointers (`buffer`, `sense`) that outlive the ioctl call.
+        let rc = unsafe {
+            libc::ioctl(
+                self.fd,
+                CDROM_SEND_PACKET,
+                &mut cgc as *mut CdromGenericCommand,
+            )
+        };
         if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(AacsError::Io(format!(
-                "ioctl(SG_IO) failed: {err} (opcode=0x{:02x})",
-                cdb[0]
-            )));
+            // The kernel returns -1 + errno on transport failure AND on
+            // CHECK CONDITION (it stuffs sense into the buffer and
+            // returns EIO). Distinguish by inspecting `cgc.stat`:
+            // non-zero status means the drive replied (just not GOOD)
+            // and we should pass the response up rather than report a
+            // transport error.
+            let errno = std::io::Error::last_os_error();
+            if cgc.stat == 0 {
+                return Err(AacsError::Io(format!(
+                    "ioctl(CDROM_SEND_PACKET) failed: {errno} (opcode=0x{:02x})",
+                    cdb[0]
+                )));
+            }
         }
 
-        // SG_IO v3 packs three different status fields:
-        //   * host_status: host-adapter transport errors (e.g.
-        //     selection timeout, unexpected disconnect).
-        //   * driver_status: driver-layer diagnostic. The low nibble
-        //     carries the error code (`DRIVER_TIMEOUT=6`,
-        //     `DRIVER_SENSE=8`, etc.). DRIVER_SENSE alone just means
-        //     "sense data accompanies a non-GOOD SCSI status" — it's
-        //     the normal way the kernel surfaces a drive's CHECK
-        //     CONDITION reply, not a transport failure. The high bits
-        //     carry DRIVER_SUGGEST_* advisories that we ignore.
-        //   * status: the SCSI status byte itself.
-        //
-        // Treat only host_status != 0 and non-SENSE driver-status
-        // codes as transport errors; a CHECK CONDITION reply (status
-        // = 0x02, driver_status = 0x08) flows through to the sense
-        // path below.
-        const DRIVER_SENSE: u16 = 0x08;
-        let driver_code = hdr.driver_status & 0x0f;
-        if hdr.host_status != 0 || (driver_code != 0 && driver_code != DRIVER_SENSE) {
-            return Err(AacsError::Io(format!(
-                "SG_IO transport error: host_status=0x{:04x} driver_status=0x{:04x} \
-                 (opcode=0x{:02x})",
-                hdr.host_status, hdr.driver_status, cdb[0]
-            )));
-        }
-
-        // Truncate read buffer to actually-transferred bytes (resid is
-        // requested minus actual, can be 0 or positive).
-        if matches!(direction, DataDirection::FromDevice) {
-            let actual = (data_buf.len() as i32 - hdr.resid).max(0) as usize;
-            data_buf.truncate(actual);
-        } else {
-            data_buf.clear();
-        }
-
-        // If the drive reported a non-GOOD status, hand back the sense
-        // bytes instead of the (typically empty / undefined) data
-        // buffer so callers can diagnose.
-        if hdr.status != 0 {
-            let sb_len = (hdr.sb_len_wr as usize).min(SG_SENSE_BUF_LEN);
+        // CHECK CONDITION reply — return sense bytes as the data
+        // payload so callers can decode KCQ codes.
+        if cgc.stat != 0 {
             return Ok(ScsiResponse {
-                status: hdr.status,
-                data: sense[..sb_len].to_vec(),
+                status: cgc.stat as u8,
+                data: sense.to_vec(),
             });
         }
 
+        if matches!(direction, DataDirection::ToDevice) {
+            data_buf.clear();
+        }
         Ok(ScsiResponse::good(data_buf))
     }
 }
