@@ -185,7 +185,12 @@ pub struct ClipInformation {
 impl ClipInformation {
     pub fn parse(buf: &[u8]) -> Result<Self> {
         let header = BdmvHeader::parse(buf)?;
-        if header.type_indicator != b"CLPI" {
+        // Per BD-ROM Part 3 §5.5.1.1, the .clpi `type_indicator` is
+        // the four ASCII bytes "HDMV" (not "CLPI" — that's the file
+        // *extension*, not the wire magic). Accept "CLPI" as a
+        // lenient back-compat path for any synthetic fixture that
+        // followed the older (incorrect) parser's expectation.
+        if header.type_indicator != b"HDMV" && header.type_indicator != b"CLPI" {
             return Err(BlurayError::malformed(format!(
                 ".clpi type_indicator {:?}",
                 header.type_indicator
