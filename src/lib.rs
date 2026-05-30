@@ -96,7 +96,7 @@ pub use m2ts::{
     iter_source_packets, strip_tp_extra, strip_tp_extra_to_vec, M2tsIter, M2tsSourcePacket,
     TpExtraHeader, M2TS_PACKET_LEN, TP_EXTRA_HEADER_LEN, TS_PACKET_LEN,
 };
-pub use source::{detect_disc_root, parse_bluray_uri, BlurayUri};
+pub use source::{detect_disc_root, parse_bluray_uri, BlurayUri, BlurayUriTarget, ChapterSelector};
 
 #[cfg(feature = "registry")]
 pub use source::register;

@@ -12,6 +12,22 @@
 //!   route through the raw-UDF mounter once we wire `Disc::mount_image`.
 //!   Phase 1 returns `Unsupported` for paths that aren't directories.
 //!
+//! ### Query-string selectors
+//!
+//! Any of the above can carry `?key=value&...` modifiers:
+//!
+//! - `?title=N` — open the title with 1-based id `N` instead of the
+//!   longest. Range: `[1, disc.titles().len()]`.
+//! - `?chapters=A-B` — restrict playback to chapters A through B
+//!   inclusive (1-based, matching `Disc::chapters()` order). `A == B`
+//!   is one chapter; `A > B` is an error. `chapters=2-` means "from
+//!   chapter 2 to the end".
+//! - `?chapters=A,B,C` — emit each named chapter as its own segment.
+//!   A single integer (`chapters=3`) is the degenerate case.
+//!
+//! Forgiving on missing keys, strict on malformed values: bad values
+//! surface as parse errors rather than being silently dropped.
+//!
 //! ## Registry hook
 //!
 //! When the default-on `registry` cargo feature is enabled, the
@@ -34,30 +50,116 @@ use std::path::{Path, PathBuf};
 use crate::disc::{Disc, TitleSource};
 use crate::error::{BlurayError, Result};
 
-/// Parsed `bluray://` URI.
+/// Disc-location target carried inside a parsed [`BlurayUri`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BlurayUri {
+pub enum BlurayUriTarget {
     /// `bluray://` — auto-detect.
     AutoDetect,
     /// `bluray:///abs/path` (no host).
     Path(PathBuf),
 }
 
-/// Parse a `bluray://...` URI string.
+/// Which chapters of a title to expose downstream.
+///
+/// Parsed from the optional `?chapters=...` query parameter of a
+/// `bluray://` URI. Indices are 1-based and match the order returned by
+/// [`crate::Disc::chapters`] (chapter 1 → index 0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChapterSelector {
+    /// No `chapters=` query — emit one segment per chapter in the title.
+    All,
+    /// `chapters=A-B` (inclusive) or `chapters=A-` (A through the last
+    /// chapter). `start` must be ≥ 1; `end`, when present, must be ≥
+    /// `start`.
+    Range { start: u32, end: Option<u32> },
+    /// `chapters=A,B,C` — non-contiguous chapter ids. A single integer
+    /// (`chapters=3`) reaches here as a one-element list. The list is
+    /// stored in URI order and is non-empty.
+    List(Vec<u32>),
+}
+
+/// Parsed `bluray://` URI plus optional title + chapter selectors.
+///
+/// `target` carries the disc location (auto-detect or filesystem path);
+/// `title_id` and `chapter_selector` carry the optional `?title=` /
+/// `?chapters=` query params. Pre-query-string callers only need
+/// [`Self::target`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlurayUri {
+    pub target: BlurayUriTarget,
+    /// 1-based title id from `?title=` if present. `None` means "use
+    /// the autoplay heuristic" — `Disc::longest_title()`.
+    pub title_id: Option<u16>,
+    /// Chapter selector from `?chapters=` (defaults to
+    /// [`ChapterSelector::All`]).
+    pub chapter_selector: ChapterSelector,
+}
+
+impl BlurayUri {
+    /// Build an auto-detect URI with no query selectors — handy in
+    /// tests that only care about the target.
+    #[cfg(test)]
+    pub(crate) fn auto() -> Self {
+        Self {
+            target: BlurayUriTarget::AutoDetect,
+            title_id: None,
+            chapter_selector: ChapterSelector::All,
+        }
+    }
+
+    /// Build a path-target URI with no query selectors.
+    #[cfg(test)]
+    pub(crate) fn path(p: impl Into<PathBuf>) -> Self {
+        Self {
+            target: BlurayUriTarget::Path(p.into()),
+            title_id: None,
+            chapter_selector: ChapterSelector::All,
+        }
+    }
+}
+
+/// Parse a `bluray://...` URI string, including optional `?title=` and
+/// `?chapters=` query selectors. See the module-level docs for the
+/// accepted grammar.
 pub fn parse_bluray_uri(uri: &str) -> Result<BlurayUri> {
     let rest = uri
         .strip_prefix("bluray://")
         .or_else(|| uri.strip_prefix("bluray:"))
         .ok_or_else(|| BlurayError::not_bluray(format!("not a bluray:// URI: {uri}")))?;
-    if rest.is_empty() || rest == "/" {
-        return Ok(BlurayUri::AutoDetect);
+
+    // Split off the query string (if any) before we touch the path.
+    // We don't honor `#fragment` — there's no spec'd meaning for one
+    // on `bluray://` and a path containing `#` would be unusual.
+    let (path_part, query_part) = match rest.find('?') {
+        Some(i) => (&rest[..i], Some(&rest[i + 1..])),
+        None => (rest, None),
+    };
+
+    let target = parse_target(path_part);
+    let (title_id, chapter_selector) = match query_part {
+        Some(q) => parse_query(q)?,
+        None => (None, ChapterSelector::All),
+    };
+
+    Ok(BlurayUri {
+        target,
+        title_id,
+        chapter_selector,
+    })
+}
+
+/// Resolve the path / auto-detect portion of a `bluray://` URI (the
+/// part before any `?query`). Mirrors the pre-query-string parser.
+fn parse_target(path_part: &str) -> BlurayUriTarget {
+    if path_part.is_empty() || path_part == "/" {
+        return BlurayUriTarget::AutoDetect;
     }
     // We accept either `bluray:///abs/path` (the empty-host form, post
     // `bluray://` strip the leading `/` belongs to the path) or
     // `bluray://host/path` (treated as a path with the host as the
     // first component — useful for `bluray://localhost/...` style usage
     // even though we don't interpret the host).
-    let path = if let Some(p) = rest.strip_prefix('/') {
+    let path = if let Some(p) = path_part.strip_prefix('/') {
         // strip the leading slash separator after the (empty) host.
         if p.starts_with('/') {
             // bluray:////double — preserve absolute root
@@ -66,9 +168,143 @@ pub fn parse_bluray_uri(uri: &str) -> Result<BlurayUri> {
             PathBuf::from(format!("/{p}"))
         }
     } else {
-        PathBuf::from(rest)
+        PathBuf::from(path_part)
     };
-    Ok(BlurayUri::Path(path))
+    BlurayUriTarget::Path(path)
+}
+
+/// Parse the query string (everything after `?`). Forgiving on missing
+/// keys; strict on malformed values.
+fn parse_query(query: &str) -> Result<(Option<u16>, ChapterSelector)> {
+    let mut title_id: Option<u16> = None;
+    let mut chapter_selector = ChapterSelector::All;
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => {
+                return Err(BlurayError::malformed(format!(
+                    "bluray:// query expects key=value, got `{pair}`"
+                )))
+            }
+        };
+        match key {
+            "title" => {
+                let n: u16 = value.parse().map_err(|_| {
+                    BlurayError::malformed(format!(
+                        "bluray:// `title=` expects a positive integer, got `{value}`"
+                    ))
+                })?;
+                if n == 0 {
+                    return Err(BlurayError::malformed(
+                        "bluray:// `title=0` is invalid (titles are 1-based)",
+                    ));
+                }
+                title_id = Some(n);
+            }
+            "chapters" => {
+                chapter_selector = parse_chapter_selector(value)?;
+            }
+            other => {
+                return Err(BlurayError::malformed(format!(
+                    "bluray:// unknown query key `{other}`"
+                )));
+            }
+        }
+    }
+    Ok((title_id, chapter_selector))
+}
+
+/// Parse the value of a `chapters=` query: a range (`A-B` / `A-`), a
+/// comma list (`A,B,C`), or a single id.
+fn parse_chapter_selector(value: &str) -> Result<ChapterSelector> {
+    if value.is_empty() {
+        return Err(BlurayError::malformed(
+            "bluray:// `chapters=` is empty (expected N, A-B, or A,B,C)",
+        ));
+    }
+    // List form has precedence: `1,2,3` is unambiguous; a `-` inside a
+    // comma-separated entry is rejected as malformed.
+    if value.contains(',') {
+        let mut ids = Vec::new();
+        for tok in value.split(',') {
+            if tok.is_empty() {
+                return Err(BlurayError::malformed(format!(
+                    "bluray:// `chapters=` has an empty list entry in `{value}`"
+                )));
+            }
+            if tok.contains('-') {
+                return Err(BlurayError::malformed(format!(
+                    "bluray:// `chapters=` mixes range and list syntax in `{value}`"
+                )));
+            }
+            let n: u32 = tok.parse().map_err(|_| {
+                BlurayError::malformed(format!(
+                    "bluray:// `chapters=` list entry `{tok}` is not a positive integer"
+                ))
+            })?;
+            if n == 0 {
+                return Err(BlurayError::malformed(format!(
+                    "bluray:// `chapters=` ids are 1-based; got `0` in `{value}`"
+                )));
+            }
+            ids.push(n);
+        }
+        return Ok(ChapterSelector::List(ids));
+    }
+    if let Some((a, b)) = value.split_once('-') {
+        if a.is_empty() {
+            return Err(BlurayError::malformed(format!(
+                "bluray:// `chapters=` range missing start: `{value}`"
+            )));
+        }
+        let start: u32 = a.parse().map_err(|_| {
+            BlurayError::malformed(format!(
+                "bluray:// `chapters=` range start `{a}` is not a positive integer"
+            ))
+        })?;
+        if start == 0 {
+            return Err(BlurayError::malformed(format!(
+                "bluray:// `chapters=` ids are 1-based; got start `0` in `{value}`"
+            )));
+        }
+        let end = if b.is_empty() {
+            None
+        } else {
+            let end: u32 = b.parse().map_err(|_| {
+                BlurayError::malformed(format!(
+                    "bluray:// `chapters=` range end `{b}` is not a positive integer"
+                ))
+            })?;
+            if end == 0 {
+                return Err(BlurayError::malformed(format!(
+                    "bluray:// `chapters=` ids are 1-based; got end `0` in `{value}`"
+                )));
+            }
+            if end < start {
+                return Err(BlurayError::malformed(format!(
+                    "bluray:// `chapters=` range end `{end}` is before start `{start}`"
+                )));
+            }
+            Some(end)
+        };
+        return Ok(ChapterSelector::Range { start, end });
+    }
+    // Bare integer: `chapters=3` → single-element list.
+    let n: u32 = value.parse().map_err(|_| {
+        BlurayError::malformed(format!(
+            "bluray:// `chapters=` value `{value}` is not a positive integer, range, or list"
+        ))
+    })?;
+    if n == 0 {
+        return Err(BlurayError::malformed(format!(
+            "bluray:// `chapters=` ids are 1-based; got `0` in `{value}`"
+        )));
+    }
+    Ok(ChapterSelector::List(vec![n]))
 }
 
 /// Probe the OS for a mounted BD-ROM. Returns the first directory
@@ -105,17 +341,22 @@ fn push_children_with_bdmv(parent: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// `bluray://` source-registry entry point. Mounts the disc,
-/// auto-picks the longest HDMV title, and returns a streaming
-/// `BytesSource`.
+/// auto-picks the longest HDMV title (or honors `?title=N`), and
+/// returns a streaming `BytesSource`.
+///
+/// `?chapters=...` is parsed and validated, but the BytesSource path
+/// currently surfaces the whole title — chapter slicing happens
+/// downstream via [`crate::Disc::open_title_chapters`] when callers
+/// want one segment per chapter rather than one stream.
 #[cfg(feature = "registry")]
 pub fn open_bluray(uri: &str) -> oxideav_core::Result<Box<dyn oxideav_core::BytesSource>> {
     use oxideav_core::Error as CoreError;
     let parsed = parse_bluray_uri(uri).map_err(|e| CoreError::invalid(e.to_string()))?;
-    let root = match parsed {
-        BlurayUri::AutoDetect => detect_disc_root()
+    let root = match parsed.target {
+        BlurayUriTarget::AutoDetect => detect_disc_root()
             .map_err(|e| CoreError::invalid(e.to_string()))?
             .ok_or_else(|| CoreError::invalid("no BD-ROM mount found"))?,
-        BlurayUri::Path(p) => {
+        BlurayUriTarget::Path(p) => {
             if !p.is_dir() {
                 return Err(CoreError::invalid(format!(
                     "bluray:// path {} is not a directory (raw-device support is Phase 2)",
@@ -126,10 +367,26 @@ pub fn open_bluray(uri: &str) -> oxideav_core::Result<Box<dyn oxideav_core::Byte
         }
     };
     let disc = Disc::mount(&root).map_err(|e| CoreError::invalid(e.to_string()))?;
-    let title = disc
-        .longest_title()
-        .ok_or_else(|| CoreError::invalid("disc has no playable HDMV titles"))?
-        .clone();
+    let title = match parsed.title_id {
+        Some(id) => {
+            let idx = (id as usize).checked_sub(1).ok_or_else(|| {
+                CoreError::invalid(format!("bluray://?title={id} — titles are 1-based"))
+            })?;
+            disc.titles()
+                .get(idx)
+                .ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "bluray://?title={id} — disc only has {} title(s)",
+                        disc.titles().len()
+                    ))
+                })?
+                .clone()
+        }
+        None => disc
+            .longest_title()
+            .ok_or_else(|| CoreError::invalid("disc has no playable HDMV titles"))?
+            .clone(),
+    };
     // Auto-resolve AACS decryption when the `aacs` feature is on
     // (default-on). Fail LOUDLY for AACS-protected discs whose VUK
     // isn't in KEYDB.cfg — silently falling back to Identity would
@@ -176,26 +433,20 @@ mod tests {
 
     #[test]
     fn parse_auto_detect() {
-        assert_eq!(
-            parse_bluray_uri("bluray://").unwrap(),
-            BlurayUri::AutoDetect
-        );
-        assert_eq!(parse_bluray_uri("bluray:").unwrap(), BlurayUri::AutoDetect);
-        assert_eq!(
-            parse_bluray_uri("bluray:///").unwrap(),
-            BlurayUri::AutoDetect
-        );
+        assert_eq!(parse_bluray_uri("bluray://").unwrap(), BlurayUri::auto());
+        assert_eq!(parse_bluray_uri("bluray:").unwrap(), BlurayUri::auto());
+        assert_eq!(parse_bluray_uri("bluray:///").unwrap(), BlurayUri::auto());
     }
 
     #[test]
     fn parse_absolute_path() {
         assert_eq!(
             parse_bluray_uri("bluray:///tmp/disc-root").unwrap(),
-            BlurayUri::Path(PathBuf::from("/tmp/disc-root"))
+            BlurayUri::path("/tmp/disc-root")
         );
         assert_eq!(
             parse_bluray_uri("bluray:///dev/sr0").unwrap(),
-            BlurayUri::Path(PathBuf::from("/dev/sr0"))
+            BlurayUri::path("/dev/sr0")
         );
     }
 
@@ -203,6 +454,190 @@ mod tests {
     fn rejects_wrong_scheme() {
         assert!(parse_bluray_uri("file:///x").is_err());
         assert!(parse_bluray_uri("http://example/").is_err());
+    }
+
+    // ─── ?title= ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_title_query_on_path() {
+        let u = parse_bluray_uri("bluray:///tmp/disc?title=2").unwrap();
+        assert_eq!(u.target, BlurayUriTarget::Path(PathBuf::from("/tmp/disc")));
+        assert_eq!(u.title_id, Some(2));
+        assert_eq!(u.chapter_selector, ChapterSelector::All);
+    }
+
+    #[test]
+    fn parse_title_query_on_autodetect() {
+        let u = parse_bluray_uri("bluray://?title=1").unwrap();
+        assert_eq!(u.target, BlurayUriTarget::AutoDetect);
+        assert_eq!(u.title_id, Some(1));
+    }
+
+    #[test]
+    fn rejects_title_zero() {
+        // titles are 1-based; `?title=0` is a definite user error rather
+        // than a silently-recovered "use the longest" case.
+        assert!(parse_bluray_uri("bluray:///d?title=0").is_err());
+    }
+
+    #[test]
+    fn rejects_title_non_integer() {
+        assert!(parse_bluray_uri("bluray:///d?title=abc").is_err());
+        assert!(parse_bluray_uri("bluray:///d?title=-1").is_err());
+    }
+
+    #[test]
+    fn rejects_title_out_of_u16_range() {
+        // u16 caps at 65535; anything past that overflows the parser
+        // and surfaces a Malformed error rather than silently wrapping.
+        assert!(parse_bluray_uri("bluray:///d?title=70000").is_err());
+    }
+
+    // ─── ?chapters= range ──────────────────────────────────────
+
+    #[test]
+    fn parse_chapter_range_inclusive() {
+        let u = parse_bluray_uri("bluray:///d?chapters=2-5").unwrap();
+        assert_eq!(
+            u.chapter_selector,
+            ChapterSelector::Range {
+                start: 2,
+                end: Some(5)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_chapter_range_single_chapter() {
+        let u = parse_bluray_uri("bluray:///d?chapters=3-3").unwrap();
+        assert_eq!(
+            u.chapter_selector,
+            ChapterSelector::Range {
+                start: 3,
+                end: Some(3)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_chapter_range_open_ended() {
+        let u = parse_bluray_uri("bluray:///d?chapters=2-").unwrap();
+        assert_eq!(
+            u.chapter_selector,
+            ChapterSelector::Range {
+                start: 2,
+                end: None
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_chapter_range_inverted() {
+        assert!(parse_bluray_uri("bluray:///d?chapters=5-2").is_err());
+    }
+
+    #[test]
+    fn rejects_chapter_range_missing_start() {
+        // `-3` would mean "start from somewhere" — ambiguous; surface
+        // it as a parse error rather than silently treating as `1-3`.
+        assert!(parse_bluray_uri("bluray:///d?chapters=-3").is_err());
+    }
+
+    #[test]
+    fn rejects_chapter_range_zero() {
+        assert!(parse_bluray_uri("bluray:///d?chapters=0-3").is_err());
+        assert!(parse_bluray_uri("bluray:///d?chapters=2-0").is_err());
+    }
+
+    // ─── ?chapters= list ───────────────────────────────────────
+
+    #[test]
+    fn parse_chapter_list_multi() {
+        let u = parse_bluray_uri("bluray:///d?chapters=2,4,7").unwrap();
+        assert_eq!(u.chapter_selector, ChapterSelector::List(vec![2, 4, 7]));
+    }
+
+    #[test]
+    fn parse_chapter_single_int_lists_one() {
+        // `chapters=3` is the degenerate single-element list; matches
+        // the user's mental model of "give me chapter 3 only".
+        let u = parse_bluray_uri("bluray:///d?chapters=3").unwrap();
+        assert_eq!(u.chapter_selector, ChapterSelector::List(vec![3]));
+    }
+
+    #[test]
+    fn rejects_chapter_list_with_range_token() {
+        // `1,2-3,4` mixes syntax — refuse rather than guess which
+        // semantics the user meant.
+        assert!(parse_bluray_uri("bluray:///d?chapters=1,2-3,4").is_err());
+    }
+
+    #[test]
+    fn rejects_chapter_list_empty_token() {
+        assert!(parse_bluray_uri("bluray:///d?chapters=1,,3").is_err());
+        assert!(parse_bluray_uri("bluray:///d?chapters=,1").is_err());
+    }
+
+    #[test]
+    fn rejects_chapter_list_non_integer() {
+        assert!(parse_bluray_uri("bluray:///d?chapters=1,x,3").is_err());
+    }
+
+    // ─── Composition ───────────────────────────────────────────
+
+    #[test]
+    fn parse_title_and_chapters_compose() {
+        let u = parse_bluray_uri("bluray:///vol/movie?title=1&chapters=2-5").unwrap();
+        assert_eq!(u.target, BlurayUriTarget::Path(PathBuf::from("/vol/movie")));
+        assert_eq!(u.title_id, Some(1));
+        assert_eq!(
+            u.chapter_selector,
+            ChapterSelector::Range {
+                start: 2,
+                end: Some(5)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_order_of_query_params_does_not_matter() {
+        let a = parse_bluray_uri("bluray://?title=2&chapters=1,3").unwrap();
+        let b = parse_bluray_uri("bluray://?chapters=1,3&title=2").unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rejects_unknown_query_key() {
+        // Strict on malformed: silently ignoring would let typos
+        // (`?titl=1`) silently fall back to "longest title".
+        assert!(parse_bluray_uri("bluray://?titl=1").is_err());
+        assert!(parse_bluray_uri("bluray://?chapter=2-5").is_err());
+    }
+
+    #[test]
+    fn rejects_query_without_equals() {
+        assert!(parse_bluray_uri("bluray://?title").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_chapters_value() {
+        assert!(parse_bluray_uri("bluray://?chapters=").is_err());
+    }
+
+    #[test]
+    fn parse_empty_query_string_is_default() {
+        // `?` with nothing after it is equivalent to no query at all.
+        let u = parse_bluray_uri("bluray:///d?").unwrap();
+        assert_eq!(u, BlurayUri::path("/d"));
+    }
+
+    #[test]
+    fn parse_skips_consecutive_ampersands() {
+        // `a=1&&b=2` shouldn't fail — leading/trailing `&` separators
+        // are common and harmless.
+        let u = parse_bluray_uri("bluray:///d?title=1&&chapters=3").unwrap();
+        assert_eq!(u.title_id, Some(1));
+        assert_eq!(u.chapter_selector, ChapterSelector::List(vec![3]));
     }
 
     #[test]
