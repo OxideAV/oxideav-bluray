@@ -30,6 +30,7 @@ use crate::bdmv::mpls::{Chapter, PlayItem, PlayListMpls};
 use crate::decrypt::{StreamDecryptor, AACS_UNIT_LEN};
 use crate::error::{BlurayError, Result};
 use crate::m2ts::{strip_tp_extra, M2TS_PACKET_LEN, TS_PACKET_LEN};
+use crate::source::ChapterSelector;
 
 /// HDMV vs BD-J title classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +284,112 @@ impl Disc {
         TitleSource::new(bdmv, play_items, angle, decryptor)
     }
 
+    /// Open a title as a stream of per-chapter byte segments selected
+    /// by `selector` against the title's chapter table.
+    ///
+    /// Each yielded [`ChapterSegment`] carries the chapter's title-
+    /// relative 1-based id, its start + end title-PTS in 90 kHz ticks,
+    /// and the *decrypted, TP_extra-stripped* MPEG-TS bytes for that
+    /// chapter. Selectors map to chapter ids as follows:
+    ///
+    /// - [`ChapterSelector::All`] → one segment per chapter in title order.
+    /// - [`ChapterSelector::Range`] → chapters in `[start, end]` (or
+    ///   `[start, last]` when `end` is `None`); range is inclusive on
+    ///   both ends, 1-based.
+    /// - [`ChapterSelector::List`] → the named chapters, in the order
+    ///   given by the URI (so `?chapters=3,1` yields chapter 3 *then* 1).
+    ///
+    /// Returns [`BlurayError::NotBluray`] when the title has no
+    /// chapters (so a CLI loop never silently produces zero output),
+    /// and [`BlurayError::Malformed`] when `selector` references a
+    /// chapter id outside `[1, chapter_count]` — the URI parser cannot
+    /// validate the upper bound; we do it here.
+    ///
+    /// # Boundary caveat
+    ///
+    /// Per-chapter byte slicing on a Blu-ray is *approximate*. m2ts
+    /// streams are contiguous Aligned Units, and a chapter boundary
+    /// that falls inside an aligned unit can't be split exactly. The
+    /// seeker rounds DOWN to the I-frame at or before the requested
+    /// PTS (the only safe landing for a decodable boundary), so each
+    /// per-chapter MKV the downstream remuxer produces will have up
+    /// to a few hundred ms of *overlap* with the previous chapter at
+    /// its head. That's acceptable for the remux use case (the
+    /// resulting MKVs play correctly; just one wastes some duplicated
+    /// I-frames at the seam). Frame-exact slicing would require a
+    /// transcode and is out of scope here.
+    pub fn open_title_chapters(
+        &self,
+        title: &TitleInfo,
+        selector: &ChapterSelector,
+        decryptor: Option<Box<dyn StreamDecryptor>>,
+    ) -> Result<ChapterSegments> {
+        let chapters = self.chapters(title);
+        if chapters.is_empty() {
+            return Err(BlurayError::not_bluray(format!(
+                "title {} has no chapters — cannot slice by chapter",
+                title.id
+            )));
+        }
+        let chapter_count = chapters.len() as u32;
+        let ids: Vec<u32> = match selector {
+            ChapterSelector::All => (1..=chapter_count).collect(),
+            ChapterSelector::Range { start, end } => {
+                let end = end.unwrap_or(chapter_count);
+                if *start < 1 || *start > chapter_count {
+                    return Err(BlurayError::malformed(format!(
+                        "chapter range start {start} is outside [1, {chapter_count}]"
+                    )));
+                }
+                if end < *start || end > chapter_count {
+                    return Err(BlurayError::malformed(format!(
+                        "chapter range end {end} is outside [{start}, {chapter_count}]"
+                    )));
+                }
+                (*start..=end).collect()
+            }
+            ChapterSelector::List(list) => {
+                for &id in list {
+                    if id < 1 || id > chapter_count {
+                        return Err(BlurayError::malformed(format!(
+                            "chapter id {id} is outside [1, {chapter_count}]"
+                        )));
+                    }
+                }
+                list.clone()
+            }
+        };
+
+        // Pre-compute (chapter_id, start_pts, end_pts) per request.
+        // `end_pts` is the next chapter's start; the last chapter in
+        // the title carries `end_pts = title_duration` *and* the
+        // `ends_at_title_end` flag. The flag is what tells `read_one`
+        // to read to EOF rather than to `seek_to(title_duration)` —
+        // the latter would round down to the last keyframe in the
+        // title, dropping the final GOP of bytes.
+        let title_duration = title.duration_ticks;
+        let last_chapter_idx = chapters.len() - 1;
+        let mut requests = Vec::with_capacity(ids.len());
+        for &chapter_id in &ids {
+            let idx = chapter_id as usize - 1;
+            let start_pts_90k = chapters[idx].start_pts_90k;
+            let (end_pts_90k, ends_at_title_end) = if idx == last_chapter_idx {
+                (title_duration, true)
+            } else {
+                (chapters[idx + 1].start_pts_90k, false)
+            };
+            requests.push(ChapterRequest {
+                chapter_id,
+                start_pts_90k,
+                end_pts_90k,
+                ends_at_title_end,
+            });
+        }
+
+        let source = self.open_title(title, decryptor)?;
+        Ok(ChapterSegments { source, requests })
+    }
+
     /// Maximum angle index `k` such that every PlayItem in `title`'s
     /// PlayList offers an angle-`k` clip — i.e. the largest value that
     /// is safe to pass to [`Self::open_title_with_angle`]. Returns 0
@@ -467,6 +574,14 @@ impl TitleSource {
         };
         s.open_next_clip()?;
         Ok(s)
+    }
+
+    /// Total output bytes the title will produce when read to EOF
+    /// (sum of each `.m2ts` size × 188 / 192, truncated to packet
+    /// boundaries). Computed once at construction; constant for the
+    /// lifetime of the source.
+    pub fn output_total(&self) -> u64 {
+        self.output_total
     }
 
     /// Seek to the keyframe-aligned entry point at or before `pts_90k`
@@ -689,6 +804,153 @@ impl Read for TitleSource {
         self.pending_pos += take;
         self.output_pos += take as u64;
         Ok(take)
+    }
+}
+
+// ─────────────────────── chapter byte segments ─────────────────────
+
+/// One chapter's worth of decrypted, TP_extra-stripped MPEG-TS bytes,
+/// emitted by [`ChapterSegments`].
+///
+/// `chapter_id` is 1-based and matches `Disc::chapters()` index + 1.
+/// `start_pts_90k` / `end_pts_90k` are the title-relative PTS values
+/// that bounded the request — keep in mind the *actual* byte range is
+/// keyframe-rounded (see [`Disc::open_title_chapters`] for the
+/// boundary caveat).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChapterSegment {
+    /// 1-based chapter id (matches `Disc::chapters()` order + 1).
+    pub chapter_id: u32,
+    /// Title-relative start PTS in 90 kHz ticks (the chapter's mark).
+    pub start_pts_90k: u64,
+    /// Title-relative end PTS in 90 kHz ticks — next chapter's mark,
+    /// or the title duration for the final chapter.
+    pub end_pts_90k: u64,
+    /// Decrypted M2TS bytes for this chapter — already TP-extra
+    /// stripped by the underlying [`TitleSource`], so this is clean
+    /// 188-byte MPEG-TS ready for a remuxer.
+    pub bytes: Vec<u8>,
+}
+
+/// Internal request record: each item in this list becomes one
+/// [`ChapterSegment`] on the iterator's output.
+#[derive(Debug, Clone, Copy)]
+struct ChapterRequest {
+    chapter_id: u32,
+    start_pts_90k: u64,
+    end_pts_90k: u64,
+    /// `true` when this request is the title's final chapter — read
+    /// to EOF rather than seek to `end_pts_90k` (which would round
+    /// DOWN to the last keyframe and drop the final GOP).
+    ends_at_title_end: bool,
+}
+
+/// Iterator yielding one [`ChapterSegment`] per chapter requested via
+/// [`Disc::open_title_chapters`].
+///
+/// Lazy: each `next()` call seeks the underlying [`TitleSource`] to
+/// the chapter's start PTS, then reads bytes until reaching the next
+/// chapter's start PTS (or the end of the title). The seeker is
+/// keyframe-aligned per BD-ROM AV §5.7 — see
+/// [`Disc::open_title_chapters`] for the resulting frame-boundary
+/// caveat.
+pub struct ChapterSegments {
+    source: TitleSource,
+    requests: Vec<ChapterRequest>,
+}
+
+impl std::fmt::Debug for ChapterSegments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChapterSegments")
+            .field("remaining", &self.requests.len())
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+impl ChapterSegments {
+    /// Number of segments left to emit (handy for progress UIs).
+    pub fn remaining(&self) -> usize {
+        self.requests.len()
+    }
+
+    /// Read one chapter — resolve start + end byte offsets via
+    /// [`TitleSource::seek_to`], then read the byte range. We
+    /// intentionally re-use the same seek primitive for both ends so
+    /// the boundary is keyframe-rounded the same way at the seam.
+    ///
+    /// For the title's final chapter (`ends_at_title_end == true`),
+    /// the end byte is the title's EOF rather than the seeker output:
+    /// `seek_to(title_duration)` rounds DOWN to the last keyframe and
+    /// would drop the closing GOP.
+    fn read_one(&mut self, req: &ChapterRequest) -> Result<ChapterSegment> {
+        // End byte: either the title's total output size (last
+        // chapter) or the keyframe at-or-before the next chapter's
+        // mark. Reading `output_total()` rather than `seek(End(0))`
+        // avoids consuming bytes just to discover the EOF offset on
+        // a real (multi-GB) title.
+        let end_byte = if req.ends_at_title_end {
+            self.source.output_total()
+        } else {
+            self.source
+                .seek_to(req.end_pts_90k)
+                .map_err(BlurayError::Io)?
+        };
+        let start_byte = self
+            .source
+            .seek_to(req.start_pts_90k)
+            .map_err(BlurayError::Io)?;
+
+        // Defensive: if start >= end (would happen on a degenerate
+        // chapter whose mark happens to land exactly at the title end),
+        // emit an empty segment rather than read backwards.
+        if start_byte >= end_byte {
+            return Ok(ChapterSegment {
+                chapter_id: req.chapter_id,
+                start_pts_90k: req.start_pts_90k,
+                end_pts_90k: req.end_pts_90k,
+                bytes: Vec::new(),
+            });
+        }
+        let want = (end_byte - start_byte) as usize;
+        let mut bytes = Vec::with_capacity(want);
+        let mut taken: usize = 0;
+        let mut buf = [0u8; 64 * 1024];
+        while taken < want {
+            let n = (want - taken).min(buf.len());
+            let got = self.source.read(&mut buf[..n]).map_err(BlurayError::Io)?;
+            if got == 0 {
+                // Short read: the source hit EOF before reaching the
+                // resolved end byte. Could happen if the end seek
+                // returned an over-estimate at the title boundary;
+                // we just truncate the chapter to what we got.
+                break;
+            }
+            bytes.extend_from_slice(&buf[..got]);
+            taken += got;
+        }
+        Ok(ChapterSegment {
+            chapter_id: req.chapter_id,
+            start_pts_90k: req.start_pts_90k,
+            end_pts_90k: req.end_pts_90k,
+            bytes,
+        })
+    }
+}
+
+impl Iterator for ChapterSegments {
+    type Item = Result<ChapterSegment>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.requests.is_empty() {
+            return None;
+        }
+        let req = self.requests.remove(0);
+        Some(self.read_one(&req))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.requests.len(), Some(self.requests.len()))
     }
 }
 
