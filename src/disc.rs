@@ -147,6 +147,85 @@ impl Disc {
             .max_by_key(|t| t.duration_ticks)
     }
 
+    /// Deduplicated title list — one entry per unique `playlist_id`,
+    /// preserving the lowest-id title that points at each playlist and
+    /// dropping placeholder entries.
+    ///
+    /// Commercial Blu-ray discs routinely ship many `TitleInfo`
+    /// entries pointing at the same `.mpls` (anti-rip / menu
+    /// navigation artifacts: the "feature" title, the "language
+    /// switch" alias, the BD-J entry-point variant, all referencing
+    /// the same playlist). A remux pipeline wants exactly one entry
+    /// per distinct piece of content; this method returns that view.
+    ///
+    /// Skips:
+    ///
+    /// - `playlist_id == 0x4000` — BD-ROM Part 3 §5.2.2 reserves this
+    ///   value for "no-op" titles used for BD-J / HDMV menu wiring;
+    ///   it never references real playable content.
+    ///
+    /// Order is by ascending title id, so iterating the result yields
+    /// content in disc-author intent order.
+    pub fn unique_titles(&self) -> Vec<&TitleInfo> {
+        let mut seen: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for t in &self.titles {
+            // BD-ROM Part 3 §5.2.2 reserves playlist_id 0x4000 for
+            // "placeholder" titles that wire BD-J / menu nav and never
+            // point at real content. Skip them — they're guaranteed to
+            // have duration 0 anyway and would clutter a remux selector.
+            if t.playlist_id == 0x4000 {
+                continue;
+            }
+            if seen.insert(t.playlist_id) {
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    /// Disc-level title metadata pulled from
+    /// `BDMV/META/DL/bdmt_<lang>.xml` (BD-ROM Part 3 §5.7). Returns
+    /// `None` when the META directory is absent, empty, or unreadable —
+    /// which is the common case (e.g. the Kite Uncut BD this work
+    /// targets ships an empty `META/` directory; most commercial discs
+    /// don't author META at all).
+    ///
+    /// Pulled as a `<di:name>` byte-scan from the first XML file found
+    /// under `META/DL/`. The standard library has no XML parser and the
+    /// crate intentionally keeps its dep tree tiny; this is a 30-line
+    /// regex-free byte scan that's robust against the namespace prefix
+    /// variations actually used in the wild (`<di:name>`, `<name>`).
+    ///
+    /// The returned [`DiscTitleMeta::language`] is the 3-letter ISO
+    /// 639-2/T tag carried in the filename suffix (`bdmt_eng.xml` →
+    /// `Some("eng")`).
+    pub fn title_meta(&self) -> Option<DiscTitleMeta> {
+        let meta_dir = self.root.join("BDMV").join("META").join("DL");
+        let entries = std::fs::read_dir(&meta_dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            // BD-ROM names META XML files `bdmt_<lang>.xml` per
+            // §5.7.4 — match case-insensitively because authoring
+            // tools have shipped both spellings.
+            let lower = name.to_ascii_lowercase();
+            if !lower.starts_with("bdmt_") || !lower.ends_with(".xml") {
+                continue;
+            }
+            let language = lower
+                .strip_prefix("bdmt_")
+                .and_then(|s| s.strip_suffix(".xml"))
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let bytes = std::fs::read(&path).ok()?;
+            if let Some(title) = extract_di_name(&bytes) {
+                return Some(DiscTitleMeta { title, language });
+            }
+        }
+        None
+    }
+
     /// Open a title as a [`TitleSource`] on the primary angle. The
     /// optional `decryptor` lets an AACS adapter plug in; pass `None`
     /// for unprotected homemade discs and for the crate's own tests.
@@ -613,6 +692,77 @@ impl Read for TitleSource {
     }
 }
 
+/// Disc-level title metadata returned by [`Disc::title_meta`].
+///
+/// Optional fields stay `Option<_>` because META XML authoring is
+/// inconsistent across publishers — many discs omit alternate names,
+/// thumbnails, etc., and the `<di:name>` element itself is the only
+/// universally-shipped field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscTitleMeta {
+    /// The disc's display title — content of the `<di:name>` element
+    /// (the BD-ROM spec's "DiscInfo name").
+    pub title: String,
+    /// 3-letter ISO 639-2/T language tag carried in the META filename
+    /// suffix (e.g. `bdmt_eng.xml` → `Some("eng")`).
+    pub language: Option<String>,
+}
+
+/// Extract the contents of the first `<di:name>` (or `<name>`) element
+/// out of a BDMV META XML byte buffer. Pure byte scan — keeps the
+/// crate dep-free of any XML parser. Robust against the two namespace
+/// spellings actually authored in the wild; trims surrounding
+/// whitespace.
+///
+/// Returns `None` if the buffer doesn't contain a recognisable name
+/// element. Stops at the first match — META files only carry one
+/// `<di:name>` at the top level per BD-ROM Part 3 §5.7.4.
+fn extract_di_name(bytes: &[u8]) -> Option<String> {
+    // Try both spellings the wild-type authoring tools have emitted.
+    for open in [b"<di:name".as_slice(), b"<name".as_slice()] {
+        let Some(start) = find_subsequence(bytes, open) else {
+            continue;
+        };
+        // Skip past `<di:name` then scan for the `>` that closes the
+        // start tag (allowing for attributes like `xml:lang="en"`).
+        let after_open = start + open.len();
+        let Some(rel) = bytes[after_open..].iter().position(|&b| b == b'>') else {
+            continue;
+        };
+        let body_start = after_open + rel + 1;
+        // Find the matching close tag. We match the exact byte
+        // sequence so `<di:name>` pairs with `</di:name>` and `<name>`
+        // pairs with `</name>` — mixing the two would be malformed XML
+        // and we reject it by returning None.
+        let close = match open {
+            b"<di:name" => b"</di:name>".as_slice(),
+            b"<name" => b"</name>".as_slice(),
+            _ => unreachable!(),
+        };
+        let Some(rel_end) = find_subsequence(&bytes[body_start..], close) else {
+            continue;
+        };
+        let body = &bytes[body_start..body_start + rel_end];
+        let s = std::str::from_utf8(body).ok()?.trim().to_string();
+        if s.is_empty() {
+            return None;
+        }
+        return Some(s);
+    }
+    None
+}
+
+/// O(n·m) byte-substring search — tiny inputs (META XML files are
+/// kilobytes), so the naïve scan is fine and saves a regex dep.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 // ─────────────────────── helpers ───────────────────────
 
 fn playlist_path(bdmv: &Path, id: u16) -> PathBuf {
@@ -739,5 +889,187 @@ impl Seek for TitleSource {
             }
         }
         Ok(self.output_pos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn title(id: u16, playlist_id: u16, duration_ticks: u64) -> TitleInfo {
+        TitleInfo {
+            id,
+            kind: TitleKind::Hdmv,
+            playlist_id,
+            duration_ticks,
+            languages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unique_titles_dedup_by_playlist_id() {
+        // Multiple TitleInfo entries pointing at the same playlist (the
+        // commercial-disc anti-rip pattern). `unique_titles` keeps the
+        // lowest-id title per playlist.
+        let disc = Disc {
+            root: PathBuf::from("/dev/null"),
+            titles: vec![
+                title(1, 100, 90_000 * 60),
+                title(2, 100, 90_000 * 60), // same playlist as title 1 → dropped
+                title(3, 200, 90_000 * 30),
+                title(4, 100, 90_000 * 60), // dup of title 1 again → dropped
+                title(5, 300, 90_000 * 10),
+            ],
+        };
+        let unique = disc.unique_titles();
+        assert_eq!(unique.len(), 3);
+        assert_eq!(unique[0].id, 1);
+        assert_eq!(unique[0].playlist_id, 100);
+        assert_eq!(unique[1].id, 3);
+        assert_eq!(unique[1].playlist_id, 200);
+        assert_eq!(unique[2].id, 5);
+        assert_eq!(unique[2].playlist_id, 300);
+    }
+
+    #[test]
+    fn unique_titles_skips_placeholder_4000() {
+        // playlist_id == 0x4000 is the BD-ROM "no-op" sentinel (BD-J /
+        // menu wiring). `unique_titles` must skip it even when it's the
+        // first / only entry pointing at that id.
+        let disc = Disc {
+            root: PathBuf::from("/dev/null"),
+            titles: vec![
+                title(1, 0x4000, 0),
+                title(2, 100, 90_000 * 30),
+                title(3, 0x4000, 0),
+                title(4, 100, 90_000 * 30),
+            ],
+        };
+        let unique = disc.unique_titles();
+        assert_eq!(unique.len(), 1);
+        assert_eq!(unique[0].id, 2);
+        assert_eq!(unique[0].playlist_id, 100);
+    }
+
+    #[test]
+    fn unique_titles_empty_list_yields_empty_result() {
+        let disc = Disc {
+            root: PathBuf::from("/dev/null"),
+            titles: vec![],
+        };
+        assert!(disc.unique_titles().is_empty());
+    }
+
+    #[test]
+    fn extract_di_name_handles_namespaced_form() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<disclibrary xmlns:di="urn:BDA:bdmv;discinfo">
+  <di:discinfo>
+    <di:title>
+      <di:name>My Movie</di:name>
+      <di:numSets>1</di:numSets>
+    </di:title>
+  </di:discinfo>
+</disclibrary>"#;
+        assert_eq!(extract_di_name(xml), Some("My Movie".to_string()));
+    }
+
+    #[test]
+    fn extract_di_name_handles_unqualified_name() {
+        let xml = br#"<root><name>Plain</name></root>"#;
+        assert_eq!(extract_di_name(xml), Some("Plain".to_string()));
+    }
+
+    #[test]
+    fn extract_di_name_returns_none_when_absent() {
+        let xml = br#"<root><title>Not a name</title></root>"#;
+        assert_eq!(extract_di_name(xml), None);
+    }
+
+    #[test]
+    fn extract_di_name_trims_whitespace() {
+        let xml = b"<di:name>   Padded   </di:name>";
+        assert_eq!(extract_di_name(xml), Some("Padded".to_string()));
+    }
+
+    #[test]
+    fn extract_di_name_empty_element_yields_none() {
+        let xml = b"<di:name></di:name>";
+        assert_eq!(extract_di_name(xml), None);
+    }
+
+    #[test]
+    fn extract_di_name_skips_attributes_on_start_tag() {
+        // Authors frequently ship `<di:name xml:lang="en">...</di:name>`.
+        let xml = br#"<di:name xml:lang="en">Localised</di:name>"#;
+        assert_eq!(extract_di_name(xml), Some("Localised".to_string()));
+    }
+
+    fn make_test_dir(suffix: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let p = std::env::temp_dir().join(format!("oxideav-bluray-{suffix}-{pid}-{nonce}"));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn empty_disc(root: PathBuf) -> Disc {
+        Disc {
+            root,
+            titles: vec![],
+        }
+    }
+
+    #[test]
+    fn title_meta_returns_none_when_meta_directory_absent() {
+        let root = make_test_dir("meta-none");
+        let disc = empty_disc(root.clone());
+        assert_eq!(disc.title_meta(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn title_meta_returns_none_when_meta_directory_empty() {
+        let root = make_test_dir("meta-empty");
+        std::fs::create_dir_all(root.join("BDMV/META/DL")).unwrap();
+        let disc = empty_disc(root.clone());
+        assert_eq!(disc.title_meta(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn title_meta_reads_bdmt_en_xml_with_language_suffix() {
+        let root = make_test_dir("meta-en");
+        let dl = root.join("BDMV/META/DL");
+        std::fs::create_dir_all(&dl).unwrap();
+        let xml = br#"<?xml version="1.0"?>
+<disclibrary xmlns:di="urn:BDA:bdmv;discinfo">
+  <di:discinfo>
+    <di:title>
+      <di:name>Kite Uncut</di:name>
+    </di:title>
+  </di:discinfo>
+</disclibrary>"#;
+        std::fs::write(dl.join("bdmt_eng.xml"), xml).unwrap();
+        let disc = empty_disc(root.clone());
+        let meta = disc.title_meta().expect("META present");
+        assert_eq!(meta.title, "Kite Uncut");
+        assert_eq!(meta.language.as_deref(), Some("eng"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn title_meta_ignores_non_matching_filenames() {
+        // A stray `.xml` that isn't a `bdmt_*.xml` must not be parsed.
+        let root = make_test_dir("meta-stray");
+        let dl = root.join("BDMV/META/DL");
+        std::fs::create_dir_all(&dl).unwrap();
+        std::fs::write(dl.join("README.xml"), b"<root><name>nope</name></root>").unwrap();
+        let disc = empty_disc(root.clone());
+        assert_eq!(disc.title_meta(), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

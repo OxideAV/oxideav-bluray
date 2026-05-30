@@ -90,7 +90,7 @@ pub use bdmv::{
     },
 };
 pub use decrypt::{DecryptError, StreamDecryptor};
-pub use disc::{Disc, TitleInfo, TitleKind, TitleSource};
+pub use disc::{Disc, DiscTitleMeta, TitleInfo, TitleKind, TitleSource};
 pub use error::{BlurayError, Result};
 pub use m2ts::{
     iter_source_packets, strip_tp_extra, strip_tp_extra_to_vec, M2tsIter, M2tsSourcePacket,
