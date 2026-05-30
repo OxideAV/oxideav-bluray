@@ -590,16 +590,46 @@ impl oxideav_core::MultiTitleSource for BluRayMultiTitleSource {
                         ids.len()
                     ))
                 })?;
-                let segments = disc
-                    .open_title_chapters(&self.title, &ChapterSelector::List(vec![id]), decryptor)
+                let chapters = disc.chapters(&self.title);
+                if chapters.is_empty() {
+                    return Err(CoreError::invalid(format!(
+                        "title {} has no chapters",
+                        self.title.id
+                    )));
+                }
+                let chapter_count = chapters.len() as u32;
+                if id < 1 || id > chapter_count {
+                    return Err(CoreError::invalid(format!(
+                        "chapter id {id} outside [1, {chapter_count}]"
+                    )));
+                }
+                let idx = id as usize - 1;
+                let start_pts_90k = chapters[idx].start_pts_90k;
+                let last_chapter = idx == chapters.len() - 1;
+                let next_pts_90k = if last_chapter {
+                    self.title.duration_ticks
+                } else {
+                    chapters[idx + 1].start_pts_90k
+                };
+                let mut title_source = disc
+                    .open_title(&self.title, decryptor)
                     .map_err(|e| CoreError::invalid(e.to_string()))?;
-                // `List(vec![id])` yields exactly one ChapterSegment.
-                let mut it = segments;
-                let seg = it
-                    .next()
-                    .ok_or_else(|| CoreError::invalid("chapter segments iter empty"))?
-                    .map_err(|e| CoreError::invalid(e.to_string()))?;
-                Ok(Box::new(std::io::Cursor::new(seg.bytes)))
+                // Compute end byte first (last chapter → EOF; else
+                // keyframe-aligned next-chapter byte) THEN seek back to
+                // the start.  Mirrors ChapterSegments::read_one — the
+                // seek is keyframe-rounded so two seeks at the seam
+                // line up on the same packet boundary.
+                let end_byte = if last_chapter {
+                    title_source.output_total()
+                } else {
+                    title_source.seek_to(next_pts_90k).map_err(CoreError::Io)?
+                };
+                let start_byte = title_source.seek_to(start_pts_90k).map_err(CoreError::Io)?;
+                let remaining = end_byte.saturating_sub(start_byte);
+                Ok(Box::new(BoundedTitleSource {
+                    inner: title_source,
+                    remaining,
+                }))
             }
         }
     }
@@ -628,6 +658,49 @@ impl oxideav_core::MultiTitleSource for BluRayMultiTitleSource {
 
     fn metadata(&self) -> &[(String, String)] {
         &self.metadata
+    }
+}
+
+/// Streaming wrapper around [`TitleSource`] that bounds the number of
+/// bytes the demuxer can read from the underlying title.  Used by the
+/// chapter branch of [`BluRayMultiTitleSource::open_title`] so a CLI
+/// pipeline sees `.ts` output growing on disk as the bluray is read,
+/// instead of waiting for a full chapter to land in RAM first.
+#[cfg(feature = "registry")]
+struct BoundedTitleSource {
+    inner: TitleSource,
+    remaining: u64,
+}
+
+#[cfg(feature = "registry")]
+impl std::fmt::Debug for BoundedTitleSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundedTitleSource")
+            .field("remaining", &self.remaining)
+            .finish()
+    }
+}
+
+#[cfg(feature = "registry")]
+impl std::io::Read for BoundedTitleSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let cap = (self.remaining as usize).min(buf.len());
+        let n = self.inner.read(&mut buf[..cap])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+#[cfg(feature = "registry")]
+impl std::io::Seek for BoundedTitleSource {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        // The mpegts demuxer never seeks on the input.  Forward to
+        // preserve trait shape; do not adjust `remaining` since byte
+        // accounting after an arbitrary seek is undefined.
+        self.inner.seek(pos)
     }
 }
 
