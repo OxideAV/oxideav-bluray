@@ -30,7 +30,7 @@ registry = ["dep:oxideav-core"]
 # every commercial Blu-ray Disc is AACS-encrypted, so this is
 # default-on. Turn it off for BD-R / homemade-disc-only consumers
 # that want a smaller dep tree.
-aacs = ["dep:oxideav-aacs", "dep:thiserror", "dep:libloading"]
+aacs = ["dep:oxideav-aacs", "dep:thiserror", "dep:libloading", "dep:libc"]
 
 # `aacs-online` extends the AACS resolver with two further fallbacks
 # after the KEYDB.cfg `<disc_id>=V<vuk>` lookup misses:
@@ -70,3 +70,10 @@ thiserror = { version = "2", optional = true }
 # backends will use the same crate for SG_IO ioctl handles / SPTI
 # DeviceIoControl.
 libloading = { version = "0.8", optional = true }
+
+# `libc` is pulled in only on Linux under the `aacs` feature. The
+# Linux drive backend uses `ioctl(SG_IO)` against `/dev/sr*` to send
+# MMC `READ DISC STRUCTURE` for the AACS Volume Identifier. macOS goes
+# through IOKit (no libc), Windows through DeviceIoControl.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
