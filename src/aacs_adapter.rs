@@ -8,8 +8,14 @@
 //!      `AACS/DUPLICATE/Unit_Key_RO.inf`). No drive query, no AACS
 //!      host-authentication handshake — the file is plain-text-
 //!      readable through the filesystem.
-//!   3. Resolve a VUK by walking the three-tier cascade in
+//!   3. Resolve a VUK by walking the cascade in
 //!      [`resolve_aacs_entry`]:
+//!      (0) Env-var override — `OXIDEAV_AACS_VUK=<32-hex>` short-
+//!      circuits with a complete VUK; `OXIDEAV_AACS_MEDIA_KEY=<32-hex>`
+//!      combines with VID (from drive or `OXIDEAV_AACS_VOLUME_ID`) to
+//!      compute `K_vu = AES-G(K_m, ID_v)`. Either lets a Type-4
+//!      MKB whose KCD path isn't wired (or any disc whose `K_m` was
+//!      computed externally) play immediately.
 //!      (a) Stream-scan KEYDB.cfg line-by-line for the disc ID.
 //!      (b) On miss, stream-scan the local VUK cache
 //!      (`~/.cache/oxideav/vuk-cache.cfg`) — same line format,
@@ -33,10 +39,9 @@ use crate::m2ts::M2TS_PACKET_LEN;
 #[cfg(feature = "aacs-online")]
 use oxideav_aacs::keydb::DeviceKeyRecord;
 use oxideav_aacs::keydb::KeyDbEntry;
-use oxideav_aacs::vuk::disc_id_from_unit_key_file_bytes;
+use oxideav_aacs::vuk::{derive_vuk, disc_id_from_unit_key_file_bytes};
 #[cfg(feature = "aacs-online")]
 use oxideav_aacs::DeviceKey;
-#[cfg(any(test, feature = "aacs-online"))]
 use oxideav_aacs::Vuk;
 use oxideav_aacs::{AacsVolume, KeyDb, TitleKey};
 #[cfg(any(test, feature = "aacs-online"))]
@@ -193,23 +198,29 @@ pub fn try_resolve_aacs(disc_root: &Path) -> std::io::Result<Option<Box<dyn Stre
             return Ok(None);
         }
     };
-    let trial_sample = match std::fs::read(&first_m2ts) {
-        Ok(b) if b.len() >= AACS_UNIT_LEN => b[..AACS_UNIT_LEN].to_vec(),
-        Ok(b) => {
+    // Only need the first AACS Aligned Unit (6144 bytes) for the
+    // trial decrypt — m2ts files on commercial discs run into tens of
+    // gigabytes, so a `std::fs::read` of the whole file would buffer
+    // the entire title-1 stream in RAM and (on flaky optical drives)
+    // tends to hit a transient sector read error long before the EOF.
+    let trial_sample = {
+        use std::io::Read;
+        let mut f = match std::fs::File::open(&first_m2ts) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("oxideav-bluray: open {} failed: {e}", first_m2ts.display());
+                return Ok(None);
+            }
+        };
+        let mut buf = vec![0u8; AACS_UNIT_LEN];
+        if let Err(e) = f.read_exact(&mut buf) {
             eprintln!(
-                "oxideav-bluray: {} too short ({} bytes) for one AACS Aligned Unit",
-                first_m2ts.display(),
-                b.len()
-            );
-            return Ok(None);
-        }
-        Err(e) => {
-            eprintln!(
-                "oxideav-bluray: failed to read {}: {e}",
+                "oxideav-bluray: short read on {}: {e}",
                 first_m2ts.display()
             );
             return Ok(None);
         }
+        buf
     };
 
     for cps_idx in 0..volume.cps_units.len() {
@@ -264,6 +275,8 @@ pub fn try_resolve_aacs(disc_root: &Path) -> std::io::Result<Option<Box<dyn Stre
 /// and whether to write-back to the cache on a successful trial decrypt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResolvedSource {
+    /// `OXIDEAV_AACS_VUK` / `OXIDEAV_AACS_MEDIA_KEY` env-var override.
+    EnvOverride,
     /// `KEYDB.cfg` legacy `<DISCID>=V<VUK>` entry.
     Keydb,
     /// Local on-disk cache (`~/.cache/oxideav/vuk-cache.cfg`).
@@ -280,6 +293,7 @@ enum ResolvedSource {
 impl ResolvedSource {
     fn label(self) -> &'static str {
         match self {
+            ResolvedSource::EnvOverride => "env-var override",
             ResolvedSource::Keydb => "KEYDB.cfg",
             ResolvedSource::Cache => "local VUK cache",
             #[cfg(feature = "aacs-online")]
@@ -306,6 +320,20 @@ fn resolve_aacs_entry(
     volume: &AacsVolume,
     debug: bool,
 ) -> std::io::Result<Option<ResolvedEntry>> {
+    // (0) Env-var override. Lets a caller plug in a complete VUK or a
+    //     Media Key (K_m) computed externally (libaacs, another tool,
+    //     a Type-4 KCD-Mark reader). Unblocks Type-4 BD-Prerecorded
+    //     discs whose Subset-Difference walk yields the Media Key
+    //     *precursor* K_mp rather than K_m, since the cascade's online
+    //     derivation expects K_m to verify directly against the MKB's
+    //     Verify-Media-Key record.
+    if let Some(entry) = entry_from_env(disc_id, disc_root, debug)? {
+        return Ok(Some(ResolvedEntry {
+            entry,
+            source: ResolvedSource::EnvOverride,
+        }));
+    }
+
     // (1) Legacy KEYDB.cfg `<DISCID>=V<VUK>` line scan.
     if let Some(path) = keydb_path {
         if let Some(line) = scan_keydb_for_line(path, disc_id, debug)? {
@@ -420,6 +448,136 @@ fn resolve_aacs_entry(
         }
     );
     Ok(None)
+}
+
+/// Resolve a VUK from environment variables, bypassing the rest of
+/// the cascade. Two shapes are accepted, in priority order:
+///
+/// * `OXIDEAV_AACS_VUK=<32-hex>` — supplies the 16-byte Volume Unique
+///   Key directly. Same shape KEYDB.cfg's legacy `V` token holds.
+///
+/// * `OXIDEAV_AACS_MEDIA_KEY=<32-hex>` — supplies the 16-byte Media
+///   Key `K_m` (post-KCD). Combined with the Volume Identifier (from
+///   `OXIDEAV_AACS_VOLUME_ID` if set, otherwise read from the optical
+///   drive via [`crate::drive::read_volume_id`]) to compute
+///   `K_vu = AES-G(K_m, ID_v)`.
+///
+/// Both override paths skip the disc-id-keyed lookups in KEYDB.cfg /
+/// cache and the MKB walk — so they unblock Type-4 BD-Prerecorded
+/// discs whose Subset-Difference walk yields `K_mp` rather than `K_m`
+/// (the KCD-Mark drive read for `K_m = AES-G(K_mp, KCD)` is not yet
+/// wired), and any disc whose `K_m` was computed by an external tool
+/// (libaacs, etc.).
+///
+/// `disc_id` is accepted for symmetry with the keydb lookups but is
+/// not used — the env override applies to whatever disc is mounted.
+fn entry_from_env(
+    disc_id: &[u8; DISC_ID_LEN],
+    disc_root: &Path,
+    debug: bool,
+) -> std::io::Result<Option<KeyDbEntry>> {
+    let _ = disc_root; // silence unused on builds without aacs-online
+    if let Ok(s) = std::env::var("OXIDEAV_AACS_VUK") {
+        let vuk_bytes = match parse_hex16_env("OXIDEAV_AACS_VUK", &s) {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        if debug {
+            eprintln!(
+                "oxideav-bluray: OXIDEAV_AACS_VUK env override applied — vuk \
+                 {:02X}{:02X}…{:02X}{:02X}",
+                vuk_bytes[0], vuk_bytes[1], vuk_bytes[14], vuk_bytes[15]
+            );
+        }
+        return Ok(Some(KeyDbEntry {
+            disc_id: *disc_id,
+            vuk: Vuk::from_bytes(vuk_bytes),
+            label: Some("OXIDEAV_AACS_VUK env override".to_string()),
+            unit_keys: Vec::new(),
+        }));
+    }
+
+    if let Ok(km_s) = std::env::var("OXIDEAV_AACS_MEDIA_KEY") {
+        let km = match parse_hex16_env("OXIDEAV_AACS_MEDIA_KEY", &km_s) {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        // VID source: env override first, then drive query. The drive
+        // query is only available under the `aacs-online` feature; on
+        // a feature-free build, fall through if the env override
+        // isn't set.
+        let vid_opt: Option<[u8; 16]> = if let Ok(vid_s) = std::env::var("OXIDEAV_AACS_VOLUME_ID") {
+            parse_hex16_env("OXIDEAV_AACS_VOLUME_ID", &vid_s)
+        } else {
+            #[cfg(feature = "aacs-online")]
+            {
+                match crate::drive::read_volume_id(disc_root) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!(
+                            "oxideav-bluray: OXIDEAV_AACS_MEDIA_KEY env set but \
+                             drive Volume Identifier query failed: {e}. Set \
+                             OXIDEAV_AACS_VOLUME_ID=<32-hex chars> to supply it \
+                             manually."
+                        );
+                        None
+                    }
+                }
+            }
+            #[cfg(not(feature = "aacs-online"))]
+            {
+                eprintln!(
+                    "oxideav-bluray: OXIDEAV_AACS_MEDIA_KEY env set without \
+                     OXIDEAV_AACS_VOLUME_ID, and `aacs-online` feature is off \
+                     so no drive query is available. Either set the env var \
+                     or rebuild with --features aacs-online."
+                );
+                None
+            }
+        };
+        let Some(vid) = vid_opt else {
+            return Ok(None);
+        };
+        let vuk = derive_vuk(&km, &vid);
+        if debug {
+            let vb = vuk.as_bytes();
+            eprintln!(
+                "oxideav-bluray: OXIDEAV_AACS_MEDIA_KEY env override — \
+                 K_vu = AES-G(K_m, ID_v) = {:02X}{:02X}…{:02X}{:02X}",
+                vb[0], vb[1], vb[14], vb[15]
+            );
+        }
+        return Ok(Some(KeyDbEntry {
+            disc_id: *disc_id,
+            vuk,
+            label: Some("OXIDEAV_AACS_MEDIA_KEY env override".to_string()),
+            unit_keys: Vec::new(),
+        }));
+    }
+    Ok(None)
+}
+
+/// Parse a 16-byte (32-hex) env-var value with `0x` prefix tolerated.
+/// Emits a stderr diagnostic and returns `None` on a malformed value
+/// so the caller can fall through to the next cascade step.
+fn parse_hex16_env(name: &str, s: &str) -> Option<[u8; 16]> {
+    let trimmed = s
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| s.trim().strip_prefix("0X"))
+        .unwrap_or(s.trim());
+    if trimmed.len() != 32 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        eprintln!(
+            "oxideav-bluray: {name} env override is not 32 hex characters: {s:?} — \
+             ignoring"
+        );
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Parse a single `<DISCID>=V<VUK>` KEYDB.cfg line into a
