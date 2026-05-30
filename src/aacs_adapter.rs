@@ -809,16 +809,24 @@ fn resolve_volume_id(disc_root: &Path, kdb: &KeyDb, debug: bool) -> Option<[u8; 
 fn device_key_from_record(rec: &DeviceKeyRecord) -> Option<DeviceKey> {
     let uv = u32::from_be_bytes(rec.key_uv);
     let u_mask_zero_bits = rec.key_u_mask_shift;
-    // `v_mask` zero-bit count = trailing zeros of `uv`, since the v
-    // half of the node identifier is whatever bits remain below the
-    // u-mask boundary (BD-AACS Common §3.2.3 uv encoding). Capped at
-    // the spec's 32-bit field width.
-    let v_mask_zero_bits = uv.trailing_zeros().min(32) as u8;
+    // Per Common spec §3.2.3, zero bits in m_v include the lowest
+    // 1-bit AND every 0-bit below it — so v_mask_zero_bits is
+    // `trailing_zeros(uv) + 1`, not `trailing_zeros(uv)` alone. The
+    // spec's reference C code shifts the mask while `(uv & ~v_mask) == 0`
+    // and stops only when a 1-bit appears, which is one more shift than
+    // bare `trailing_zeros` represents.
+    let v_mask_zero_bits = if uv == 0 {
+        32
+    } else {
+        (uv.trailing_zeros() + 1).min(32) as u8
+    };
+    let device_node = Some(u32::from(u16::from_be_bytes(rec.device_node)));
     Some(DeviceKey {
         key: rec.device_key,
         uv,
         u_mask_zero_bits,
         v_mask_zero_bits,
+        device_node,
     })
 }
 
@@ -1174,7 +1182,9 @@ mod tests {
         let rec = DeviceKeyRecord {
             device_key: [0x33u8; 16],
             device_node: [0x12, 0x34],
-            // 0x0000_0400 → uv = 1024, trailing_zeros = 10 → v_mask_zero_bits = 10.
+            // Per Common spec §3.2.3, m_v zero bits = trailing_zeros + 1
+            // (the lowest 1-bit AND the 0-bits below it). For
+            // uv = 0x0000_0400, trailing_zeros = 10, so v_mask_zero_bits = 11.
             key_uv: [0x00, 0x00, 0x04, 0x00],
             key_u_mask_shift: 23,
             comment: None,
@@ -1183,7 +1193,8 @@ mod tests {
         assert_eq!(dk.key, [0x33u8; 16]);
         assert_eq!(dk.uv, 0x0000_0400);
         assert_eq!(dk.u_mask_zero_bits, 23);
-        assert_eq!(dk.v_mask_zero_bits, 10);
+        assert_eq!(dk.v_mask_zero_bits, 11);
+        assert_eq!(dk.device_node, Some(0x1234));
     }
 
     /// Save / restore an environment variable for the duration of a
