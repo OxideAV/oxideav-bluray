@@ -19,6 +19,17 @@
 //! short-circuits the drive query and supplies the 16-byte Volume ID
 //! directly. Useful for validating the rest of the pipeline before the
 //! native drive path lands per platform.
+//!
+//! ## AKE-authenticated read
+//!
+//! Most consumer Blu-ray drives refuse a raw `READ DISC STRUCTURE`
+//! Format `0x80` query with sense `KCQ 05/6f/02` ("KEY NOT
+//! ESTABLISHED") — they require the AACS Drive-Host Authentication +
+//! Key Exchange handshake first. [`read_volume_id_with_ake`] runs the
+//! full §4.3 AKE against the drive using the host certificate +
+//! private key from `KEYDB.cfg`'s `| HC |` record and the bundled
+//! AACS LA root public key ([`oxideav_aacs::aacs_la_pub_point`]),
+//! then issues the VID query under the bus-key-encrypted session.
 
 use std::path::Path;
 
@@ -59,6 +70,47 @@ pub fn read_volume_id(disc_root: &Path) -> Result<[u8; 16], DriveError> {
         return Ok(out);
     }
     platform::read_volume_id(disc_root)
+}
+
+/// Read the 16-byte AACS Volume Identifier through an AKE-authenticated
+/// drive session. Mirrors the AACS Common 0.953 §4.3 host-side
+/// handshake exactly:
+///
+/// 1. `REPORT KEY` Key Format `0x00` → AGID.
+/// 2. `SEND KEY` Key Format `0x01` → `Hn || Host_Cert`.
+/// 3. `REPORT KEY` Key Format `0x01` → `Dn || Drive_Cert`. Host
+///    verifies the Drive Certificate against `AACS_LApub`.
+/// 4. `REPORT KEY` Key Format `0x02` → `Dv || Dsig`. Host verifies
+///    `AACS_Verify(Drive_pub, Dsig, Hn || Dv)`.
+/// 5. Host computes `Hk·G = Hv`, signs `(Dn || Hv)`, and sends
+///    `Hv || Hsig` via `SEND KEY` `0x02`.
+/// 6. Bus Key `BK = lsb_128(x-coord of Hk·Dv)`.
+/// 7. `READ DISC STRUCTURE` Format `0x80` with the granted AGID;
+///    response includes a CMAC under BK over the Volume ID that the
+///    host verifies before returning.
+///
+/// Currently wired only for the Linux SG_IO transport. macOS already
+/// reads VID without AKE via IOKit's `MMCDeviceInterface`; Windows
+/// (SPTI) returns `Unimplemented` for now.
+#[cfg(target_os = "linux")]
+pub fn read_volume_id_with_ake(
+    disc_root: &Path,
+    host_cert: &[u8; 92],
+    host_priv_key: &[u8; 20],
+) -> Result<[u8; 16], DriveError> {
+    platform::read_volume_id_with_ake(disc_root, host_cert, host_priv_key)
+}
+
+/// Stub on non-Linux platforms — AKE wiring is only Linux-side for
+/// now (macOS uses IOKit's `ReadDiscStructure` which doesn't need
+/// AKE; Windows SPTI plumbing isn't yet in this crate).
+#[cfg(not(target_os = "linux"))]
+pub fn read_volume_id_with_ake(
+    _disc_root: &Path,
+    _host_cert: &[u8; 92],
+    _host_priv_key: &[u8; 20],
+) -> Result<[u8; 16], DriveError> {
+    Err(DriveError::Unimplemented)
 }
 
 #[cfg(target_os = "macos")]

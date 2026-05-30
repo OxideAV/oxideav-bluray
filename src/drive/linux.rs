@@ -375,6 +375,61 @@ pub fn read_volume_id(disc_root: &Path) -> Result<[u8; 16], DriveError> {
     Ok(parsed.volume_id)
 }
 
+/// AKE-authenticated variant of [`read_volume_id`]. Runs the full
+/// AACS Common 0.953 §4.3 Drive-Host AKE handshake against the
+/// drive, then issues `READ DISC STRUCTURE` Format `0x80` under the
+/// established bus-key session and verifies the drive's CMAC over
+/// the Volume Identifier.
+///
+/// `host_cert` / `host_priv_key` come from the keydb's `| HC |`
+/// record. The AACS LA root public key is taken from
+/// [`oxideav_aacs::aacs_la_pub_point`] — a spec-defined constant
+/// every compliant licensee carries.
+///
+/// Ephemeral host material — the 20-byte nonce `Hn` and the 20-byte
+/// scalar `Hk` — is drawn from `/dev/urandom`. The AACS spec calls
+/// out §2.2 RNG requirements for production callers; `/dev/urandom`
+/// on a modern kernel meets the practical bar.
+pub fn read_volume_id_with_ake(
+    disc_root: &Path,
+    host_cert: &[u8; 92],
+    host_priv_key: &[u8; 20],
+) -> Result<[u8; 16], DriveError> {
+    use oxideav_aacs::ake::{
+        aacs_la_pub_point, host_authenticate, read_verified_volume_id, HostCredentials,
+    };
+    use oxideav_aacs::ec::U160;
+    use std::io::Read;
+
+    let aacs_la_pub = aacs_la_pub_point();
+
+    let dev_path = block_device_for_mount(disc_root)?;
+    let mut drive = SgDrive::open(&dev_path)?;
+
+    // Draw 40 random bytes for Hn (20) || Hk (20).
+    let mut rng_bytes = [0u8; 40];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut rng_bytes))
+        .map_err(|e| DriveError::Mmc(format!("/dev/urandom read failed: {e}")))?;
+    let mut host_nonce = [0u8; 20];
+    host_nonce.copy_from_slice(&rng_bytes[..20]);
+    let mut hk_bytes = [0u8; 20];
+    hk_bytes.copy_from_slice(&rng_bytes[20..]);
+    let hk = U160::from_be_bytes(&hk_bytes);
+
+    let creds = HostCredentials {
+        host_cert: *host_cert,
+        host_priv: U160::from_be_bytes(host_priv_key),
+        aacs_la_pub,
+    };
+
+    let ake_result = host_authenticate(&mut drive, &creds, &host_nonce, &hk)
+        .map_err(|e| DriveError::Mmc(format!("AKE handshake failed: {e}")))?;
+
+    read_verified_volume_id(&mut drive, &ake_result.bus_key, ake_result.agid)
+        .map_err(|e| DriveError::Mmc(format!("AKE-verified Volume ID read failed: {e}")))
+}
+
 /// Render a sense buffer as a short KCQ triple (Key/ASC/ASCQ) for
 /// error messages. Accepts both fixed-format and descriptor-format
 /// sense.

@@ -502,27 +502,24 @@ fn entry_from_env(
             Some(b) => b,
             None => return Ok(None),
         };
-        // VID source: env override first, then drive query. The drive
-        // query is only available under the `aacs-online` feature; on
-        // a feature-free build, fall through if the env override
-        // isn't set.
+        // VID source: env override first, then the same direct →
+        // AKE-fallback drive resolver `try_online_vuk` uses, so a
+        // caller who supplies K_m and the AACS LA pubkey (but not the
+        // VID) gets the VID acquired from the drive automatically.
         let vid_opt: Option<[u8; 16]> = if let Ok(vid_s) = std::env::var("OXIDEAV_AACS_VOLUME_ID") {
             parse_hex16_env("OXIDEAV_AACS_VOLUME_ID", &vid_s)
         } else {
             #[cfg(feature = "aacs-online")]
             {
-                match crate::drive::read_volume_id(disc_root) {
-                    Ok(v) => Some(v),
-                    Err(e) => {
-                        eprintln!(
-                            "oxideav-bluray: OXIDEAV_AACS_MEDIA_KEY env set but \
-                             drive Volume Identifier query failed: {e}. Set \
-                             OXIDEAV_AACS_VOLUME_ID=<32-hex chars> to supply it \
-                             manually."
-                        );
-                        None
-                    }
-                }
+                // Reuse `resolve_volume_id`'s direct → AKE cascade.
+                // Parsing KEYDB.cfg here is wasteful but the path is
+                // only hit when MEDIA_KEY is set without VID; in
+                // practice that's a one-off setup step.
+                let keydb_text = find_keydb_path()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .unwrap_or_default();
+                let kdb = KeyDb::parse(&keydb_text).unwrap_or_default();
+                resolve_volume_id(disc_root, &kdb, debug)
             }
             #[cfg(not(feature = "aacs-online"))]
             {
@@ -631,16 +628,24 @@ fn try_online_vuk(
         return Ok(None);
     }
 
-    // Drive-side: fetch the 16-byte AACS Volume Identifier via MMC
-    // READ DISC STRUCTURE (or the `OXIDEAV_AACS_VOLUME_ID` env
-    // override for testing). The drive query is what makes this path
-    // "online".
-    let volume_id = match crate::drive::read_volume_id(disc_root) {
-        Ok(v) => v,
-        Err(e) => {
+    // Drive-side: fetch the 16-byte AACS Volume Identifier. Two-step
+    // strategy:
+    //
+    //   (a) Try the direct `READ DISC STRUCTURE` Format 0x80 first —
+    //       it's the cheapest path and macOS' IOKit MMC backend (the
+    //       reference impl) takes it.
+    //   (b) On CHECK CONDITION (the common case on Linux SG_IO since
+    //       most consumer drives demand AACS Drive-Host AKE before
+    //       serving Format 0x80), fall back to a full AKE handshake
+    //       using the `| HC |` record from KEYDB.cfg and the AACS LA
+    //       root public key supplied via `OXIDEAV_AACS_LA_PUB`.
+    let volume_id = match resolve_volume_id(disc_root, &kdb, debug) {
+        Some(v) => v,
+        None => {
             eprintln!(
                 "oxideav-bluray: online VUK derivation: drive Volume \
-                 Identifier query failed for {disc_id_hex}: {e}"
+                 Identifier acquisition failed for {disc_id_hex} \
+                 (both direct read and AKE handshake)"
             );
             return Ok(None);
         }
@@ -688,6 +693,66 @@ fn try_online_vuk(
         }
     }
     Ok(None)
+}
+
+/// Two-step Volume ID acquisition for the online cascade. Tries
+/// the direct `READ DISC STRUCTURE` Format 0x80 first; on any error
+/// (typically `KCQ 05/6f/02` "KEY NOT ESTABLISHED" from a drive that
+/// enforces AKE), falls back to a full AACS Common §4.3 Drive-Host
+/// AKE handshake using credentials parsed from KEYDB.cfg + the
+/// `OXIDEAV_AACS_LA_PUB=<80 hex>` env var.
+///
+/// Returns `None` only when both paths fail; intermediate failures
+/// are surfaced on stderr.
+#[cfg(feature = "aacs-online")]
+fn resolve_volume_id(disc_root: &Path, kdb: &KeyDb, debug: bool) -> Option<[u8; 16]> {
+    match crate::drive::read_volume_id(disc_root) {
+        Ok(v) => {
+            if debug {
+                eprintln!("oxideav-bluray: direct READ DISC STRUCTURE returned VID");
+            }
+            return Some(v);
+        }
+        Err(e) => {
+            if debug {
+                eprintln!("oxideav-bluray: direct VID read failed: {e}. Trying AKE fallback.");
+            }
+        }
+    }
+
+    let hc = match kdb.host_certs().first() {
+        Some(h) => h,
+        None => {
+            eprintln!(
+                "oxideav-bluray: AKE fallback skipped — no `| HC |` Host Certificate \
+                 record in KEYDB.cfg"
+            );
+            return None;
+        }
+    };
+    if hc.host_cert.len() != 92 {
+        eprintln!(
+            "oxideav-bluray: AKE fallback skipped — `| HC |` host certificate is \
+             {} bytes, expected 92 per AACS Common Table 4-2",
+            hc.host_cert.len()
+        );
+        return None;
+    }
+    let mut host_cert = [0u8; 92];
+    host_cert.copy_from_slice(&hc.host_cert);
+
+    match crate::drive::read_volume_id_with_ake(disc_root, &host_cert, &hc.host_priv_key) {
+        Ok(v) => {
+            if debug {
+                eprintln!("oxideav-bluray: AKE-authenticated VID read succeeded");
+            }
+            Some(v)
+        }
+        Err(e) => {
+            eprintln!("oxideav-bluray: AKE-authenticated VID read failed: {e}");
+            None
+        }
+    }
 }
 
 /// Map a KEYDB.cfg `| DK |` record into the
