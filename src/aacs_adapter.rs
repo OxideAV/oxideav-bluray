@@ -8,27 +8,23 @@
 //!      `AACS/DUPLICATE/Unit_Key_RO.inf`). No drive query, no AACS
 //!      host-authentication handshake — the file is plain-text-
 //!      readable through the filesystem.
-//!   3. Resolve a VUK by walking the cascade in
-//!      [`resolve_aacs_entry`]:
-//!      (0) Env-var override — `OXIDEAV_AACS_VUK=<32-hex>` short-
-//!      circuits with a complete VUK; `OXIDEAV_AACS_MEDIA_KEY=<32-hex>`
-//!      combines with VID (from drive or `OXIDEAV_AACS_VOLUME_ID`) to
-//!      compute `K_vu = AES-G(K_m, ID_v)`. Either lets a Type-4
-//!      MKB whose KCD path isn't wired (or any disc whose `K_m` was
-//!      computed externally) play immediately.
-//!      (a) Stream-scan KEYDB.cfg line-by-line for the disc ID.
-//!      (b) On miss, stream-scan the local VUK cache
-//!      (`~/.cache/oxideav/vuk-cache.cfg`) — same line format,
-//!      so the cache is shareable with KEYDB.cfg by `cat`.
-//!      (c) On miss, attempt *online* derivation (gated behind the
-//!      `aacs-online` cargo feature): read the AACS Volume Identifier
-//!      via MMC `READ DISC STRUCTURE`
-//!      ([`crate::drive::read_volume_id`]) and walk the disc's MKB
-//!      Subset-Difference tree with each `| DK |` Device Key parsed
-//!      from KEYDB.cfg, via
-//!      [`oxideav_aacs::AacsVolume::derive_vuk_from_device_key`]. A
-//!      successful derivation is written back to the cache with an
-//!      `online-<RFC3339>` provenance stamp.
+//!   3. Resolve a VUK by walking the four-tier cascade in
+//!      [`resolve_aacs_entry`]: env-var overrides, then KEYDB.cfg
+//!      line scan, then the local VUK cache, then online derivation.
+//!      Env-var overrides accept any of: `OXIDEAV_AACS_VUK=<32 hex>`
+//!      (a complete Volume Unique Key, short-circuits the cascade),
+//!      `OXIDEAV_AACS_MEDIA_KEY=<32 hex>` (combines K_m with VID
+//!      from drive or `OXIDEAV_AACS_VOLUME_ID` to compute
+//!      `K_vu = AES-G(K_m, ID_v)`), and `OXIDEAV_AACS_KCD=<32 hex>`
+//!      (supplies Type-4 Key Conversion Data so the online walk
+//!      applies `K_m = AES-G(K_mp, KCD)` and verifies). The online
+//!      derivation reads the AACS Volume Identifier via MMC
+//!      `READ DISC STRUCTURE` ([`crate::drive::read_volume_id`]) —
+//!      direct first, AKE-authenticated fallback — and walks the
+//!      disc's MKB Subset-Difference tree with each `| DK |` Device
+//!      Key parsed from KEYDB.cfg. A successful derivation is
+//!      written back to the cache with an `online-<RFC3339>`
+//!      provenance stamp.
 //!   4. Apply the resolved VUK (or its pre-unwrapped Unit Keys) to a
 //!      freshly-opened `AacsVolume`, verify by trial-decrypting the
 //!      first `.m2ts` Aligned Unit and checking for the BD-AV TS sync
@@ -675,7 +671,22 @@ fn try_online_vuk(
                 continue;
             }
         };
-        match volume.derive_vuk_from_device_key(&device_key, &volume_id) {
+        // Type-3 MKBs walk straight to K_m; Type-4 BD-Prerecorded MKBs
+        // walk to K_mp (precursor) and need a KCD post-step: K_m =
+        // AES-G(K_mp, KCD). The KCD is in the BD-ROM physical Mark per
+        // BD-Prerecorded §3.8 (not in any filesystem-readable record)
+        // and reading it from the drive requires the AACS LA's
+        // KCD-Mark Outline spec (not publicly distributed). Until that
+        // path is wired, callers with a known KCD value can supply it
+        // via `OXIDEAV_AACS_KCD=<32 hex>` and the cascade will run the
+        // KCD-aware verifier.
+        let kcd = parse_hex16_env_opt("OXIDEAV_AACS_KCD");
+        let derive_result = if kcd.is_some() {
+            volume.derive_vuk_from_device_key_with_kcd(&device_key, &volume_id, kcd.as_ref())
+        } else {
+            volume.derive_vuk_from_device_key(&device_key, &volume_id)
+        };
+        match derive_result {
             Ok(vuk) => {
                 if debug {
                     eprintln!(
@@ -692,15 +703,41 @@ fn try_online_vuk(
             }
         }
     }
+    if matches!(volume.mkb.mkb_type, Some(oxideav_aacs::mkb::MkbType::Type4)) && kcd_env().is_none()
+    {
+        eprintln!(
+            "oxideav-bluray: this disc's MKB is Type-4 (BD-Prerecorded with Key \
+             Conversion Data) — the Subset-Difference walk yields the Media Key \
+             *precursor* K_mp, not K_m. Reading the disc's KCD-Mark from the \
+             drive needs the AACS LA KCD-Mark Outline spec, which we don't yet \
+             implement. Workarounds: set OXIDEAV_AACS_KCD=<32 hex> if you have \
+             the disc's KCD; or set OXIDEAV_AACS_MEDIA_KEY=<32 hex> with K_m \
+             from another tool (e.g. libaacs's `aacs_info`)."
+        );
+    }
     Ok(None)
+}
+
+/// Parse a 16-byte env-var value (32 hex chars, optional `0x`
+/// prefix). Returns `None` if the env var is unset or malformed.
+#[cfg(feature = "aacs-online")]
+fn parse_hex16_env_opt(name: &str) -> Option<[u8; 16]> {
+    let s = std::env::var(name).ok()?;
+    parse_hex16_env(name, &s)
+}
+
+/// Check whether `OXIDEAV_AACS_KCD` is set (used to gate diagnostics).
+#[cfg(feature = "aacs-online")]
+fn kcd_env() -> Option<String> {
+    std::env::var("OXIDEAV_AACS_KCD").ok()
 }
 
 /// Two-step Volume ID acquisition for the online cascade. Tries
 /// the direct `READ DISC STRUCTURE` Format 0x80 first; on any error
 /// (typically `KCQ 05/6f/02` "KEY NOT ESTABLISHED" from a drive that
 /// enforces AKE), falls back to a full AACS Common §4.3 Drive-Host
-/// AKE handshake using credentials parsed from KEYDB.cfg + the
-/// `OXIDEAV_AACS_LA_PUB=<80 hex>` env var.
+/// AKE handshake using credentials parsed from KEYDB.cfg and the
+/// bundled AACS LA root public key.
 ///
 /// Returns `None` only when both paths fail; intermediate failures
 /// are surfaced on stderr.
