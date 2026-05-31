@@ -9,7 +9,8 @@
 //! [`CDROM_SEND_PACKET`] = `0x5393`) is the older, more portable
 //! interface: it takes a 12-byte MMC CDB plus a `cdrom_generic_command`
 //! envelope and the kernel's CD-ROM driver routes it to whatever
-//! transport backs the device. libaacs uses this for the same reason.
+//! transport backs the device — the right transport-agnostic ioctl for
+//! a MMC CDB issued from userspace.
 //!
 //! Flow:
 //!

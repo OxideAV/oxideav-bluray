@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use crate::bdmv::clpi::ClipInformation;
 use crate::bdmv::index_bdmv::{IndexBdmv, IndexEntry, IndexObjectType};
-use crate::bdmv::mpls::{Chapter, PlayItem, PlayListMpls};
+use crate::bdmv::mpls::{Chapter, PlayItem, PlayListMpls, StreamCodingType};
 use crate::decrypt::{StreamDecryptor, AACS_UNIT_LEN};
 use crate::error::{BlurayError, Result};
 use crate::m2ts::{strip_tp_extra, M2TS_PACKET_LEN, TS_PACKET_LEN};
@@ -52,10 +52,12 @@ pub struct TitleInfo {
     pub playlist_id: u16,
     /// Total duration in 90 kHz ticks.
     pub duration_ticks: u64,
-    /// Soft list of language tags found in the playlist's STN_table.
-    /// Phase 1: empty (STN_table per-stream entries aren't surfaced
-    /// yet); the field stays for forward compatibility so the API
-    /// doesn't break later.
+    /// Sorted, deduplicated 3-letter ISO 639-2/T language tags found
+    /// across the playlist's STN_table audio + subtitle entries
+    /// (BD-ROM Part 3 §5.4.4.4). Empty when the playlist is missing /
+    /// unreadable or when every audio + subtitle stream's
+    /// `language_code` is the spec sentinel `b"\0\0\0"`. Use
+    /// [`Disc::title_streams`] for the full per-track listing.
     pub languages: Vec<String>,
 }
 
@@ -83,27 +85,28 @@ impl Disc {
         let index_bytes = read_file(&bdmv.join("index.bdmv"))?;
         let index = IndexBdmv::parse(&index_bytes)?;
 
-        // For each title, resolve the PlayList id + duration.
+        // For each title, resolve the PlayList id + duration + the
+        // sorted-unique language tag list. Each .mpls is read at most
+        // once: a successful parse hands the duration AND the language
+        // catalogue back via a tuple; a parse failure surfaces (0, [])
+        // rather than failing the whole mount, since some titles are
+        // intentionally empty placeholders for chapters / menus.
         let mut titles = Vec::with_capacity(index.titles.len());
         for (i, entry) in index.titles.iter().enumerate() {
             let id = (i + 1) as u16;
             let (kind, playlist_id) = resolve_title_playlist(&bdmv, entry)?;
-            // Parse the playlist for the duration. If parsing fails
-            // (missing / corrupt), surface duration 0 rather than
-            // failing the whole mount — some titles are intentionally
-            // empty placeholders for chapters / menus.
-            let duration_ticks = read_file(&playlist_path(&bdmv, playlist_id))
+            let (duration_ticks, languages) = read_file(&playlist_path(&bdmv, playlist_id))
                 .and_then(|b| {
                     let pl = PlayListMpls::parse(&b)?;
-                    Ok(pl.duration_90k())
+                    Ok((pl.duration_90k(), collect_languages(&pl)))
                 })
-                .unwrap_or(0);
+                .unwrap_or((0, Vec::new()));
             titles.push(TitleInfo {
                 id,
                 kind,
                 playlist_id,
                 duration_ticks,
-                languages: Vec::new(),
+                languages,
             });
         }
 
@@ -435,6 +438,46 @@ impl Disc {
             return Vec::new();
         };
         pl.chapters()
+    }
+
+    /// Per-track catalogue lifted out of the title's playlist STN_table
+    /// (BD-ROM Part 3 §5.4.4.4).
+    ///
+    /// Every PlayItem in a Blu-ray title carries its own STN_table, but
+    /// for a single-angle conformant title the table is identical across
+    /// PlayItems — the same primary-video / audio / PG / IG entries
+    /// repeat unchanged. The catalogue here merges every PlayItem's
+    /// entries by `(elementary_pid, kind)` so a downstream remuxer
+    /// gets exactly one [`Track`] per distinct elementary stream, with
+    /// `playitem_count` recording how many PlayItems carried that PID.
+    ///
+    /// The selected angle's PlayItem STN tables are the source of truth.
+    /// Multi-angle alternate clips also carry STN tables, but every
+    /// angle MUST surface the same elementary PIDs (BD-ROM AV §5.2.3.3
+    /// requires this so a mid-stream angle change can keep the same
+    /// PMT); reading just the primary PlayItem chain is therefore
+    /// sufficient for the per-track listing.
+    ///
+    /// Tracks are returned in canonical STN class order — primary
+    /// video, primary audio, PG subtitles, IG menus, secondary audio,
+    /// secondary video, PiP PG — and within each class in the order
+    /// the STN_table itself lists them. This is the same order a BD
+    /// player applies when assigning per-class user-selector indices,
+    /// so a remuxer can label tracks deterministically off `Track::pid`.
+    ///
+    /// Returns an empty list on read / parse failure rather than
+    /// propagating the error (matches [`Self::max_angle`] /
+    /// [`Self::chapters`]). A caller needing precise diagnostics can
+    /// [`PlayListMpls::parse`] directly.
+    pub fn title_streams(&self, title: &TitleInfo) -> TrackCatalogue {
+        let bdmv = self.root.join("BDMV");
+        let Ok(pl_bytes) = read_file(&playlist_path(&bdmv, title.playlist_id)) else {
+            return TrackCatalogue::default();
+        };
+        let Ok(pl) = PlayListMpls::parse(&pl_bytes) else {
+            return TrackCatalogue::default();
+        };
+        build_track_catalogue(&pl)
     }
 }
 
@@ -1025,6 +1068,290 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+// ─────────────────────── track catalogue ───────────────────────
+
+/// Stream class for one entry in a [`TrackCatalogue`].
+///
+/// Mirrors the seven counted STN_table classes (BD-ROM Part 3
+/// §5.4.4.4) — every elementary stream a title can carry maps onto
+/// exactly one of these. We collapse the parser's per-class struct
+/// types (`PrimaryVideoStream`, `PrimaryAudioStream`, …) into a single
+/// enum so a remuxer can iterate one flat list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrackKind {
+    /// Primary video — the title's main video stream.
+    PrimaryVideo,
+    /// Primary audio — the title's main audio mix.
+    PrimaryAudio,
+    /// Presentation Graphic Stream (BD bitmap subtitle).
+    PgSubtitle,
+    /// Interactive Graphic Stream (on-disc menu overlay).
+    IgMenu,
+    /// Secondary audio (PiP / commentary mixdown).
+    SecondaryAudio,
+    /// Secondary video (Picture-in-Picture overlay).
+    SecondaryVideo,
+    /// Picture-in-Picture Presentation Graphic Stream.
+    PipPgSubtitle,
+}
+
+/// One elementary stream a title carries, as listed in every PlayItem's
+/// STN_table. Returned by [`Disc::title_streams`].
+///
+/// `language_code` is `None` for video / IG / PiP PG entries (the
+/// stream class doesn't carry one) and for audio / PG / text-subtitle
+/// entries whose `language_code` field is the spec sentinel `b"\0\0\0"`
+/// (the "language not specified" pad many discs ship for the primary
+/// audio mix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Track {
+    /// MPEG-TS elementary PID carrying this stream. Stable across the
+    /// whole title (BD-ROM AV §5.2.3.3 requires the PID assignment to
+    /// be consistent across all PlayItems and all angles).
+    pub pid: u16,
+    pub kind: TrackKind,
+    /// Spec coding type — `Mpeg2Video` / `AvcVideo` / `Ac3Audio` /
+    /// `DtsHdMaAudio` / `PgsSubtitle` etc. (BD-ROM Part 3 §5.4.4.4
+    /// `stream_coding_type`).
+    pub coding_type: StreamCodingType,
+    /// ISO 639-2/T 3-letter language tag. `None` when the stream class
+    /// doesn't carry one, when the field is unset, or when the raw
+    /// bytes don't decode as ASCII.
+    pub language: Option<String>,
+    /// Number of PlayItems in the title's PlayList that listed this
+    /// PID in their STN_table. For a single-angle conformant title
+    /// this equals the PlayItem count (every PI lists the same PIDs);
+    /// a value lower than the PlayItem count indicates a per-PlayItem
+    /// override (e.g. a clip that drops a commentary track).
+    pub playitem_count: u32,
+}
+
+/// Aggregated per-track listing for a Blu-ray title — one entry per
+/// distinct (PID, [`TrackKind`]) pair across every PlayItem in the
+/// PlayList.
+///
+/// Order matches the canonical STN class order documented on
+/// [`Disc::title_streams`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackCatalogue {
+    pub tracks: Vec<Track>,
+}
+
+impl TrackCatalogue {
+    /// Number of tracks in the catalogue.
+    pub fn len(&self) -> usize {
+        self.tracks.len()
+    }
+
+    /// True when the catalogue is empty (parse failure or
+    /// genuinely-track-free placeholder title).
+    pub fn is_empty(&self) -> bool {
+        self.tracks.is_empty()
+    }
+
+    /// Iterate over tracks of a given kind, in catalogue order.
+    pub fn by_kind(&self, kind: TrackKind) -> impl Iterator<Item = &Track> {
+        self.tracks.iter().filter(move |t| t.kind == kind)
+    }
+
+    /// First track with the given PID, if any. PIDs are unique within
+    /// a Blu-ray title's PlayList (per AV §5.2.3.3), so this returns
+    /// the canonical Track for that elementary stream.
+    pub fn by_pid(&self, pid: u16) -> Option<&Track> {
+        self.tracks.iter().find(|t| t.pid == pid)
+    }
+}
+
+/// Decode a 3-byte ISO 639-2/T language code into a 3-letter String.
+/// Returns `None` for the spec sentinel `b"\0\0\0"` (the "unset"
+/// pad) and for any byte sequence that isn't printable ASCII (the
+/// spec allows author-private extension here).
+fn decode_lang_code(raw: [u8; 3]) -> Option<String> {
+    if raw == [0, 0, 0] {
+        return None;
+    }
+    if !raw.iter().all(|&b| b.is_ascii_graphic()) {
+        return None;
+    }
+    // Lowercase per ISO 639-2/T convention so a downstream remuxer
+    // emits `eng` / `jpn` regardless of whether the disc author wrote
+    // `ENG` / `JPN` (some do).
+    let s: String = raw
+        .iter()
+        .map(|&b| (b as char).to_ascii_lowercase())
+        .collect();
+    Some(s)
+}
+
+/// Lift every PlayItem's STN_table into a single deduplicated
+/// [`TrackCatalogue`]. See [`Disc::title_streams`] for details.
+fn build_track_catalogue(pl: &PlayListMpls) -> TrackCatalogue {
+    // Track records pushed in first-seen order; the canonical STN
+    // class order falls out of the inner walk order below.
+    let mut tracks: Vec<Track> = Vec::new();
+    let mut index_by_key: std::collections::HashMap<(u16, TrackKind), usize> =
+        std::collections::HashMap::new();
+
+    let bump = |tracks: &mut Vec<Track>,
+                index_by_key: &mut std::collections::HashMap<(u16, TrackKind), usize>,
+                pid: u16,
+                kind: TrackKind,
+                coding_type: StreamCodingType,
+                language: Option<String>| {
+        if pid == 0 {
+            // Non-in-mux entries (stream_type 2/3/4) carry a SubPath
+            // reference rather than a direct PID; the parser leaves
+            // the PID at 0 for those. Skip — there's no main-TS PID
+            // for a remuxer to label.
+            return;
+        }
+        let key = (pid, kind);
+        if let Some(&idx) = index_by_key.get(&key) {
+            tracks[idx].playitem_count += 1;
+        } else {
+            let idx = tracks.len();
+            tracks.push(Track {
+                pid,
+                kind,
+                coding_type,
+                language,
+                playitem_count: 1,
+            });
+            index_by_key.insert(key, idx);
+        }
+    };
+
+    for pi in &pl.play_list.play_items {
+        for s in &pi.stn_table.primary_video {
+            bump(
+                &mut tracks,
+                &mut index_by_key,
+                s.elementary_pid,
+                TrackKind::PrimaryVideo,
+                s.coding_type,
+                None,
+            );
+        }
+        for s in &pi.stn_table.primary_audio {
+            bump(
+                &mut tracks,
+                &mut index_by_key,
+                s.elementary_pid,
+                TrackKind::PrimaryAudio,
+                s.coding_type,
+                decode_lang_code(s.language_code),
+            );
+        }
+        for s in &pi.stn_table.pg_subtitles {
+            bump(
+                &mut tracks,
+                &mut index_by_key,
+                s.elementary_pid,
+                TrackKind::PgSubtitle,
+                s.coding_type,
+                decode_lang_code(s.language_code),
+            );
+        }
+        for s in &pi.stn_table.ig_streams {
+            bump(
+                &mut tracks,
+                &mut index_by_key,
+                s.elementary_pid,
+                TrackKind::IgMenu,
+                s.coding_type,
+                decode_lang_code(s.language_code),
+            );
+        }
+        for s in &pi.stn_table.secondary_audio {
+            bump(
+                &mut tracks,
+                &mut index_by_key,
+                s.elementary_pid,
+                TrackKind::SecondaryAudio,
+                s.coding_type,
+                decode_lang_code(s.language_code),
+            );
+        }
+        for s in &pi.stn_table.secondary_video {
+            bump(
+                &mut tracks,
+                &mut index_by_key,
+                s.elementary_pid,
+                TrackKind::SecondaryVideo,
+                s.coding_type,
+                None,
+            );
+        }
+        for s in &pi.stn_table.pip_pg {
+            bump(
+                &mut tracks,
+                &mut index_by_key,
+                s.elementary_pid,
+                TrackKind::PipPgSubtitle,
+                s.coding_type,
+                decode_lang_code(s.language_code),
+            );
+        }
+    }
+
+    // Sort by class (canonical STN order) then by first-seen index.
+    // Currently the input order already matches class order across
+    // PlayItems, but if a downstream parser ever introduced an
+    // out-of-order STN class the explicit sort keeps the invariant.
+    tracks.sort_by_key(|t| (class_order(t.kind), t.pid));
+    TrackCatalogue { tracks }
+}
+
+/// Canonical ordering rank for [`TrackKind`] — matches the STN_table
+/// class declaration order in BD-ROM Part 3 §5.4.4.4.
+fn class_order(kind: TrackKind) -> u8 {
+    match kind {
+        TrackKind::PrimaryVideo => 0,
+        TrackKind::PrimaryAudio => 1,
+        TrackKind::PgSubtitle => 2,
+        TrackKind::IgMenu => 3,
+        TrackKind::SecondaryAudio => 4,
+        TrackKind::SecondaryVideo => 5,
+        TrackKind::PipPgSubtitle => 6,
+    }
+}
+
+/// Sorted, deduplicated set of 3-letter language tags pulled from a
+/// PlayList's STN_table audio + PG + IG + PiP PG entries. Used by
+/// [`Disc::mount`] to populate [`TitleInfo::languages`] without re-
+/// reading the .mpls per title.
+fn collect_languages(pl: &PlayListMpls) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for pi in &pl.play_list.play_items {
+        for s in &pi.stn_table.primary_audio {
+            if let Some(l) = decode_lang_code(s.language_code) {
+                set.insert(l);
+            }
+        }
+        for s in &pi.stn_table.pg_subtitles {
+            if let Some(l) = decode_lang_code(s.language_code) {
+                set.insert(l);
+            }
+        }
+        for s in &pi.stn_table.ig_streams {
+            if let Some(l) = decode_lang_code(s.language_code) {
+                set.insert(l);
+            }
+        }
+        for s in &pi.stn_table.secondary_audio {
+            if let Some(l) = decode_lang_code(s.language_code) {
+                set.insert(l);
+            }
+        }
+        for s in &pi.stn_table.pip_pg {
+            if let Some(l) = decode_lang_code(s.language_code) {
+                set.insert(l);
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
 // ─────────────────────── helpers ───────────────────────
 
 fn playlist_path(bdmv: &Path, id: u16) -> PathBuf {
@@ -1321,6 +1648,42 @@ mod tests {
         assert_eq!(meta.title, "Kite Uncut");
         assert_eq!(meta.language.as_deref(), Some("eng"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn decode_lang_code_rejects_unset_sentinel() {
+        assert_eq!(decode_lang_code([0, 0, 0]), None);
+    }
+
+    #[test]
+    fn decode_lang_code_rejects_non_ascii() {
+        assert_eq!(decode_lang_code([0xFF, 0xFE, 0xFD]), None);
+        assert_eq!(decode_lang_code([0, b'e', b'n']), None);
+    }
+
+    #[test]
+    fn decode_lang_code_lowercases_uppercase_authoring() {
+        assert_eq!(decode_lang_code(*b"ENG"), Some("eng".into()));
+        assert_eq!(decode_lang_code(*b"jpn"), Some("jpn".into()));
+        assert_eq!(decode_lang_code(*b"FrA"), Some("fra".into()));
+    }
+
+    #[test]
+    fn class_order_is_monotonic_and_matches_spec_order() {
+        // BD-ROM Part 3 §5.4.4.4 declaration order: primary video,
+        // primary audio, PG, IG, secondary audio, secondary video, PiP PG.
+        let order = [
+            TrackKind::PrimaryVideo,
+            TrackKind::PrimaryAudio,
+            TrackKind::PgSubtitle,
+            TrackKind::IgMenu,
+            TrackKind::SecondaryAudio,
+            TrackKind::SecondaryVideo,
+            TrackKind::PipPgSubtitle,
+        ];
+        for (i, k) in order.iter().enumerate() {
+            assert_eq!(class_order(*k) as usize, i);
+        }
     }
 
     #[test]

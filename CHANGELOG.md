@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Disc::title_streams(title) -> TrackCatalogue` — per-title track
+  catalogue** (BD-ROM Part 3 §5.4.4.4 STN_table lift). The MPLS parser
+  already decoded every PlayItem's `StnTable` into typed per-class
+  vectors (`primary_video`, `primary_audio`, `pg_subtitles`, …), but no
+  high-level helper aggregated those across a title's PlayItems for a
+  remuxer to consume as a flat track list. The new catalogue merges
+  every PlayItem's entries by `(elementary_pid, kind)` (PIDs are stable
+  across PlayItems per AV §5.2.3.3) and returns one `Track { pid, kind,
+  coding_type, language, playitem_count }` per distinct elementary
+  stream, in canonical STN class order: `PrimaryVideo` → `PrimaryAudio`
+  → `PgSubtitle` → `IgMenu` → `SecondaryAudio` → `SecondaryVideo` →
+  `PipPgSubtitle`. `language` is the lowercased 3-letter ISO 639-2/T
+  tag from the per-stream attributes block (`None` for video / IG / PiP
+  PG which carry no `language_code`, for the spec sentinel `b"\0\0\0"`,
+  and for non-ASCII raw bytes). `playitem_count` records how many
+  PlayItems in the title's PlayList carried that PID — equals
+  `play_items.len()` for the common single-angle case, less when a clip
+  drops a commentary track. `TrackCatalogue::by_pid` / `by_kind` give
+  O(n) lookups for downstream selectors. Returns an empty catalogue on
+  read / parse failure (matches `Disc::max_angle` /
+  `Disc::chapters`). The new types `Track` / `TrackKind` /
+  `TrackCatalogue` are re-exported at the crate root.
+- **`TitleInfo::languages` populated at mount time** (was a documented
+  Phase-1 stub returning `Vec::new()`). Populated from every audio
+  (primary + secondary) + subtitle (PG + PiP PG) + IG entry's
+  `language_code` field on the title's playlist, sorted and
+  deduplicated through a `BTreeSet<String>` and lowercased so a disc
+  shipping `ENG` and `jpn` returns `vec!["eng", "jpn"]`. Empty when the
+  playlist is missing / unreadable or when every entry's language is
+  the spec sentinel `b"\0\0\0"`. Reuses the same MPLS parse as the
+  existing duration calculation — no extra I/O per title.
+- **Four new integration tests** (`tests/track_catalogue.rs`):
+  multi-PlayItem deduplication keeps `playitem_count == 2` for every
+  shared PID; `by_kind` walks only the requested class; mount-time
+  `TitleInfo::languages` is sorted-lowercased-deduplicated against a
+  mixed-case 3-tag synthetic disc; PID-0 (non-in-mux SubPath) entries
+  are filtered out of the catalogue. Three new unit tests cover
+  `decode_lang_code` (sentinel rejection, non-ASCII rejection,
+  lowercasing) and `class_order` (matches §5.4.4.4 declaration order).
+
+### Changed
+
+- **Tempdir helpers across `tests/` now use an atomic monotonic counter
+  alongside `SystemTime`-derived nonce** — bare nanoseconds collided
+  when several integration tests ran concurrently in the same
+  test binary, causing intermittent `BDMV header truncated` failures
+  when one test's `Disc::mount` raced with another's
+  `fs::create_dir_all`.
+- Scrubbed two clean-room attribution leaks from doc comments: a
+  "matches libbluray's clean-room read path" tag in
+  `src/bdmv/mpls.rs` and a "libaacs uses this for the same reason"
+  tag in `src/drive/linux.rs`. Both replaced with spec citations
+  (BD-ROM Part 3 §5.4.4.4 / kernel-userspace MMC CDB rationale).
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-bluray/compare/v0.0.1...v0.0.2) - 2026-05-29
 
 ### Other

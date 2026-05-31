@@ -891,9 +891,9 @@ fn parse_play_item(r: &mut Reader<'_>) -> Result<PlayItem> {
         for _ in 0..num_secondary_audio {
             // Secondary audio adds 1-byte num_secondary_audio_extra_pid
             // + N additional PID bytes per entry — but we follow the
-            // simplified layout (same as primary audio) that matches
-            // libbluray's clean-room read path. Anything trailing is
-            // skipped by the stream_attributes length envelope.
+            // simplified layout (same as primary audio) per BD-ROM
+            // Part 3 §5.4.4.4. Anything trailing is skipped by the
+            // stream_attributes length envelope.
             t.secondary_audio.push(parse_secondary_audio_stream(r)?);
         }
         for _ in 0..num_secondary_video {

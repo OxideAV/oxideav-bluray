@@ -425,13 +425,16 @@ impl Drop for TestDir {
     }
 }
 
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn tempdir_for_test() -> TestDir {
     let pid = std::process::id();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    let path = std::env::temp_dir().join(format!("oxideav-bluray-chap-{pid}-{nonce}"));
+    let serial = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("oxideav-bluray-chap-{pid}-{nonce}-{serial}"));
     fs::create_dir_all(&path).unwrap();
     TestDir { path }
 }

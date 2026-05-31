@@ -59,6 +59,17 @@ bluray://                          → auto-detect first BD-ROM mount
   `TitleSource::seek_to`. Link points (`mark_type == 0x02`) and
   malformed refs are excluded. A `MarkType` enum + `PlayListMark::kind()`
   classify the raw `mark_type` byte.
+- **Per-title track catalogue** — `Disc::title_streams(title) ->
+  TrackCatalogue` aggregates every PlayItem's STN_table (§5.4.4.4) into
+  a flat per-track listing, deduplicated by `(elementary_pid, kind)` so
+  a remuxer sees exactly one `Track { pid, kind, coding_type, language,
+  playitem_count }` per distinct elementary stream. Tracks are emitted
+  in canonical STN class order (primary video → primary audio → PG → IG
+  → secondary audio → secondary video → PiP PG). `TrackCatalogue::by_pid`
+  / `by_kind` give O(n) PID lookup + class filter for downstream label
+  emission. `TitleInfo::languages` is now populated at mount time from
+  every audio + subtitle entry's 3-byte ISO 639-2/T tag (sorted,
+  deduplicated, lowercased — disc authors ship a mix of `ENG` / `eng`).
 - `bluray://` URI handler registered with `oxideav_core::SourceRegistry`
   under the default-on `registry` cargo feature.
 - Pluggable [`StreamDecryptor`] trait so `oxideav-aacs` can plug in
