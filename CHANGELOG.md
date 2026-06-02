@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-PlayItem STC PTS continuity map** — new
+  `TitleSource::pts_continuity_segments()` plus the file-less peer
+  `Disc::title_pts_continuity_segments(title)` (and an angle-aware
+  variant `…_with_angle(title, angle)`) return one
+  `PtsContinuitySegment` per PlayItem in playback order: a record of
+  where that PlayItem's bytes live in the output stream
+  (`output_byte_start` / `output_byte_end`), where the segment sits on
+  the title timeline (`title_pts_start` / `title_pts_end` in 90 kHz),
+  the PlayItem's IN / OUT lifted onto the same 90 kHz axis
+  (`clip_in_pts_90k` / `clip_out_pts_90k`, doubled from §5.4.4.1's
+  45 kHz fields), the clip-local STC origin lifted from the CLPI
+  `SequenceInfo` (§5.5.4.2 — `presentation_start_time` of the STC
+  sequence picked by the PlayItem's `stc_id_ref`), the `stc_id_ref`
+  itself, and the seam's `ConnectionCondition` (§5.4.4.2 —
+  `NonSeamless` / `SeamlessContinuation` / `SeamlessNewStc`). A
+  downstream MPEG-TS demuxer reprojects each PES packet inside a
+  segment as `title_pts = title_pts_start + (pes_pts - clip_in_pts_90k)`;
+  the convenience `TitleSource::map_clip_pts_to_title_pts(byte_pos,
+  pes_pts)` does the binary search for one-shot callers and returns
+  `None` when the requested PES PTS sits before the segment's IN
+  (leading bytes that the demuxer should drop). The first PlayItem's
+  recorded `connection_condition` byte is meaningless (defined as the
+  relation to the *previous* PlayItem, of which there is none) so the
+  surface always normalises it to `NonSeamless`. Internally the same
+  walk feeds a renamed `load_clip_meta` helper that now returns both
+  the primary EP_map (was `load_entry_points`) and the
+  CLPI-resolved STC origin in one CLPI parse — no extra I/O per clip.
+  `ClipSeekInfo` gained three fields (`connection_condition`,
+  `stc_id_ref`, `stc_origin_pts_90k`) and `TitleSource` caches the
+  title's 90 kHz duration so the final segment's `title_pts_end`
+  doesn't need a separate MPLS walk.
+- **`PtsContinuitySegment` re-exported at the crate root.**
+- **Six new integration tests** (`tests/pts_continuity.rs`): a 3-PlayItem
+  tile that verifies byte / PTS bounds contiguity + per-clip STC origin
+  threading; first-PlayItem `connection_condition` normalisation; empty
+  `SequenceInfo` falls back to a 0 STC origin; the `map_clip_pts_to_title_pts`
+  walk across a NonSeamless / SeamlessNewStc seam; a PlayItem with a
+  non-zero IN-point reprojects correctly; missing MPLS yields an empty
+  segment list (matches the `chapters` / `title_streams` swallow-error
+  policy).
 - **`Disc::title_streams(title) -> TrackCatalogue` — per-title track
   catalogue** (BD-ROM Part 3 §5.4.4.4 STN_table lift). The MPLS parser
   already decoded every PlayItem's `StnTable` into typed per-class

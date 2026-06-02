@@ -59,6 +59,26 @@ bluray://                          → auto-detect first BD-ROM mount
   `TitleSource::seek_to`. Link points (`mark_type == 0x02`) and
   malformed refs are excluded. A `MarkType` enum + `PlayListMark::kind()`
   classify the raw `mark_type` byte.
+- **Cross-PlayItem STC PTS continuity map** — `TitleSource::pts_continuity_segments()`
+  (and the file-less peer `Disc::title_pts_continuity_segments(title)`) returns
+  one [`PtsContinuitySegment`] per PlayItem in playback order, telling a downstream
+  MPEG-TS demuxer where each PlayItem's bytes live in the output stream and how to
+  reproject its clip-local PTS onto the title timeline. Each segment carries
+  `output_byte_start` / `output_byte_end`, `title_pts_start` / `title_pts_end`
+  (90 kHz), `clip_in_pts_90k` / `clip_out_pts_90k` (PlayItem IN/OUT lifted from
+  §5.4.4.1, doubled from 45 kHz), the `stc_origin_pts_90k` lifted from the clip's
+  CLPI `SequenceInfo` / `presentation_start_time` (§5.5.4.2, picked by the
+  PlayItem's `stc_id_ref`), and the seam's `connection_condition` (§5.4.4.2 —
+  `NonSeamless` / `SeamlessContinuation` / `SeamlessNewStc`). A demuxer reprojects
+  each PES packet inside a segment as
+  `title_pts = title_pts_start + (pes_pts - clip_in_pts_90k)`; the convenience
+  `TitleSource::map_clip_pts_to_title_pts(byte_pos, pes_pts)` does the binary
+  search for one-shot callers. The first PlayItem's recorded
+  `connection_condition` byte is meaningless (defined as the relation to the
+  *previous* PlayItem) so the surface always normalises it to `NonSeamless`. The
+  reproject closes the long-standing gap where a downstream remuxer either had to
+  flatten every clip's PTS into a single axis or interpret natural BD-AV STC
+  restarts as stream corruption.
 - **Per-title track catalogue** — `Disc::title_streams(title) ->
   TrackCatalogue` aggregates every PlayItem's STN_table (§5.4.4.4) into
   a flat per-track listing, deduplicated by `(elementary_pid, kind)` so
@@ -104,8 +124,11 @@ bluray://                          → auto-detect first BD-ROM mount
 - Mid-stream angle switching at an `is_angle_change_point` boundary
   (`open_title_with_angle` fixes the angle at open time; the EP_map
   rows do flag angle-change points but switching live still requires a
-  re-open) and SequenceInfo STC-based PTS remapping across non-seamless
-  PlayItem joins.
+  re-open). Cross-PlayItem STC PTS continuity is now exposed as a
+  `pts_continuity_segments` map (see Scope above) — the demuxer-side
+  PES reproject is fully driven by it; what's still deferred is having
+  `TitleSource::read()` *itself* rewrite outgoing PES PTS so a remuxer
+  doesn't even need the map.
 - ICB strategy types other than 4, ExtendedFileEntry, long/extended
   allocation descriptors, multi-extent partition maps.
 

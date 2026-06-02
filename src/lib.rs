@@ -91,8 +91,8 @@ pub use bdmv::{
 };
 pub use decrypt::{DecryptError, StreamDecryptor};
 pub use disc::{
-    ChapterSegment, ChapterSegments, Disc, DiscTitleMeta, TitleInfo, TitleKind, TitleSource, Track,
-    TrackCatalogue, TrackKind,
+    ChapterSegment, ChapterSegments, Disc, DiscTitleMeta, PtsContinuitySegment, TitleInfo,
+    TitleKind, TitleSource, Track, TrackCatalogue, TrackKind,
 };
 pub use error::{BlurayError, Result};
 pub use m2ts::{

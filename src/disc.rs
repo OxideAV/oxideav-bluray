@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use crate::bdmv::clpi::ClipInformation;
 use crate::bdmv::index_bdmv::{IndexBdmv, IndexEntry, IndexObjectType};
-use crate::bdmv::mpls::{Chapter, PlayItem, PlayListMpls, StreamCodingType};
+use crate::bdmv::mpls::{Chapter, ConnectionCondition, PlayItem, PlayListMpls, StreamCodingType};
 use crate::decrypt::{StreamDecryptor, AACS_UNIT_LEN};
 use crate::error::{BlurayError, Result};
 use crate::m2ts::{strip_tp_extra, M2TS_PACKET_LEN, TS_PACKET_LEN};
@@ -469,6 +469,127 @@ impl Disc {
     /// propagating the error (matches [`Self::max_angle`] /
     /// [`Self::chapters`]). A caller needing precise diagnostics can
     /// [`PlayListMpls::parse`] directly.
+    /// PlayItem-aligned PTS continuity segments for `title` —
+    /// equivalent to opening a [`TitleSource`] on the primary angle
+    /// and calling [`TitleSource::pts_continuity_segments`], but
+    /// skips the m2ts file-open step (the segment list is derived
+    /// entirely from the MPLS + CLPI surface).
+    ///
+    /// See [`PtsContinuitySegment`] for the per-PlayItem byte / PTS
+    /// reproject contract and the
+    /// `SeamlessContinuation` / `SeamlessNewStc` / `NonSeamless`
+    /// semantics at PlayItem seams.
+    ///
+    /// Returns an empty list on read / parse failure rather than
+    /// propagating the error (matches [`Self::chapters`] /
+    /// [`Self::title_streams`]).
+    pub fn title_pts_continuity_segments(&self, title: &TitleInfo) -> Vec<PtsContinuitySegment> {
+        self.title_pts_continuity_segments_with_angle(title, 0)
+    }
+
+    /// Same as [`Self::title_pts_continuity_segments`] but for a
+    /// specific 0-based angle. Returns an empty list when `angle`
+    /// is unavailable on any PlayItem (matches the
+    /// [`Self::open_title_with_angle`] rejection policy, but doesn't
+    /// surface the error since this method is used for inspection).
+    pub fn title_pts_continuity_segments_with_angle(
+        &self,
+        title: &TitleInfo,
+        angle: u8,
+    ) -> Vec<PtsContinuitySegment> {
+        let bdmv = self.root.join("BDMV");
+        let Ok(pl_bytes) = read_file(&playlist_path(&bdmv, title.playlist_id)) else {
+            return Vec::new();
+        };
+        let Ok(pl) = PlayListMpls::parse(&pl_bytes) else {
+            return Vec::new();
+        };
+        if pl.play_list.play_items.is_empty() {
+            return Vec::new();
+        }
+        for pi in &pl.play_list.play_items {
+            if pi.angle_clip(angle).is_none() {
+                return Vec::new();
+            }
+        }
+        // The construction mirrors `TitleSource::new` + the public
+        // `pts_continuity_segments` body. We can't share the code
+        // because `TitleSource::new` does real I/O (open the m2ts +
+        // mount the decryptor); this lighter walk only reads CLPI.
+        let mut clips: Vec<ClipSeekInfo> = Vec::with_capacity(pl.play_list.play_items.len());
+        let mut output_total: u64 = 0;
+        let mut title_pts_start: u64 = 0;
+        for pi in &pl.play_list.play_items {
+            let angle_ref = pi.angle_clip(angle);
+            let stem = angle_ref
+                .map(|a| a.clip_information_file_name.to_string())
+                .unwrap_or_else(|| pi.clip_information_file_name.clone());
+            let stc_id_ref = angle_ref.map(|a| a.stc_id_ref).unwrap_or(pi.stc_id_ref);
+            let m2ts_path = bdmv.join("STREAM").join(format!("{stem}.m2ts"));
+            let packet_count = match std::fs::metadata(&m2ts_path) {
+                Ok(meta) => {
+                    let raw = meta.len();
+                    let usable = raw - (raw % M2TS_PACKET_LEN as u64);
+                    usable / M2TS_PACKET_LEN as u64
+                }
+                Err(_) => 0,
+            };
+            let (entry_points, stc_origin_pts_90k) = load_clip_meta(&bdmv, &stem, stc_id_ref);
+            clips.push(ClipSeekInfo {
+                stem,
+                output_start: output_total,
+                packet_count,
+                title_pts_start,
+                in_pts_90k: u64::from(pi.in_time_ticks) * 2,
+                entry_points,
+                connection_condition: pi.connection_condition,
+                stc_id_ref,
+                stc_origin_pts_90k,
+            });
+            output_total += packet_count * TS_PACKET_LEN as u64;
+            title_pts_start += pi.duration_90k();
+        }
+
+        // Build the public segment list — same logic as
+        // `TitleSource::pts_continuity_segments` but operating on the
+        // local `clips` vec rather than `self.clips`.
+        let mut out = Vec::with_capacity(clips.len());
+        for (idx, c) in clips.iter().enumerate() {
+            let cc = if idx == 0 {
+                ConnectionCondition::NonSeamless
+            } else {
+                c.connection_condition
+            };
+            let next_output_start = clips
+                .get(idx + 1)
+                .map(|n| n.output_start)
+                .unwrap_or(output_total);
+            let next_title_pts = clips
+                .get(idx + 1)
+                .map(|n| n.title_pts_start)
+                .unwrap_or_else(|| c.title_pts_start + pl.play_list.play_items[idx].duration_90k());
+            let clip_out_pts_90k = c.in_pts_90k + next_title_pts.saturating_sub(c.title_pts_start);
+            let mut stem_bytes = [0u8; 5];
+            let raw = c.stem.as_bytes();
+            let copy_len = raw.len().min(5);
+            stem_bytes[..copy_len].copy_from_slice(&raw[..copy_len]);
+            out.push(PtsContinuitySegment {
+                play_item_index: idx as u16,
+                clip_stem: stem_bytes,
+                output_byte_start: c.output_start,
+                output_byte_end: next_output_start,
+                title_pts_start: c.title_pts_start,
+                title_pts_end: next_title_pts,
+                clip_in_pts_90k: c.in_pts_90k,
+                clip_out_pts_90k,
+                stc_origin_pts_90k: c.stc_origin_pts_90k,
+                stc_id_ref: c.stc_id_ref,
+                connection_condition: cc,
+            });
+        }
+        out
+    }
+
     pub fn title_streams(&self, title: &TitleInfo) -> TrackCatalogue {
         let bdmv = self.root.join("BDMV");
         let Ok(pl_bytes) = read_file(&playlist_path(&bdmv, title.playlist_id)) else {
@@ -508,6 +629,102 @@ struct ClipSeekInfo {
     /// clip's primary-video EP_map. Empty when the clip ships no CPI
     /// (homemade discs) — seeking then falls back to the clip start.
     entry_points: Vec<(u32, u32)>,
+    /// Connection condition advertised by the **owning PlayItem**
+    /// (§5.4.4.2): how this clip's STC relates to the previous clip's.
+    /// `SeamlessContinuation` (0x05) means the previous clip's PTS axis
+    /// continues; the other variants introduce a fresh STC origin and a
+    /// downstream demuxer must add a per-clip offset to reproject
+    /// clip-local PTS onto the title timeline.
+    connection_condition: ConnectionCondition,
+    /// `stc_id_ref` from the PlayItem — indexes into the CLPI's
+    /// SequenceInfo to pick **which STC sequence inside the clip** the
+    /// PlayItem maps to (§5.4.4.1 + §5.5.4.2).
+    stc_id_ref: u8,
+    /// Clip-local 90 kHz PTS at which the referenced STC sequence
+    /// begins, lifted from the CLPI's `SequenceInfo` /
+    /// `StcSequence::presentation_start_time` (§5.5.4.2). The
+    /// SequenceInfo stores it in 45 kHz units; we double it to 90 kHz
+    /// for parity with the rest of the seek pipeline. Falls back to
+    /// `in_pts_90k` when the SequenceInfo is missing or the
+    /// `stc_id_ref` is out of range (homemade discs).
+    stc_origin_pts_90k: u64,
+}
+
+/// One PlayItem-aligned continuity segment of a title's output byte
+/// stream, ready for a downstream MPEG-TS demuxer to translate raw
+/// clip-local PTS values onto a continuous title timeline.
+///
+/// Background: every PlayItem references its own clip
+/// (`STREAM/<stem>.m2ts`), and every clip carries its own STC (System
+/// Time Clock) sequence whose origin PTS lives in the CLPI's
+/// `SequenceInfo` (BD-ROM AV §5.5.4.2). When [`TitleSource`] stitches
+/// PlayItems back-to-back the TS bytes still carry the *clip-local*
+/// PTS values — they restart (`NonSeamless` 0x01 / `SeamlessNewStc`
+/// 0x06) or continue (`SeamlessContinuation` 0x05) at every PlayItem
+/// boundary, but the bytes themselves do not advertise which case
+/// applies. Without an out-of-band map a demuxer either sees PTS
+/// jumps as legitimate huge skips or assumes monotonic timing and
+/// produces a malformed mux at the join.
+///
+/// One [`PtsContinuitySegment`] per PlayItem says: "between
+/// [`output_byte_start`] and [`output_byte_end`] every PES packet's
+/// PTS is on the clip's local clock starting at
+/// [`clip_in_pts_90k`]; to lift it onto the title timeline add
+/// `title_pts_start - clip_in_pts_90k`". The
+/// [`connection_condition`] tells the consumer whether the previous
+/// segment's PTS axis carries through (no reproject needed across
+/// the seam) or restarts (reproject required).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtsContinuitySegment {
+    /// 0-based index of this PlayItem in the title's PlayList. Matches
+    /// `PlayItem`'s position in `PlayListMpls::play_list.play_items`,
+    /// which is also `PlayListMark::ref_play_item_id` for the chapter
+    /// marks that point inside this segment.
+    pub play_item_index: u16,
+    /// 5-digit clip stem (e.g. `"00001"`); resolves both
+    /// `STREAM/<stem>.m2ts` and `CLIPINF/<stem>.clpi`.
+    pub clip_stem: [u8; 5],
+    /// Absolute output-byte offset (post-`TP_extra`-strip) at which
+    /// this segment's clean MPEG-TS bytes begin in the title stream.
+    /// Equals `0` for the first PlayItem.
+    pub output_byte_start: u64,
+    /// Exclusive upper bound of the segment's byte range — first byte
+    /// of the next PlayItem (or [`TitleSource::output_total`] for the
+    /// final PlayItem).
+    pub output_byte_end: u64,
+    /// Title-relative 90 kHz PTS at which this segment's playback
+    /// starts: running sum of the durations of all preceding PlayItems
+    /// (§5.4.4.1 IN/OUT pair, doubled from 45 kHz to 90 kHz).
+    pub title_pts_start: u64,
+    /// Title-relative 90 kHz PTS at which this segment ends —
+    /// `title_pts_start + (out_time - in_time) × 2`.
+    pub title_pts_end: u64,
+    /// Clip-local 90 kHz PTS of the PlayItem's IN point
+    /// (`PlayItem::in_time_ticks × 2`). PES packets inside this
+    /// segment carry PTS values ≥ `clip_in_pts_90k`; the title-PTS
+    /// reproject is `title_pts_start + (pes_pts - clip_in_pts_90k)`.
+    pub clip_in_pts_90k: u64,
+    /// Clip-local 90 kHz PTS of the PlayItem's OUT point
+    /// (`PlayItem::out_time_ticks × 2`). PES packets past this are
+    /// out-of-PlayItem and should be discarded by the demuxer.
+    pub clip_out_pts_90k: u64,
+    /// Clip-local 90 kHz PTS at which the STC sequence indexed by
+    /// [`stc_id_ref`] begins (CLPI `SequenceInfo` /
+    /// `presentation_start_time` doubled). `0` when the clip ships no
+    /// SequenceInfo or `stc_id_ref` is out of range (homemade discs).
+    /// A demuxer that uses MPEG-2 33-bit PTS wraparound math can use
+    /// this as the segment's STC origin to disambiguate wrap-around.
+    pub stc_origin_pts_90k: u64,
+    /// Which STC sequence inside the clip this PlayItem maps to
+    /// (§5.4.4.1 `stc_id_ref` field). For most clips this is `0`
+    /// — single-STC authoring — but some clips ship multiple STC
+    /// sequences and the PlayItem picks one.
+    pub stc_id_ref: u8,
+    /// Connection condition advertised by the PlayItem (§5.4.4.2):
+    /// how this segment's PTS axis relates to the previous segment's.
+    /// First PlayItem is always treated as a fresh axis regardless of
+    /// the recorded byte (there's no "previous" to continue from).
+    pub connection_condition: ConnectionCondition,
 }
 
 /// A `Read`-able view onto a title: concatenates the title's PlayItem
@@ -537,6 +754,12 @@ pub struct TitleSource {
     /// each .m2ts file size * 188 / 192). Computed at construction
     /// so `seek(End(0))`-style probes don't have to walk the clips.
     output_total: u64,
+    /// Total title duration in 90 kHz ticks — sum of every
+    /// PlayItem's `(OUT - IN) × 2`. Cached at construction so
+    /// [`Self::pts_continuity_segments`] can derive the final
+    /// segment's `title_pts_end` without re-walking the PlayItem
+    /// list.
+    title_duration_90k: u64,
 }
 
 impl std::fmt::Debug for TitleSource {
@@ -574,10 +797,14 @@ impl TitleSource {
         let mut output_total: u64 = 0;
         let mut title_pts_start: u64 = 0;
         for pi in &play_items {
-            let stem = pi
-                .angle_clip(angle)
+            let angle_ref = pi.angle_clip(angle);
+            let stem = angle_ref
                 .map(|a| a.clip_information_file_name.to_string())
                 .unwrap_or_else(|| pi.clip_information_file_name.clone());
+            // The angle clip carries its own `stc_id_ref` (§5.4.4.1's
+            // is_multi_angle block); fall back to the primary-PlayItem
+            // value when the angle list is empty.
+            let stc_id_ref = angle_ref.map(|a| a.stc_id_ref).unwrap_or(pi.stc_id_ref);
             let m2ts_path = bdmv_root.join("STREAM").join(format!("{stem}.m2ts"));
             let packet_count = match std::fs::metadata(&m2ts_path) {
                 Ok(meta) => {
@@ -588,7 +815,7 @@ impl TitleSource {
                 Err(_) => 0,
             };
 
-            let entry_points = load_entry_points(&bdmv_root, &stem);
+            let (entry_points, stc_origin_pts_90k) = load_clip_meta(&bdmv_root, &stem, stc_id_ref);
 
             clips.push(ClipSeekInfo {
                 stem,
@@ -597,6 +824,9 @@ impl TitleSource {
                 title_pts_start,
                 in_pts_90k: u64::from(pi.in_time_ticks) * 2,
                 entry_points,
+                connection_condition: pi.connection_condition,
+                stc_id_ref,
+                stc_origin_pts_90k,
             });
 
             output_total += packet_count * TS_PACKET_LEN as u64;
@@ -614,6 +844,7 @@ impl TitleSource {
             pending_pos: 0,
             output_pos: 0,
             output_total,
+            title_duration_90k: title_pts_start,
         };
         s.open_next_clip()?;
         Ok(s)
@@ -625,6 +856,109 @@ impl TitleSource {
     /// lifetime of the source.
     pub fn output_total(&self) -> u64 {
         self.output_total
+    }
+
+    /// PlayItem-aligned continuity segments for the title — one
+    /// [`PtsContinuitySegment`] per PlayItem in playback order.
+    ///
+    /// A downstream MPEG-TS demuxer streams the bytes [`Self::read`]
+    /// emits and consults this list to reproject each PES packet's
+    /// clip-local PTS onto the continuous title timeline. The mapping
+    /// for a packet seen between `output_byte_start` and
+    /// `output_byte_end` of segment `s` is:
+    ///
+    /// ```text
+    ///   title_pts = s.title_pts_start + (pes_pts - s.clip_in_pts_90k)
+    /// ```
+    ///
+    /// (where `pes_pts` is the raw 90 kHz PES PTS). The fact that
+    /// each segment's PTS axis can be **completely unrelated** to the
+    /// previous one — `connection_condition == NonSeamless` (0x01) or
+    /// `SeamlessNewStc` (0x06) — is exactly the case a remuxer
+    /// previously had no signal for. With this list in hand the
+    /// remuxer can:
+    ///
+    /// * apply a per-segment offset to map clip-local PTS → title PTS;
+    /// * detect that a new STC sequence starts at the seam (the bytes
+    ///   already carry a different PCR value but a demuxer that
+    ///   tracks PCR continuity needs to be told the boundary is
+    ///   intentional, not corruption);
+    /// * preserve `SeamlessContinuation` (0x05) seams as a single
+    ///   continuous axis (no reproject across that seam).
+    ///
+    /// The returned vec is empty only when the title has no
+    /// PlayItems — every successfully-mounted title has at least one
+    /// segment.
+    pub fn pts_continuity_segments(&self) -> Vec<PtsContinuitySegment> {
+        let mut out = Vec::with_capacity(self.clips.len());
+        for (idx, c) in self.clips.iter().enumerate() {
+            // The first PlayItem's connection condition is meaningless
+            // (§5.4.4.2 defines it as "between this PlayItem and the
+            // previous one") so normalise it to `NonSeamless` — the
+            // segment is the seed of its own axis, no previous to
+            // continue from.
+            let cc = if idx == 0 {
+                ConnectionCondition::NonSeamless
+            } else {
+                c.connection_condition
+            };
+            let next_output_start = self
+                .clips
+                .get(idx + 1)
+                .map(|n| n.output_start)
+                .unwrap_or(self.output_total);
+            // Title-PTS end of this segment: next clip's start for
+            // every clip but the last; for the last clip, the cached
+            // total title duration (sum of every PlayItem's
+            // `duration_90k`, captured at construction).
+            let next_title_pts = self
+                .clips
+                .get(idx + 1)
+                .map(|n| n.title_pts_start)
+                .unwrap_or(self.title_duration_90k);
+            let clip_out_pts_90k = c.in_pts_90k + next_title_pts.saturating_sub(c.title_pts_start);
+            let mut stem_bytes = [0u8; 5];
+            let raw = c.stem.as_bytes();
+            let copy_len = raw.len().min(5);
+            stem_bytes[..copy_len].copy_from_slice(&raw[..copy_len]);
+            out.push(PtsContinuitySegment {
+                play_item_index: idx as u16,
+                clip_stem: stem_bytes,
+                output_byte_start: c.output_start,
+                output_byte_end: next_output_start,
+                title_pts_start: c.title_pts_start,
+                title_pts_end: next_title_pts,
+                clip_in_pts_90k: c.in_pts_90k,
+                clip_out_pts_90k,
+                stc_origin_pts_90k: c.stc_origin_pts_90k,
+                stc_id_ref: c.stc_id_ref,
+                connection_condition: cc,
+            });
+        }
+        out
+    }
+
+    /// Reproject a clip-local 90 kHz PES PTS at output-byte position
+    /// `byte_pos` onto the title timeline. Returns `None` when
+    /// `byte_pos` lies past the last continuity segment or when the
+    /// clip-local PTS sits before its segment's IN point (out-of-
+    /// PlayItem leading bytes that the demuxer should discard).
+    ///
+    /// This is the convenience companion to [`Self::pts_continuity_segments`]
+    /// for one-shot remap calls. A demuxer that already cached the
+    /// segment list per-output-byte should reproject inline; this is
+    /// the slower binary-search path for callers that don't.
+    pub fn map_clip_pts_to_title_pts(&self, byte_pos: u64, clip_pts_90k: u64) -> Option<u64> {
+        // Pick the segment whose [start, end) contains byte_pos.
+        let seg_idx = self
+            .clips
+            .iter()
+            .rposition(|c| c.output_start <= byte_pos)?;
+        let seg = &self.clips[seg_idx];
+        if clip_pts_90k < seg.in_pts_90k {
+            return None;
+        }
+        Some(seg.title_pts_start + (clip_pts_90k - seg.in_pts_90k))
     }
 
     /// Seek to the keyframe-aligned entry point at or before `pts_90k`
@@ -1365,37 +1699,63 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Best-effort: parse `CLIPINF/<stem>.clpi`, pick the primary EP_map,
-/// and lift it into an ascending `(pts_ep_start, spn_ep_start)` list a
-/// seeker can binary-search. A missing / corrupt / CPI-less `.clpi`
-/// yields an empty list — seeking then falls back to the clip start
-/// rather than failing the whole title.
+/// Best-effort `CLIPINF/<stem>.clpi` lift. Returns:
 ///
-/// "Primary" EP_map: the EP_map with the lowest `stream_pid` (the
-/// primary video PID is always the lowest-numbered video elementary
-/// stream on a conformant BD-ROM, so its EP_map carries the I-frame
-/// boundaries we want to land on). The rows are sorted by
-/// `pts_ep_start` defensively — they're already monotonic on a
-/// conformant disc, but a stable sort makes the binary search correct
-/// even on a malformed table.
-fn load_entry_points(bdmv_root: &Path, stem: &str) -> Vec<(u32, u32)> {
+/// * **`entry_points`** — the primary EP_map (BD-ROM AV §5.7), flattened
+///   into an ascending `(pts_ep_start, spn_ep_start)` list. "Primary" =
+///   the EP_map with the lowest `stream_pid`; on a conformant BD-ROM
+///   the primary video PID is always the lowest video PID. Sorted
+///   defensively against a malformed (non-monotonic) table.
+/// * **`stc_origin_pts_90k`** — the 90 kHz clip-local PTS at which the
+///   STC sequence indexed by `stc_id_ref` begins, lifted from
+///   `SequenceInfo` (§5.5.4.2 `presentation_start_time`, stored in
+///   45 kHz units, doubled here for parity with the seek pipeline).
+///
+/// Both fall back gracefully:
+///
+/// - missing / corrupt `.clpi` → empty EP list + `stc_origin_pts_90k = 0`;
+/// - clip with an EP_map but no SequenceInfo → empty EP list passes
+///   through unchanged, `stc_origin_pts_90k = 0`;
+/// - `stc_id_ref` past the end of the first ATC sequence's STC list →
+///   `stc_origin_pts_90k = 0` (no usable origin advertised).
+///
+/// The caller compares the resulting `stc_origin_pts_90k` against the
+/// PlayItem's `in_pts_90k` to decide whether the clip really uses the
+/// SequenceInfo origin or whether to fall back to the PlayItem IN
+/// point — see [`TitleSource::new`] for the policy.
+fn load_clip_meta(bdmv_root: &Path, stem: &str, stc_id_ref: u8) -> (Vec<(u32, u32)>, u64) {
     let path = bdmv_root.join("CLIPINF").join(format!("{stem}.clpi"));
     let Ok(bytes) = read_file(&path) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let Ok(clpi) = ClipInformation::parse(&bytes) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
-    let Some(ep) = clpi.cpi.ep_map.iter().min_by_key(|m| m.stream_pid) else {
-        return Vec::new();
+    let mut eps: Vec<(u32, u32)> = match clpi.cpi.ep_map.iter().min_by_key(|m| m.stream_pid) {
+        Some(ep) => ep
+            .entries
+            .iter()
+            .map(|e| (e.pts_ep_start, e.spn_ep_start))
+            .collect(),
+        None => Vec::new(),
     };
-    let mut eps: Vec<(u32, u32)> = ep
-        .entries
-        .iter()
-        .map(|e| (e.pts_ep_start, e.spn_ep_start))
-        .collect();
     eps.sort_by_key(|&(pts, _)| pts);
-    eps
+
+    // SequenceInfo: §5.5.4.2 — one ATC sequence per clip in the
+    // overwhelming majority of authoring patterns; the per-PlayItem
+    // `stc_id_ref` indexes the STC sequence list inside that ATC entry.
+    // A malformed clip with zero ATC sequences, or a `stc_id_ref` past
+    // the last STC slot, yields the safe `0` fallback — downstream code
+    // in `TitleSource::new` then defaults to the PlayItem's IN point.
+    let stc_origin_pts_90k = clpi
+        .sequence_info
+        .atc_sequences
+        .first()
+        .and_then(|atc| atc.stc_sequences.get(stc_id_ref as usize))
+        .map(|stc| u64::from(stc.presentation_start_time) * 2)
+        .unwrap_or(0);
+
+    (eps, stc_origin_pts_90k)
 }
 
 /// Resolve an `IndexEntry` to (kind, playlist_id). For HDMV we use
