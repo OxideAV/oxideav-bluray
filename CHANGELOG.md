@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mid-stream angle-change-point enumeration** — new
+  `TitleSource::angle_change_points() -> Vec<AngleChangePoint>` plus
+  the convenience `TitleSource::next_angle_change_point(pts_90k)`
+  and the file-less peer
+  `Disc::title_angle_change_points(title)` + angle-aware
+  `…_with_angle(title, angle)` surface every CPI EP_fine row whose
+  `is_angle_change_point = 1` bit is set (BD-ROM AV §5.7), folded
+  onto the title timeline + output-byte axis. Each
+  `AngleChangePoint { play_item_index, clip_stem, title_pts_90k,
+  output_byte, clip_pts_90k, spn }` is a video access unit at which
+  a mid-stream angle switch is guaranteed clean — every alternate
+  angle's interleaved clip (Part 3 §5.4.4.1 `is_multi_angle` block)
+  carries a co-incident I-frame at the matching source-packet
+  number, so a player UI does the switch as `read up to output_byte
+  + close + open_title_with_angle(new) + seek_to(title_pts_90k)`.
+  ACPs whose clip-local `pts_ep_start` sits before the owning
+  PlayItem's IN point are silently dropped (the streamer never
+  reaches them). The `title_angle_change_points` peer matches the
+  `chapters` / `title_streams` / `title_pts_continuity_segments`
+  swallow-error policy: empty list on `.mpls` / `.clpi` read /
+  parse failure, empty on out-of-range angle. The new
+  `AngleChangePoint` type is re-exported at the crate root.
+  Internally `load_clip_meta` grew a third return slot
+  (`angle_change_eps: Vec<(u32, u32)>`) feeding a new
+  `ClipSeekInfo::angle_change_eps` field — same CLPI parse cost as
+  before. Six new integration tests
+  (`tests/angle_change_points.rs`): 2-PlayItem × 3-angle title with
+  three flagged rows yields every ACP at the correct title-PTS +
+  output-byte; `next_angle_change_point` walks rows
+  at-or-after a cursor in title order; `Disc::title_angle_change_points`
+  matches the source's view; alt-angle CPI yields the same
+  title-timeline coordinates as the primary; pre-IN-point ACP
+  dropped; flag-clear CPI returns an empty list.
+
 - **Cross-PlayItem STC PTS continuity map** — new
   `TitleSource::pts_continuity_segments()` plus the file-less peer
   `Disc::title_pts_continuity_segments(title)` (and an angle-aware

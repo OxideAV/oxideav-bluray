@@ -534,7 +534,8 @@ impl Disc {
                 }
                 Err(_) => 0,
             };
-            let (entry_points, stc_origin_pts_90k) = load_clip_meta(&bdmv, &stem, stc_id_ref);
+            let (entry_points, stc_origin_pts_90k, angle_change_eps) =
+                load_clip_meta(&bdmv, &stem, stc_id_ref);
             clips.push(ClipSeekInfo {
                 stem,
                 output_start: output_total,
@@ -542,6 +543,7 @@ impl Disc {
                 title_pts_start,
                 in_pts_90k: u64::from(pi.in_time_ticks) * 2,
                 entry_points,
+                angle_change_eps,
                 connection_condition: pi.connection_condition,
                 stc_id_ref,
                 stc_origin_pts_90k,
@@ -600,6 +602,97 @@ impl Disc {
         };
         build_track_catalogue(&pl)
     }
+
+    /// Every mid-stream angle-change boundary for `title` on its
+    /// primary angle — file-less peer of
+    /// [`TitleSource::angle_change_points`]. Equivalent to opening the
+    /// title and calling that method, but skips the `.m2ts` file-open
+    /// step (the list is derived entirely from MPLS + CLPI).
+    ///
+    /// Returns an empty list on read / parse failure (matches
+    /// [`Self::chapters`] / [`Self::title_streams`]).
+    pub fn title_angle_change_points(&self, title: &TitleInfo) -> Vec<AngleChangePoint> {
+        self.title_angle_change_points_with_angle(title, 0)
+    }
+
+    /// Same as [`Self::title_angle_change_points`] but for a specific
+    /// 0-based angle. Returns an empty list when `angle` is
+    /// unavailable on any PlayItem (matches the
+    /// [`Self::open_title_with_angle`] rejection policy).
+    pub fn title_angle_change_points_with_angle(
+        &self,
+        title: &TitleInfo,
+        angle: u8,
+    ) -> Vec<AngleChangePoint> {
+        let bdmv = self.root.join("BDMV");
+        let Ok(pl_bytes) = read_file(&playlist_path(&bdmv, title.playlist_id)) else {
+            return Vec::new();
+        };
+        let Ok(pl) = PlayListMpls::parse(&pl_bytes) else {
+            return Vec::new();
+        };
+        if pl.play_list.play_items.is_empty() {
+            return Vec::new();
+        }
+        for pi in &pl.play_list.play_items {
+            if pi.angle_clip(angle).is_none() {
+                return Vec::new();
+            }
+        }
+
+        // Mirror `TitleSource::new`'s clip walk, but only the fields
+        // angle-change-point enumeration needs (stem + output running
+        // tally + title-PTS running tally + EP_map). No I/O against
+        // STREAM/<stem>.m2ts: we measure that file purely to advance
+        // the output running tally.
+        let mut out = Vec::new();
+        let mut output_total: u64 = 0;
+        let mut title_pts_start: u64 = 0;
+        for (idx, pi) in pl.play_list.play_items.iter().enumerate() {
+            let angle_ref = pi.angle_clip(angle);
+            let stem = angle_ref
+                .map(|a| a.clip_information_file_name.to_string())
+                .unwrap_or_else(|| pi.clip_information_file_name.clone());
+            let stc_id_ref = angle_ref.map(|a| a.stc_id_ref).unwrap_or(pi.stc_id_ref);
+            let m2ts_path = bdmv.join("STREAM").join(format!("{stem}.m2ts"));
+            let packet_count = match std::fs::metadata(&m2ts_path) {
+                Ok(meta) => {
+                    let raw = meta.len();
+                    let usable = raw - (raw % M2TS_PACKET_LEN as u64);
+                    usable / M2TS_PACKET_LEN as u64
+                }
+                Err(_) => 0,
+            };
+            let (_eps, _stc, angle_change_eps) = load_clip_meta(&bdmv, &stem, stc_id_ref);
+            let in_pts_90k = u64::from(pi.in_time_ticks) * 2;
+
+            let mut stem_bytes = [0u8; 5];
+            let raw = stem.as_bytes();
+            let copy_len = raw.len().min(5);
+            stem_bytes[..copy_len].copy_from_slice(&raw[..copy_len]);
+
+            for (pts_ep, spn) in angle_change_eps {
+                let clip_pts_64 = u64::from(pts_ep);
+                if clip_pts_64 < in_pts_90k {
+                    continue;
+                }
+                let title_pts_90k = title_pts_start + (clip_pts_64 - in_pts_90k);
+                let output_byte = output_total + u64::from(spn) * TS_PACKET_LEN as u64;
+                out.push(AngleChangePoint {
+                    play_item_index: idx as u16,
+                    clip_stem: stem_bytes,
+                    title_pts_90k,
+                    output_byte,
+                    clip_pts_90k: pts_ep,
+                    spn,
+                });
+            }
+
+            output_total += packet_count * TS_PACKET_LEN as u64;
+            title_pts_start += pi.duration_90k();
+        }
+        out
+    }
 }
 
 /// Per-clip seek metadata, computed once at construction. Lets
@@ -629,6 +722,15 @@ struct ClipSeekInfo {
     /// clip's primary-video EP_map. Empty when the clip ships no CPI
     /// (homemade discs) — seeking then falls back to the clip start.
     entry_points: Vec<(u32, u32)>,
+    /// Subset of `entry_points` whose CPI EP_fine row has the
+    /// `is_angle_change_point` bit set (BD-ROM AV §5.7 + Part 3
+    /// §5.4.4.1 `is_multi_angle`). Mid-stream angle switching is only
+    /// safe at one of these source packets — every alternate angle's
+    /// clip carries a co-incident I-frame at the matching SPN so the
+    /// decoder can resume without re-seeding state. Empty for
+    /// single-angle clips (the EP_map row will still exist, but with
+    /// the bit cleared).
+    angle_change_eps: Vec<(u32, u32)>,
     /// Connection condition advertised by the **owning PlayItem**
     /// (§5.4.4.2): how this clip's STC relates to the previous clip's.
     /// `SeamlessContinuation` (0x05) means the previous clip's PTS axis
@@ -727,6 +829,65 @@ pub struct PtsContinuitySegment {
     pub connection_condition: ConnectionCondition,
 }
 
+/// One mid-stream angle-switch candidate, lifted from the CPI EP_map's
+/// `is_angle_change_point` bit (BD-ROM AV §5.7) of the title's
+/// currently-selected angle.
+///
+/// Multi-angle Blu-ray titles interleave each angle's source packets
+/// inside a `PLAYITEM_TYPE == is_multi_angle` block (BD-ROM Part 3
+/// §5.4.4.1). A live angle switch is **only** valid at a video access
+/// unit where every alternate angle's interleaved clip carries a
+/// co-incident I-frame at the matching source-packet number — the
+/// authoring tool flags those rows with `is_angle_change_point = 1`
+/// in the EP_fine table. A naive switch at any other byte would either
+/// resume mid-GOP on the new angle (decoded garbage until the next
+/// IDR) or land on the wrong elementary-stream PID.
+///
+/// One [`AngleChangePoint`] therefore says: "at output-byte
+/// [`output_byte`] (title-PTS [`title_pts_90k`]), every alternate
+/// angle has an aligned I-frame; an angle switch performed at
+/// exactly this byte will produce a clean cut." The caller drives the
+/// switch by:
+///
+/// 1. Reading up to [`output_byte`] on the current
+///    [`TitleSource`].
+/// 2. Closing the current source.
+/// 3. Calling [`Disc::open_title_with_angle`] with the new angle index.
+/// 4. Calling [`TitleSource::seek_to`] with `title_pts_90k` to land on
+///    the matching I-frame on the new angle.
+///
+/// The struct exposes both the title-relative PTS / output byte
+/// (driver-side scheduling), the clip-local PTS / SPN
+/// ([`clip_pts_90k`] / [`spn`] — the raw EP_map values, useful for
+/// verification against the per-clip CPI dump), and the owning
+/// [`play_item_index`] / [`clip_stem`] (so a UI can label the switch
+/// boundary by chapter / clip number).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AngleChangePoint {
+    /// 0-based PlayItem index inside the title's PlayList. Matches the
+    /// position in `PlayListMpls::play_list.play_items`.
+    pub play_item_index: u16,
+    /// 5-digit clip stem (e.g. `"00001"`); identifies the `.m2ts` /
+    /// `.clpi` pair that owns the EP_map row this point came from.
+    pub clip_stem: [u8; 5],
+    /// Title-relative 90 kHz PTS at which the angle switch should
+    /// land. Directly passable to [`TitleSource::seek_to`] on a
+    /// freshly-opened source for the new angle.
+    pub title_pts_90k: u64,
+    /// Absolute output-byte position (post-`TP_extra`-strip) on the
+    /// **current** angle's title stream at which the caller should
+    /// stop reading before performing the switch. Equal to
+    /// `clip.output_start + spn × 188`.
+    pub output_byte: u64,
+    /// Clip-local 90 kHz PTS of the angle-change EP_fine row — the raw
+    /// `pts_ep_start` value from the EP_map (BD-ROM AV §5.7).
+    pub clip_pts_90k: u32,
+    /// Source-packet number on the clip's `.m2ts` at which the
+    /// I-frame begins. Equal to `output_byte_within_clip / 188` and
+    /// to `input_byte_within_clip / 192`.
+    pub spn: u32,
+}
+
 /// A `Read`-able view onto a title: concatenates the title's PlayItem
 /// clips end-to-end, stripping the 4-byte BDAV TP_extra header per
 /// 192-byte source packet to yield a clean 188-byte MPEG-TS stream.
@@ -815,7 +976,8 @@ impl TitleSource {
                 Err(_) => 0,
             };
 
-            let (entry_points, stc_origin_pts_90k) = load_clip_meta(&bdmv_root, &stem, stc_id_ref);
+            let (entry_points, stc_origin_pts_90k, angle_change_eps) =
+                load_clip_meta(&bdmv_root, &stem, stc_id_ref);
 
             clips.push(ClipSeekInfo {
                 stem,
@@ -824,6 +986,7 @@ impl TitleSource {
                 title_pts_start,
                 in_pts_90k: u64::from(pi.in_time_ticks) * 2,
                 entry_points,
+                angle_change_eps,
                 connection_condition: pi.connection_condition,
                 stc_id_ref,
                 stc_origin_pts_90k,
@@ -959,6 +1122,76 @@ impl TitleSource {
             return None;
         }
         Some(seg.title_pts_start + (clip_pts_90k - seg.in_pts_90k))
+    }
+
+    /// Every mid-stream angle-change boundary in the title, in playback
+    /// order. One [`AngleChangePoint`] per CPI EP_fine row with
+    /// `is_angle_change_point = 1` (BD-ROM AV §5.7), folded onto the
+    /// title timeline + output-byte axis exactly as
+    /// [`Self::pts_continuity_segments`] folds PlayItem seams.
+    ///
+    /// Empty when:
+    /// * the title is single-angle (no CPI row sets the bit);
+    /// * every clip ships an empty / missing CPI (homemade discs);
+    /// * the row's clip-local PTS lies before its PlayItem's IN point
+    ///   (out-of-PlayItem byte that the demuxer would discard anyway).
+    ///
+    /// Sorted ascending by `title_pts_90k`. A player UI typically pairs
+    /// this with the multi-angle picker:
+    /// [`Self::next_angle_change_point`] gives the boundary the user
+    /// can switch *into*; calling [`Disc::open_title_with_angle`] +
+    /// [`Self::seek_to`] on the new angle's source lands at the
+    /// matching I-frame.
+    ///
+    /// The title's currently-selected angle is the source of truth —
+    /// alternate angles' CPI EP_maps MUST advertise the same
+    /// angle-change rows (the spec's interleaved-clip constraint
+    /// guarantees one IDR per row in every angle), so a switch from
+    /// angle 0 → 1 → 2 walks the same boundary set.
+    pub fn angle_change_points(&self) -> Vec<AngleChangePoint> {
+        let mut out = Vec::new();
+        for (idx, c) in self.clips.iter().enumerate() {
+            let mut stem_bytes = [0u8; 5];
+            let raw = c.stem.as_bytes();
+            let copy_len = raw.len().min(5);
+            stem_bytes[..copy_len].copy_from_slice(&raw[..copy_len]);
+            for &(pts_ep, spn) in &c.angle_change_eps {
+                let clip_pts_64 = u64::from(pts_ep);
+                // Out-of-PlayItem rows: an angle-change EP whose PTS
+                // sits before the PlayItem's IN point would never be
+                // read by the streamer (the IN point clips it off);
+                // drop it so a UI doesn't surface an unreachable
+                // boundary.
+                if clip_pts_64 < c.in_pts_90k {
+                    continue;
+                }
+                let title_pts_90k = c.title_pts_start + (clip_pts_64 - c.in_pts_90k);
+                let output_byte = c.output_start + u64::from(spn) * TS_PACKET_LEN as u64;
+                out.push(AngleChangePoint {
+                    play_item_index: idx as u16,
+                    clip_stem: stem_bytes,
+                    title_pts_90k,
+                    output_byte,
+                    clip_pts_90k: pts_ep,
+                    spn,
+                });
+            }
+        }
+        out
+    }
+
+    /// First angle-change boundary at or after `pts_90k` (title
+    /// timeline, 90 kHz), or `None` if no remaining boundary exists.
+    ///
+    /// Convenience wrapper around [`Self::angle_change_points`] for the
+    /// common "user pressed the angle button, give me the next safe
+    /// switch boundary" UI path. Performs a binary search rather than
+    /// returning the iterator + a `find` call so the typical N (≤ 1
+    /// per chapter) stays O(log N).
+    pub fn next_angle_change_point(&self, pts_90k: u64) -> Option<AngleChangePoint> {
+        let pts_list = self.angle_change_points();
+        let idx = pts_list.partition_point(|p| p.title_pts_90k < pts_90k);
+        pts_list.get(idx).copied()
     }
 
     /// Seek to the keyframe-aligned entry point at or before `pts_90k`
@@ -1710,10 +1943,17 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
 ///   STC sequence indexed by `stc_id_ref` begins, lifted from
 ///   `SequenceInfo` (§5.5.4.2 `presentation_start_time`, stored in
 ///   45 kHz units, doubled here for parity with the seek pipeline).
+/// * **`angle_change_eps`** — subset of `entry_points` whose CPI
+///   EP_fine row had its `is_angle_change_point` bit set. These are
+///   the source packets at which a mid-stream angle switch can land
+///   without resetting decoder state (BD-ROM AV §5.7 + Part 3
+///   §5.4.4.1 `is_multi_angle` block). Ascending by PTS. Empty for
+///   single-angle clips.
 ///
 /// Both fall back gracefully:
 ///
-/// - missing / corrupt `.clpi` → empty EP list + `stc_origin_pts_90k = 0`;
+/// - missing / corrupt `.clpi` → empty EP list + `stc_origin_pts_90k = 0`
+///   + empty `angle_change_eps`;
 /// - clip with an EP_map but no SequenceInfo → empty EP list passes
 ///   through unchanged, `stc_origin_pts_90k = 0`;
 /// - `stc_id_ref` past the end of the first ATC sequence's STC list →
@@ -1723,15 +1963,23 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
 /// PlayItem's `in_pts_90k` to decide whether the clip really uses the
 /// SequenceInfo origin or whether to fall back to the PlayItem IN
 /// point — see [`TitleSource::new`] for the policy.
-fn load_clip_meta(bdmv_root: &Path, stem: &str, stc_id_ref: u8) -> (Vec<(u32, u32)>, u64) {
+/// `(entry_points, stc_origin_pts_90k, angle_change_eps)` — return
+/// shape of [`load_clip_meta`]. Aliased so the clippy
+/// `type_complexity` lint stays happy without dropping back onto an
+/// inline struct (the three fields are independent units of data, so
+/// a tuple is the most ergonomic call shape).
+type ClipMetaTriple = (Vec<(u32, u32)>, u64, Vec<(u32, u32)>);
+
+fn load_clip_meta(bdmv_root: &Path, stem: &str, stc_id_ref: u8) -> ClipMetaTriple {
     let path = bdmv_root.join("CLIPINF").join(format!("{stem}.clpi"));
     let Ok(bytes) = read_file(&path) else {
-        return (Vec::new(), 0);
+        return (Vec::new(), 0, Vec::new());
     };
     let Ok(clpi) = ClipInformation::parse(&bytes) else {
-        return (Vec::new(), 0);
+        return (Vec::new(), 0, Vec::new());
     };
-    let mut eps: Vec<(u32, u32)> = match clpi.cpi.ep_map.iter().min_by_key(|m| m.stream_pid) {
+    let primary_ep = clpi.cpi.ep_map.iter().min_by_key(|m| m.stream_pid);
+    let mut eps: Vec<(u32, u32)> = match primary_ep {
         Some(ep) => ep
             .entries
             .iter()
@@ -1740,6 +1988,23 @@ fn load_clip_meta(bdmv_root: &Path, stem: &str, stc_id_ref: u8) -> (Vec<(u32, u3
         None => Vec::new(),
     };
     eps.sort_by_key(|&(pts, _)| pts);
+
+    // Angle-change EP_fine rows (§5.7 bit field). A row's
+    // `is_angle_change_point` advertises that the corresponding source
+    // packet is the head of a video access unit at which a mid-stream
+    // angle switch can land without resetting decoder state. Tracked
+    // off the same primary-video EP_map; sorted by PTS for predictable
+    // search.
+    let mut angle_change_eps: Vec<(u32, u32)> = match primary_ep {
+        Some(ep) => ep
+            .entries
+            .iter()
+            .filter(|e| e.is_angle_change_point)
+            .map(|e| (e.pts_ep_start, e.spn_ep_start))
+            .collect(),
+        None => Vec::new(),
+    };
+    angle_change_eps.sort_by_key(|&(pts, _)| pts);
 
     // SequenceInfo: §5.5.4.2 — one ATC sequence per clip in the
     // overwhelming majority of authoring patterns; the per-PlayItem
@@ -1755,7 +2020,7 @@ fn load_clip_meta(bdmv_root: &Path, stem: &str, stc_id_ref: u8) -> (Vec<(u32, u3
         .map(|stc| u64::from(stc.presentation_start_time) * 2)
         .unwrap_or(0);
 
-    (eps, stc_origin_pts_90k)
+    (eps, stc_origin_pts_90k, angle_change_eps)
 }
 
 /// Resolve an `IndexEntry` to (kind, playlist_id). For HDMV we use

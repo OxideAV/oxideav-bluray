@@ -79,6 +79,23 @@ bluray://                          → auto-detect first BD-ROM mount
   reproject closes the long-standing gap where a downstream remuxer either had to
   flatten every clip's PTS into a single axis or interpret natural BD-AV STC
   restarts as stream corruption.
+- **Mid-stream angle-change-point enumeration** —
+  `TitleSource::angle_change_points() -> Vec<AngleChangePoint>` and
+  the convenience `next_angle_change_point(pts_90k)` lift every CPI
+  EP_fine row with `is_angle_change_point = 1` (BD-ROM AV §5.7) onto
+  the title timeline + output-byte axis. Each
+  `AngleChangePoint { play_item_index, clip_stem, title_pts_90k,
+  output_byte, clip_pts_90k, spn }` is the I-frame at which a live
+  angle switch can land cleanly — the spec's interleaved-clip
+  constraint guarantees every alternate angle carries a co-incident
+  I-frame at the matching SPN, so a player UI reads up to
+  `output_byte`, calls `open_title_with_angle(new_angle)`, then
+  `seek_to(title_pts_90k)` on the new source. ACPs whose clip-local
+  PTS sits before their PlayItem's IN point are dropped (unreachable
+  by the streamer). The file-less peer `Disc::title_angle_change_points(title)`
+  + angle-aware `…_with_angle(title, angle)` mirror the
+  `title_pts_continuity_segments` / `chapters` pattern (no `.m2ts`
+  open; empty list on parse failure or out-of-range angle).
 - **Per-title track catalogue** — `Disc::title_streams(title) ->
   TrackCatalogue` aggregates every PlayItem's STN_table (§5.4.4.4) into
   a flat per-track listing, deduplicated by `(elementary_pid, kind)` so
@@ -121,14 +138,18 @@ bluray://                          → auto-detect first BD-ROM mount
 - SubPath PiP / secondary-video streams.
 - Raw-block-device mount (`bluray:///dev/sr0`) — UDF mounter exists,
   high-level routing in `Disc::mount_image` is Phase 2.
-- Mid-stream angle switching at an `is_angle_change_point` boundary
-  (`open_title_with_angle` fixes the angle at open time; the EP_map
-  rows do flag angle-change points but switching live still requires a
-  re-open). Cross-PlayItem STC PTS continuity is now exposed as a
-  `pts_continuity_segments` map (see Scope above) — the demuxer-side
-  PES reproject is fully driven by it; what's still deferred is having
-  `TitleSource::read()` *itself* rewrite outgoing PES PTS so a remuxer
-  doesn't even need the map.
+- **In-place** mid-stream angle switching (`open_title_with_angle`
+  fixes the angle at open time; angle-change-point *boundaries* are
+  now enumerated via `angle_change_points()` / `next_angle_change_point()`
+  so a UI can perform a switch as a stop-current-source +
+  `open_title_with_angle(new) + seek_to(boundary_pts)` pair — what's
+  still deferred is letting `TitleSource` swap its underlying clip
+  reader at the boundary without the open/seek round-trip). Cross-PlayItem
+  STC PTS continuity is now exposed as a `pts_continuity_segments`
+  map (see Scope above) — the demuxer-side PES reproject is fully
+  driven by it; what's still deferred is having `TitleSource::read()`
+  *itself* rewrite outgoing PES PTS so a remuxer doesn't even need
+  the map.
 - ICB strategy types other than 4, ExtendedFileEntry, long/extended
   allocation descriptors, multi-extent partition maps.
 
@@ -168,6 +189,12 @@ Blu-ray discs and references no real titles. Test categories:
   primary + two alt angles each streamed from their own fingerprinted
   `.m2ts`, out-of-range angle rejected at open time, `max_angle`
   reporting the smallest PlayItem-angle-count minus one.
+- Mid-stream angle-change-point enumeration (`tests/angle_change_points.rs`):
+  ACP rows lift onto the title timeline with byte/PTS bounds; the
+  `next_angle_change_point(pts)` walk visits each row at-or-after a
+  cursor; `Disc::title_angle_change_points` matches the source's
+  view; ACPs whose clip-local PTS lies before the PlayItem's IN
+  point are dropped; a CPI with no ACP rows yields an empty list.
 
 ## Clean-room references
 
