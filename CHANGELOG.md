@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **In-place mid-stream angle switching** — new
+  `TitleSource::switch_angle_at(new_angle, title_pts_90k) -> io::Result<u64>`
+  retargets an open source to a different angle's `.m2ts` / `.clpi`
+  pair at a keyframe-aligned title PTS, without dropping the
+  decryptor or recreating the source. Every PlayItem is revalidated
+  against `new_angle` before any state mutation — an out-of-range
+  angle surfaces `io::ErrorKind::InvalidInput` and the source stays on
+  the previous angle. On success the per-clip seek index is rebuilt
+  (each PlayItem's clip stem is reselected via
+  `PlayItem::angle_clip`, the new `.m2ts` is re-measured, the new
+  `.clpi` is re-parsed for EP_map + STC origin + angle-change rows),
+  the reader is opened on the destination angle's `.m2ts` at the
+  6144-byte AACS-unit-aligned source-packet that contains the chosen
+  EP_map entry, and `current_angle` is updated. The convenience
+  `TitleSource::switch_angle(new_angle)` finds the first
+  `AngleChangePoint` at or after the current output position and
+  delegates — the typical "user pressed the angle button mid-playback"
+  UI path. When the title's CPI carries no flagged rows, or the
+  reader is past the last boundary, the convenience wrapper returns
+  `io::ErrorKind::NotFound` and leaves the source untouched.
+  `TitleSource::current_angle() -> u8` reports the angle currently
+  driving the reader; `TitleSource::num_angles() -> u8` reports the
+  smallest PlayItem-angle-count across the title (so any value
+  `< num_angles()` is guaranteed safe to pass to `switch_angle_at`).
+  The output-byte axis becomes a new physical stream after a switch —
+  alternate angles' clip bytes live in different `.m2ts` files, so
+  even when their per-clip packet counts match, the absolute output
+  position is renumbered against the destination angle's stream.
+  Callers tracking position by byte should re-anchor against the
+  returned `u64`. Spec basis: BD-ROM Part 3 §5.4.4.1 `is_multi_angle`
+  block + AV §5.2.3.3 interleaved-clip layout + §5.7 angle-change EP
+  flag. No new spec dependency. Internally the per-clip seek-index
+  build that `TitleSource::new` used was extracted into a free
+  function `build_clip_seek_index(&Path, &[PlayItem], u8) -> (clips,
+  output_total, title_duration_90k)` so `new()` and `switch_angle_at`
+  share the same code path. `TitleSource` grew two fields:
+  `play_items: Vec<PlayItem>` (kept for the rebuild) and
+  `current_angle: u8`.
+- **Six new integration tests** (`tests/switch_angle.rs`): a
+  2-PlayItem × 3-angle synthetic title with fingerprinted `.m2ts`
+  bytes per angle covers `current_angle` / `num_angles` reporting;
+  `switch_angle_at` to an intra-PlayItem ACP boundary (next read
+  returns the destination angle's fingerprint, output position lands
+  on the EP_map row's SPN × 188); `switch_angle_at` across the
+  PlayItem seam (lands on PI1's start on the new angle); out-of-range
+  angle returns `InvalidInput` and the source still streams the
+  previous angle; `switch_angle` finds the first boundary at-or-after
+  the current output position; a single-angle title with no flagged
+  rows returns `NotFound` from `switch_angle` and leaves the source
+  untouched.
+
 - **Mid-stream angle-change-point enumeration** — new
   `TitleSource::angle_change_points() -> Vec<AngleChangePoint>` plus
   the convenience `TitleSource::next_angle_change_point(pts_90k)`
