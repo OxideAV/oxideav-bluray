@@ -26,6 +26,20 @@
 //! - Sparse / sequential files.
 //! - Allocation Extent Descriptors (§14.5).
 //! - UDF 1.50 or earlier (we look at the LVD identifier suffix).
+//!
+//! ## ExtendedFileEntry (§14.17)
+//!
+//! Tag 266 lays out the same prefix as FileEntry (§14.9) up through
+//! `Information Length` (BP 56), then inserts three extra fields —
+//! `Object Size` (BP 64, u64), `Logical Blocks Recorded` (BP 72, u64,
+//! same semantics as FE BP 64), and `Creation Date and Time` (BP 104,
+//! 12-byte timestamp) — before the trailing prefix shifts by 40 bytes.
+//! L_EA lives at BP 208, L_AD at BP 212, and the Extended-Attribute /
+//! Allocation-Descriptor area starts at BP 216. We surface the FE +
+//! EFE union as a single [`FileEntry`] struct with [`FileEntry::object_size`]
+//! populated for the EFE variant; the allocation walking is identical
+//! between the two so [`UdfDisc::read_file`] / [`UdfDisc::read_directory`]
+//! transparently traverse either.
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -691,6 +705,12 @@ impl AdType {
 
 /// File Entry parsed enough to (a) compute its size and (b) walk its
 /// allocation extents.
+///
+/// Carries both the plain File Entry (§14.9, tag 261) and the
+/// Extended File Entry (§14.17, tag 266). For an EFE the additional
+/// `Object Size` field (sum of every stream's Information Length,
+/// §14.17.11) is surfaced via [`Self::object_size`]; for a plain FE
+/// the field is `None`.
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub tag: DescriptorTag,
@@ -704,6 +724,9 @@ pub struct FileEntry {
     pub record_length: u32,
     pub information_length: u64,
     pub logical_blocks_recorded: u64,
+    /// `Object Size` (§14.17.11). Recorded only on Extended File Entries;
+    /// `None` for plain File Entries which lack this field.
+    pub object_size: Option<u64>,
     pub length_of_extended_attributes: u32,
     pub length_of_allocation_descriptors: u32,
     /// Resolved short-ad extents (we refuse long/extended in Phase 1).
@@ -715,8 +738,14 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
-    /// Standard FE prefix size: 16 (tag) + 20 (ICB tag) + 136 (rest) = 172.
+    /// Plain File Entry prefix size (§14.9): 16 (tag) + 20 (ICB tag) +
+    /// 140 (rest) = 176. L_EA at BP 168, L_AD at BP 172, EAs at BP 176.
     pub const PREFIX_SIZE: usize = 176;
+    /// Extended File Entry prefix size (§14.17): the shared prefix is
+    /// 40 bytes longer because of the inserted Object Size (BP 64),
+    /// Creation Date and Time (BP 104), and the extra reserved word at
+    /// BP 132. L_EA at BP 208, L_AD at BP 212, EAs at BP 216.
+    pub const EFE_PREFIX_SIZE: usize = 216;
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < Self::PREFIX_SIZE {
@@ -726,8 +755,9 @@ impl FileEntry {
         if tag.id != TagId::FileEntry && tag.id != TagId::ExtendedFileEntry {
             return Err(BlurayError::malformed("expected FE / EFE tag"));
         }
-        if tag.id == TagId::ExtendedFileEntry {
-            return Err(BlurayError::unsupported("ExtendedFileEntry"));
+        let is_efe = tag.id == TagId::ExtendedFileEntry;
+        if is_efe && bytes.len() < Self::EFE_PREFIX_SIZE {
+            return Err(BlurayError::malformed("ExtendedFileEntry truncated"));
         }
         let icb_tag = IcbTag::parse(&bytes[16..36])?;
         let uid = u32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]);
@@ -740,20 +770,64 @@ impl FileEntry {
         let info_len = u64::from_le_bytes([
             bytes[56], bytes[57], bytes[58], bytes[59], bytes[60], bytes[61], bytes[62], bytes[63],
         ]);
-        let lbr = u64::from_le_bytes([
-            bytes[64], bytes[65], bytes[66], bytes[67], bytes[68], bytes[69], bytes[70], bytes[71],
+
+        // From here, FE (§14.9) and EFE (§14.17) diverge:
+        //
+        //   FE (BP 64):  Logical Blocks Recorded u64, then 3×12 timestamps
+        //                (access/mod/attribute), checkpoint u32, ext_attr_icb,
+        //                impl_ident, unique_id, L_EA, L_AD; EAs at BP 176.
+        //
+        //   EFE (BP 64): Object Size u64, then Logical Blocks Recorded u64,
+        //                then 4×12 timestamps (the extra one is creation_time
+        //                at BP 104), checkpoint u32, 4 reserved bytes,
+        //                ext_attr_icb, stream_dir_icb, impl_ident, unique_id,
+        //                L_EA, L_AD; EAs at BP 216.
+        //
+        // We surface object_size for the EFE branch and consume the
+        // shared "lbr / timestamps / checkpoint / impl_ident / unique_id"
+        // span opaquely — the allocation walk below is identical.
+        let (object_size, lbr, prefix_size, l_ea_off, l_ad_off) = if is_efe {
+            let obj = u64::from_le_bytes([
+                bytes[64], bytes[65], bytes[66], bytes[67], bytes[68], bytes[69], bytes[70],
+                bytes[71],
+            ]);
+            let lbr = u64::from_le_bytes([
+                bytes[72], bytes[73], bytes[74], bytes[75], bytes[76], bytes[77], bytes[78],
+                bytes[79],
+            ]);
+            // access_time 80..92, mod_time 92..104, creation_time 104..116,
+            // attribute_time 116..128, checkpoint 128..132, reserved 132..136,
+            // ext_attr_icb 136..152, stream_dir_icb 152..168,
+            // impl_ident 168..200, unique_id 200..208, L_EA 208..212,
+            // L_AD 212..216.
+            (Some(obj), lbr, Self::EFE_PREFIX_SIZE, 208usize, 212usize)
+        } else {
+            let lbr = u64::from_le_bytes([
+                bytes[64], bytes[65], bytes[66], bytes[67], bytes[68], bytes[69], bytes[70],
+                bytes[71],
+            ]);
+            // access_time 72..84, mod_time 84..96, attribute_time 96..108,
+            // checkpoint 108..112, ext_attr_icb 112..128, impl_ident 128..160,
+            // unique_id 160..168, L_EA 168..172, L_AD 172..176.
+            (None, lbr, Self::PREFIX_SIZE, 168usize, 172usize)
+        };
+
+        let l_ea = u32::from_le_bytes([
+            bytes[l_ea_off],
+            bytes[l_ea_off + 1],
+            bytes[l_ea_off + 2],
+            bytes[l_ea_off + 3],
         ]);
-        // access_time / modification_time / attribute_time at 72..108 (12 bytes each — skipped)
-        // checkpoint u32 at 108..112 (skipped)
-        // extended_attribute_icb long_ad 16 bytes at 112..128 (skipped)
-        // implementation_identifier 32 bytes at 128..160 (skipped)
-        // unique_id u64 at 160..168 (skipped)
-        let l_ea = u32::from_le_bytes([bytes[168], bytes[169], bytes[170], bytes[171]]);
-        let l_ad = u32::from_le_bytes([bytes[172], bytes[173], bytes[174], bytes[175]]);
+        let l_ad = u32::from_le_bytes([
+            bytes[l_ad_off],
+            bytes[l_ad_off + 1],
+            bytes[l_ad_off + 2],
+            bytes[l_ad_off + 3],
+        ]);
 
         let ad_type = AdType::from_flags(icb_tag.flags)?;
 
-        let ea_off = Self::PREFIX_SIZE;
+        let ea_off = prefix_size;
         let ea_end = ea_off + l_ea as usize;
         let ad_off = ea_end;
         let ad_end = ad_off + l_ad as usize;
@@ -803,6 +877,7 @@ impl FileEntry {
             record_length: rec_len,
             information_length: info_len,
             logical_blocks_recorded: lbr,
+            object_size,
             length_of_extended_attributes: l_ea,
             length_of_allocation_descriptors: l_ad,
             short_ads,
@@ -813,6 +888,12 @@ impl FileEntry {
 
     pub fn is_directory(&self) -> bool {
         self.icb_tag.file_type == 4
+    }
+
+    /// `true` when this entry was decoded from an Extended File Entry
+    /// (§14.17, tag 266) rather than a plain File Entry (§14.9).
+    pub fn is_extended(&self) -> bool {
+        self.tag.id == TagId::ExtendedFileEntry
     }
 }
 
@@ -1187,5 +1268,187 @@ mod tests {
         // high bits beyond 0..=2 don't change the type.
         assert_eq!(AdType::from_flags(0xFFF8).unwrap(), AdType::Short);
         assert_eq!(AdType::from_flags(0xFFFB).unwrap(), AdType::EmbeddedInIcb);
+    }
+
+    /// Build an ICB Tag (§14.6) prefixed by the Descriptor Tag of either
+    /// FileEntry or ExtendedFileEntry, with the configured ad-type
+    /// flags, file_type and strategy_type 4. Returns just the 36 bytes
+    /// of `tag(16) + icbtag(20)`; the caller appends the per-variant
+    /// remainder.
+    fn build_fe_header(tag_id: TagId, ad_flags: u16, file_type: u8) -> Vec<u8> {
+        let tag = DescriptorTag {
+            id: tag_id,
+            descriptor_version: 3,
+            serial_number: 1,
+            crc: 0,
+            crc_length: 0,
+            location: 0,
+        };
+        let mut out = Vec::with_capacity(36);
+        out.extend_from_slice(&tag.encode());
+        out.extend_from_slice(&0u32.to_le_bytes()); // prior_recorded_entries
+        out.extend_from_slice(&4u16.to_le_bytes()); // strategy_type = 4
+        out.extend_from_slice(&0u16.to_le_bytes()); // strategy_parameter
+        out.extend_from_slice(&1u16.to_le_bytes()); // max_entries
+        out.push(0); // reserved
+        out.push(file_type);
+        out.extend_from_slice(&[0u8; 6]); // parent_icb (lb_addr)
+        out.extend_from_slice(&ad_flags.to_le_bytes());
+        assert_eq!(out.len(), 36);
+        out
+    }
+
+    /// Hand-roll an Extended File Entry (§14.17, tag 266) carrying
+    /// `info_len` bytes of embedded payload. `object_size` is the
+    /// EFE-only field at BP 64 (§14.17.11). Returns a buffer that
+    /// [`FileEntry::parse`] can ingest directly.
+    fn build_efe_embedded(
+        file_type: u8,
+        info_len: u64,
+        object_size: u64,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        // ad_type 3 = EmbeddedInIcb.
+        let mut buf = build_fe_header(TagId::ExtendedFileEntry, 3, file_type);
+        // BP 36..64: uid, gid, permissions, file_link_count, record_format,
+        // record_display_attributes, record_length, information_length.
+        buf.extend_from_slice(&0u32.to_le_bytes()); // uid
+        buf.extend_from_slice(&0u32.to_le_bytes()); // gid
+        buf.extend_from_slice(&0u32.to_le_bytes()); // permissions
+        buf.extend_from_slice(&1u16.to_le_bytes()); // file_link_count
+        buf.push(0); // record_format
+        buf.push(0); // record_display_attributes
+        buf.extend_from_slice(&0u32.to_le_bytes()); // record_length
+        buf.extend_from_slice(&info_len.to_le_bytes()); // information_length (BP 56)
+        assert_eq!(buf.len(), 64);
+        // BP 64: object_size (EFE-only).
+        buf.extend_from_slice(&object_size.to_le_bytes());
+        // BP 72: logical_blocks_recorded.
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        // BP 80..128: 4 × 12-byte timestamps (access / mod / creation / attribute).
+        buf.extend_from_slice(&[0u8; 4 * 12]);
+        // BP 128: checkpoint.
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        // BP 132: 4 reserved bytes.
+        buf.extend_from_slice(&[0u8; 4]);
+        // BP 136: extended_attribute_icb long_ad.
+        buf.extend_from_slice(&[0u8; 16]);
+        // BP 152: stream_directory_icb long_ad.
+        buf.extend_from_slice(&[0u8; 16]);
+        // BP 168: implementation_identifier regid (32 bytes).
+        buf.extend_from_slice(&[0u8; 32]);
+        // BP 200: unique_id u64.
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        // BP 208: L_EA.
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        // BP 212: L_AD = payload length.
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        assert_eq!(buf.len(), FileEntry::EFE_PREFIX_SIZE);
+        // BP 216: EA area (empty) followed by AD area (embedded payload).
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[test]
+    fn extended_file_entry_embedded_roundtrip() {
+        // Directory (file_type 4) with 6 bytes of embedded data. The
+        // EFE's Object Size carries 999, distinguishing it from
+        // Information Length (6) so we can confirm both fields land on
+        // the right struct member.
+        let payload = b"DIRENT";
+        let bytes = build_efe_embedded(4, payload.len() as u64, 999, payload);
+        let fe = FileEntry::parse(&bytes).unwrap();
+        assert!(fe.is_extended());
+        assert!(fe.is_directory());
+        assert_eq!(fe.information_length, payload.len() as u64);
+        assert_eq!(fe.object_size, Some(999));
+        assert_eq!(fe.ad_type, AdType::EmbeddedInIcb);
+        assert_eq!(fe.embedded_data, payload);
+        assert_eq!(fe.length_of_extended_attributes, 0);
+        assert_eq!(fe.length_of_allocation_descriptors, payload.len() as u32);
+    }
+
+    #[test]
+    fn extended_file_entry_short_ad_extent() {
+        // file_type 5 (sequence of bytes / regular file), one short_ad
+        // pointing at block 42, length 4096. ad_type 0 = Short.
+        let mut buf = build_fe_header(TagId::ExtendedFileEntry, 0, 5);
+        buf.extend_from_slice(&0u32.to_le_bytes()); // uid
+        buf.extend_from_slice(&0u32.to_le_bytes()); // gid
+        buf.extend_from_slice(&0u32.to_le_bytes()); // permissions
+        buf.extend_from_slice(&1u16.to_le_bytes()); // file_link_count
+        buf.push(0); // record_format
+        buf.push(0); // record_display_attributes
+        buf.extend_from_slice(&0u32.to_le_bytes()); // record_length
+        buf.extend_from_slice(&4096u64.to_le_bytes()); // info_len
+        buf.extend_from_slice(&4096u64.to_le_bytes()); // object_size (no streams)
+        buf.extend_from_slice(&2u64.to_le_bytes()); // lbr
+        buf.extend_from_slice(&[0u8; 4 * 12]); // 4 timestamps
+        buf.extend_from_slice(&0u32.to_le_bytes()); // checkpoint
+        buf.extend_from_slice(&[0u8; 4]); // reserved
+        buf.extend_from_slice(&[0u8; 16]); // ext_attr_icb
+        buf.extend_from_slice(&[0u8; 16]); // stream_dir_icb
+        buf.extend_from_slice(&[0u8; 32]); // impl_ident
+        buf.extend_from_slice(&0u64.to_le_bytes()); // unique_id
+        buf.extend_from_slice(&0u32.to_le_bytes()); // L_EA
+        buf.extend_from_slice(&8u32.to_le_bytes()); // L_AD = one short_ad
+        assert_eq!(buf.len(), FileEntry::EFE_PREFIX_SIZE);
+        // AD area: one short_ad (length 4096, block 42).
+        let ad = ShortAd {
+            length: 4096,
+            extent_type: 0,
+            block_location: 42,
+        };
+        buf.extend_from_slice(&ad.encode());
+
+        let fe = FileEntry::parse(&buf).unwrap();
+        assert!(fe.is_extended());
+        assert!(!fe.is_directory());
+        assert_eq!(fe.information_length, 4096);
+        assert_eq!(fe.object_size, Some(4096));
+        assert_eq!(fe.logical_blocks_recorded, 2);
+        assert_eq!(fe.ad_type, AdType::Short);
+        assert_eq!(fe.short_ads.len(), 1);
+        assert_eq!(fe.short_ads[0].length, 4096);
+        assert_eq!(fe.short_ads[0].block_location, 42);
+    }
+
+    #[test]
+    fn plain_file_entry_still_reports_no_object_size() {
+        // The FE / EFE branch decision must not pollute the FE path:
+        // a plain File Entry (§14.9) returns object_size = None.
+        let mut buf = build_fe_header(TagId::FileEntry, 3, 4); // embedded dir
+        buf.extend_from_slice(&[0u8; 4 * 3]); // uid/gid/perm
+        buf.extend_from_slice(&1u16.to_le_bytes()); // file_link_count
+        buf.push(0); // record_format
+        buf.push(0); // record_display_attributes
+        buf.extend_from_slice(&0u32.to_le_bytes()); // record_length
+        buf.extend_from_slice(&0u64.to_le_bytes()); // info_len
+        buf.extend_from_slice(&0u64.to_le_bytes()); // lbr (BP 64 on FE)
+        buf.extend_from_slice(&[0u8; 3 * 12]); // 3 timestamps (no creation_time)
+        buf.extend_from_slice(&0u32.to_le_bytes()); // checkpoint
+        buf.extend_from_slice(&[0u8; 16]); // ext_attr_icb
+        buf.extend_from_slice(&[0u8; 32]); // impl_ident
+        buf.extend_from_slice(&0u64.to_le_bytes()); // unique_id
+        buf.extend_from_slice(&0u32.to_le_bytes()); // L_EA
+        buf.extend_from_slice(&0u32.to_le_bytes()); // L_AD
+        assert_eq!(buf.len(), FileEntry::PREFIX_SIZE);
+
+        let fe = FileEntry::parse(&buf).unwrap();
+        assert!(!fe.is_extended());
+        assert_eq!(fe.object_size, None);
+    }
+
+    #[test]
+    fn extended_file_entry_truncated_is_malformed() {
+        // 200 bytes is enough for FE PREFIX_SIZE (176) but not EFE
+        // PREFIX_SIZE (216). Parsing must reject rather than mis-decode
+        // an EFE.
+        let mut buf = build_fe_header(TagId::ExtendedFileEntry, 3, 4);
+        buf.resize(200, 0);
+        assert!(matches!(
+            FileEntry::parse(&buf),
+            Err(BlurayError::Malformed(_))
+        ));
     }
 }

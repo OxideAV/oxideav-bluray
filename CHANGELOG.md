@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ExtendedFileEntry (§14.17) parsing** — `FileEntry::parse` now
+  recognises Tag 266 alongside Tag 261 and decodes the full §14.17
+  layout: 40-byte-longer prefix (216 vs 176), `Object Size` (u64 at
+  BP 64) surfaced through a new `FileEntry::object_size: Option<u64>`
+  field, shifted `Logical Blocks Recorded` (BP 72) / `L_EA` (BP 208) /
+  `L_AD` (BP 212) offsets, the fourth `Creation Date and Time`
+  timestamp slot (BP 104), the additional reserved word (BP 132), and
+  the new `Stream Directory ICB` long_ad slot (BP 152) which is read
+  but not followed (named-stream walking stays Phase-2). Plain FE
+  parsing continues to report `object_size = None` and lives at the
+  same 176-byte prefix offsets it always did, so existing callers
+  (`UdfDisc::read_file` / `read_directory` / every `tests/` synthesised
+  image) decode unchanged. A new `FileEntry::is_extended()` selector
+  reports the source tag. Replaces the previous early-bail
+  `BlurayError::Unsupported("ExtendedFileEntry")` — UDF 2.50 / 2.60
+  discs that author their root directory or named-stream files using
+  Extended File Entries now mount through. Allocation descriptor walk
+  is identical between the two variants (Short / Long / Extended /
+  EmbeddedInIcb codes still source from the ICB Tag flags), so the
+  same `short_ads: Vec<ShortAd>` / `embedded_data: Vec<u8>`
+  out-parameters land for either tag. Spec basis: ECMA-167 §14.17 (the
+  EFE figure 4/48 byte map) + §14.9 (the shared FE prefix this builds
+  on). No new spec dependency. Four new unit tests in `udf::tests`
+  cover (a) an EFE-embedded directory round-trip with non-trivial
+  `object_size` distinct from `information_length`; (b) an EFE with a
+  single short_ad pointing at a file extent; (c) a regression that a
+  plain FE still reports `object_size == None`; (d) a truncated EFE
+  buffer rejected as `BlurayError::Malformed` rather than mis-decoded
+  as a plain FE.
+
 - **In-place mid-stream angle switching** — new
   `TitleSource::switch_angle_at(new_angle, title_pts_90k) -> io::Result<u64>`
   retargets an open source to a different angle's `.m2ts` / `.clpi`

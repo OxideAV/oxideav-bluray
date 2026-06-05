@@ -15,7 +15,13 @@ bluray://                          → auto-detect first BD-ROM mount
 
 - UDF 2.50 read-only mount (sector layout, Volume Descriptor
   Sequence, File Set Descriptor, File Entry / ICB short-allocation
-  walks).
+  walks). The File Entry parser accepts both Tag 261 (plain FE
+  §14.9) and Tag 266 (ExtendedFileEntry §14.17); EFE carries the
+  extra `Object Size` field (§14.17.11) surfaced through
+  `FileEntry::object_size`, and the 40-byte-longer prefix
+  (creation_time + stream_directory_icb + extra reserved word) is
+  decoded transparently so authoring tools that emit EFE for the BDMV
+  root mount without an `unsupported` bail.
 - BDMV parsers — `index.bdmv` titles, `MovieObject.bdmv` nav-command
   enumeration, `PLAYLIST/*.mpls` PlayList + PlayItem + STN_table
   summary + ClipMark, `CLIPINF/*.clpi` ClipInfo + SequenceInfo +
@@ -160,8 +166,9 @@ bluray://                          → auto-detect first BD-ROM mount
   PES reproject is fully driven by it; what's still deferred is having
   `TitleSource::read()` *itself* rewrite outgoing PES PTS so a remuxer
   doesn't even need the map.
-- ICB strategy types other than 4, ExtendedFileEntry, long/extended
-  allocation descriptors, multi-extent partition maps.
+- ICB strategy types other than 4, long/extended allocation
+  descriptors, multi-extent partition maps. (ExtendedFileEntry §14.17
+  parsing now landed — listed in Scope above.)
 
 ## Standalone build
 
@@ -181,6 +188,10 @@ All fixtures are synthetic — the crate ships zero bytes from real
 Blu-ray discs and references no real titles. Test categories:
 
 - UDF descriptor round-trips (tag checksum, lb_addr, short_ad, d-string).
+- ExtendedFileEntry (Tag 266 / §14.17) parsing: an embedded-directory
+  EFE with non-trivial `object_size`, a single-extent EFE pointing at
+  block 42, a regression that plain FE reports `object_size == None`,
+  and a truncated EFE rejected as `Malformed`.
 - BDMV parser round-trips (`index.bdmv`, `MovieObject.bdmv`,
   `.mpls`, `.clpi`).
 - `TP_extra_header` strip (1 packet, 17 packets, alignment panics).
