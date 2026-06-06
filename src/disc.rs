@@ -2152,7 +2152,12 @@ fn load_clip_meta(bdmv_root: &Path, stem: &str, stc_id_ref: u8) -> ClipMetaTripl
     let Ok(clpi) = ClipInformation::parse(&bytes) else {
         return (Vec::new(), 0, Vec::new());
     };
-    let primary_ep = clpi.cpi.ep_map.iter().min_by_key(|m| m.stream_pid);
+    // Principled pick: prefer the EP_map whose 4-bit EP_stream_type
+    // names a known BD video bitstream (HEVC > MPEG-2 / AVC / VC-1)
+    // before falling back to the lowest-PID heuristic — covers UHD-BD
+    // titles that interleave an AVC fallback EP_map alongside the
+    // HEVC main on a single clip.
+    let primary_ep = clpi.cpi.primary_video_ep_map();
     let mut eps: Vec<(u32, u32)> = match primary_ep {
         Some(ep) => ep
             .entries

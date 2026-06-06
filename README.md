@@ -27,7 +27,12 @@ bluray://                          → auto-detect first BD-ROM mount
   summary + ClipMark, `CLIPINF/*.clpi` ClipInfo + SequenceInfo +
   ProgramInfo + CPI EP_map (per-stream-PID entry-point map — coarse +
   fine rows decoded into a flat `(pts_ep_start, spn_ep_start)` list
-  ready for I-frame-aligned seek).
+  ready for I-frame-aligned seek). The 4-bit `EP_stream_type` header
+  field is surfaced through a typed `EpStreamType` view
+  (`EpMap::kind()` / `EpEntry::kind()`); `Cpi::primary_video_ep_map()`
+  uses it to pick the HEVC EP_map over a co-resident AVC fallback on
+  UHD-BD authoring patterns, falling back to lowest-PID when every
+  EP_map carries an unknown 4-bit code.
 - `.m2ts` stream → strip the 4-byte BDAV `TP_extra_header` per
   192-byte source packet, deliver clean 188-byte MPEG-TS bytes.
   Three call shapes: the in-place `strip_tp_extra(input, &mut out)`

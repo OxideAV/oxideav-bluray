@@ -97,6 +97,113 @@ pub struct ProgramInfo {
     pub programs: Vec<ProgramEntry>,
 }
 
+/// Typed view of the 4-bit `EP_stream_type` field carried in the CPI
+/// EP_map header (BD-ROM AV §5.7). One value per elementary-stream
+/// EP_map block — every [`EpEntry`] inside the block inherits it
+/// (copied into [`EpEntry::ep_stream_type`] at parse time so a flat
+/// iterator over entries is self-describing).
+///
+/// The 4-bit code identifies which class of video bitstream the
+/// entry-point map indexes into. Code points 1 (MPEG-2), 5 (AVC /
+/// H.264), 6 (VC-1) cover the original BD-ROM video toolbox listed
+/// in the BD-AV white paper; the UHD-BD HEVC profile (BD-ROM-AV
+/// HEVC whitepaper, June 2015) adds code 8. Anything else surfaces
+/// through [`EpStreamType::Other`] for diagnostics without ever
+/// losing the raw byte.
+///
+/// This is a parallel of [`crate::bdmv::mpls::StreamCodingType`] for
+/// the EP_map header — separate enum because the EP_map's 4-bit
+/// numbering is its own namespace (a single hex digit) distinct from
+/// MPEG-TS `stream_type` (the 8-bit values returned by
+/// `StreamCodingType::as_raw`, e.g. `0x1B` for AVC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EpStreamType {
+    /// `0x0` — Reserved / unused EP_map header. Code 0 appears in
+    /// authored fixtures whose CLPI lays out an EP_map slot for a
+    /// stream the disc never indexes (e.g. an audio-only PID never
+    /// indexed for keyframe seek).
+    Reserved,
+    /// `0x1` — MPEG-2 video (ISO/IEC 13818-2) elementary stream.
+    /// Used by the original BD-ROM video toolbox.
+    Mpeg2Video,
+    /// `0x5` — H.264 / MPEG-4 AVC (ISO/IEC 14496-10) elementary
+    /// stream — the dominant BD video codec since 2007.
+    AvcVideo,
+    /// `0x6` — SMPTE VC-1 elementary stream.
+    Vc1Video,
+    /// `0x8` — H.265 / HEVC (ISO/IEC 23008-2) elementary stream —
+    /// adds the UHD-BD profile (BD-ROM AV HEVC whitepaper).
+    HevcVideo,
+    /// Any other 4-bit value (0x2..0x4, 0x7, 0x9..0xF), preserved
+    /// for diagnostics. The variant is the raw nibble.
+    Other(u8),
+    /// Placeholder for the unset / never-parsed slot. [`Default`]
+    /// yields this — the parser always overwrites it with one of
+    /// the explicit variants.
+    #[default]
+    Unset,
+}
+
+impl EpStreamType {
+    /// Decode a raw 4-bit EP_stream_type into the typed enum.
+    /// Inputs outside the 4-bit range still round-trip as
+    /// [`EpStreamType::Other`] carrying the masked low nibble.
+    pub const fn from_raw(v: u8) -> Self {
+        match v & 0x0F {
+            0x0 => Self::Reserved,
+            0x1 => Self::Mpeg2Video,
+            0x5 => Self::AvcVideo,
+            0x6 => Self::Vc1Video,
+            0x8 => Self::HevcVideo,
+            other => Self::Other(other),
+        }
+    }
+
+    /// 4-bit wire encoding. [`Self::Unset`] encodes as `0x0` for
+    /// determinism on a round-trip — the slot was never populated,
+    /// which matches the [`Self::Reserved`] code semantically.
+    pub const fn as_raw(self) -> u8 {
+        match self {
+            Self::Reserved | Self::Unset => 0x0,
+            Self::Mpeg2Video => 0x1,
+            Self::AvcVideo => 0x5,
+            Self::Vc1Video => 0x6,
+            Self::HevcVideo => 0x8,
+            Self::Other(v) => v & 0x0F,
+        }
+    }
+
+    /// `true` when the stream type names one of the four known
+    /// BD video bitstreams (MPEG-2, AVC, VC-1, HEVC).
+    pub const fn is_video(self) -> bool {
+        matches!(
+            self,
+            Self::Mpeg2Video | Self::AvcVideo | Self::Vc1Video | Self::HevcVideo
+        )
+    }
+
+    /// `true` for HEVC specifically — useful when picking the EP_map
+    /// to seek against on UHD-BD authoring patterns that include
+    /// both a 1080p AVC fallback and a 2160p HEVC main.
+    pub const fn is_hevc(self) -> bool {
+        matches!(self, Self::HevcVideo)
+    }
+
+    /// Short human-readable label. Matches the codec name a UI would
+    /// surface in a track picker; `Reserved` / `Unset` / `Other`
+    /// fall through to the same `"unknown"` token to keep the label
+    /// surface a small fixed set.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Mpeg2Video => "MPEG-2 Video",
+            Self::AvcVideo => "AVC (H.264)",
+            Self::Vc1Video => "VC-1",
+            Self::HevcVideo => "HEVC (H.265)",
+            Self::Reserved | Self::Unset | Self::Other(_) => "unknown",
+        }
+    }
+}
+
 /// One row of the per-PID EP_map. The coarse-table context has already
 /// been folded into [`pts_ep_start`] / [`spn_ep_start`] so a seeker can
 /// just binary-search the flat list by `pts_ep_start`.
@@ -143,6 +250,32 @@ pub struct EpMap {
     pub entries: Vec<EpEntry>,
 }
 
+impl EpMap {
+    /// Typed view of [`Self::ep_stream_type`] — see [`EpStreamType`].
+    /// Round-trips through `from_raw` / `as_raw` so the raw byte stays
+    /// authoritative for re-encode.
+    pub fn kind(&self) -> EpStreamType {
+        EpStreamType::from_raw(self.ep_stream_type)
+    }
+
+    /// `true` when this EP_map indexes a known BD video bitstream.
+    /// Convenience for callers that want to pick the seekable-video
+    /// EP_map out of a multi-PID `.clpi` without spelling out the
+    /// enum match.
+    pub fn is_video(&self) -> bool {
+        self.kind().is_video()
+    }
+}
+
+impl EpEntry {
+    /// Typed view of [`Self::ep_stream_type`] — copied from the
+    /// enclosing [`EpMap`] header so a single iterator over entries is
+    /// self-describing without re-fetching the parent.
+    pub fn kind(&self) -> EpStreamType {
+        EpStreamType::from_raw(self.ep_stream_type)
+    }
+}
+
 /// `CPI()` block — one [`EpMap`] per stream PID plus any trailing
 /// opaque TS-type indicator bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -153,6 +286,50 @@ pub struct Cpi {
     /// reproduces the original bytes — but their internal structure is
     /// not parsed by Phase 1.
     pub ts_type_indicators: Vec<u8>,
+}
+
+impl Cpi {
+    /// Principled selector for the EP_map a keyframe-seeker should
+    /// drive against.
+    ///
+    /// Picks the first EP_map whose [`EpMap::kind`] reports a known
+    /// BD video bitstream (MPEG-2, AVC, VC-1, HEVC). On a UHD-BD
+    /// authoring pattern that ships both an HEVC main and an AVC
+    /// fallback, the HEVC EP_map wins (callers wanting the AVC
+    /// fallback look it up explicitly via [`Self::ep_map_by_kind`]).
+    /// When every EP_map carries [`EpStreamType::Reserved`] /
+    /// [`EpStreamType::Unset`] / [`EpStreamType::Other`] (an authored
+    /// fixture that omits the type byte, or a profile the table here
+    /// hasn't been extended for yet), the selector falls back to the
+    /// lowest `stream_pid` — the Phase 1 heuristic, kept compatible.
+    pub fn primary_video_ep_map(&self) -> Option<&EpMap> {
+        // HEVC first, then any other known video class. Iterate twice
+        // so the first-known-video-EP_map-wins rule is deterministic
+        // regardless of how the disc authoring tool ordered the
+        // EP_map list inside the CPI block.
+        if let Some(ep) = self.ep_map.iter().find(|m| m.kind().is_hevc()) {
+            return Some(ep);
+        }
+        if let Some(ep) = self.ep_map.iter().find(|m| m.kind().is_video()) {
+            return Some(ep);
+        }
+        self.ep_map.iter().min_by_key(|m| m.stream_pid)
+    }
+
+    /// Find the first EP_map whose typed kind matches the requested
+    /// [`EpStreamType`]. Returns `None` when nothing matches.
+    /// Useful when a UHD-BD title ships both an HEVC main and an
+    /// AVC fallback and the caller specifically wants the AVC track.
+    pub fn ep_map_by_kind(&self, kind: EpStreamType) -> Option<&EpMap> {
+        self.ep_map.iter().find(|m| m.kind() == kind)
+    }
+
+    /// Iterator over every EP_map whose kind is a known BD video
+    /// bitstream — convenience for UI that wants to list "seekable
+    /// video tracks" without filtering on the raw byte.
+    pub fn video_ep_maps(&self) -> impl Iterator<Item = &EpMap> {
+        self.ep_map.iter().filter(|m| m.is_video())
+    }
 }
 
 /// Deprecated alias retained for one release so external code that
@@ -1064,5 +1241,212 @@ mod tests {
         bytes[20..24].copy_from_slice(&new_mark_start.to_be_bytes());
         let parsed = ClipInformation::parse(&bytes).unwrap();
         assert!(parsed.cpi.ep_map.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // EpStreamType typed-accessor tests (r243 Phase 2 depth item)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn ep_stream_type_round_trip_known_codes() {
+        for (raw, expected) in [
+            (0x0u8, EpStreamType::Reserved),
+            (0x1, EpStreamType::Mpeg2Video),
+            (0x5, EpStreamType::AvcVideo),
+            (0x6, EpStreamType::Vc1Video),
+            (0x8, EpStreamType::HevcVideo),
+        ] {
+            let decoded = EpStreamType::from_raw(raw);
+            assert_eq!(decoded, expected, "from_raw({raw:#x})");
+            assert_eq!(decoded.as_raw(), raw, "as_raw round-trip for {raw:#x}");
+        }
+    }
+
+    #[test]
+    fn ep_stream_type_other_preserves_unknown_nibble() {
+        // 0x2, 0x3, 0x4, 0x7, 0x9..=0xF all hit the catch-all.
+        for raw in [0x2u8, 0x3, 0x4, 0x7, 0x9, 0xA, 0xF] {
+            let decoded = EpStreamType::from_raw(raw);
+            assert_eq!(decoded, EpStreamType::Other(raw));
+            assert_eq!(decoded.as_raw(), raw);
+        }
+    }
+
+    #[test]
+    fn ep_stream_type_from_raw_masks_high_nibble() {
+        // Raw byte 0xF5 -> low nibble 0x5 -> AVC. Defensive: a caller
+        // who hands us a stale u8 with the upper bits still set still
+        // gets a sensible classification.
+        assert_eq!(EpStreamType::from_raw(0xF5), EpStreamType::AvcVideo);
+        assert_eq!(EpStreamType::from_raw(0xF8), EpStreamType::HevcVideo);
+        // Unknown nibble preserves the masked nibble, not the full byte.
+        match EpStreamType::from_raw(0xFA) {
+            EpStreamType::Other(0xA) => {}
+            other => panic!("expected Other(0xA), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ep_stream_type_is_video_recognises_four_known_video_codes() {
+        assert!(EpStreamType::Mpeg2Video.is_video());
+        assert!(EpStreamType::AvcVideo.is_video());
+        assert!(EpStreamType::Vc1Video.is_video());
+        assert!(EpStreamType::HevcVideo.is_video());
+        assert!(!EpStreamType::Reserved.is_video());
+        assert!(!EpStreamType::Unset.is_video());
+        assert!(!EpStreamType::Other(0x9).is_video());
+    }
+
+    #[test]
+    fn ep_stream_type_is_hevc_specificity() {
+        assert!(EpStreamType::HevcVideo.is_hevc());
+        assert!(!EpStreamType::AvcVideo.is_hevc());
+        assert!(!EpStreamType::Mpeg2Video.is_hevc());
+        assert!(!EpStreamType::Vc1Video.is_hevc());
+    }
+
+    #[test]
+    fn ep_stream_type_label_smoke() {
+        assert_eq!(EpStreamType::Mpeg2Video.label(), "MPEG-2 Video");
+        assert_eq!(EpStreamType::AvcVideo.label(), "AVC (H.264)");
+        assert_eq!(EpStreamType::Vc1Video.label(), "VC-1");
+        assert_eq!(EpStreamType::HevcVideo.label(), "HEVC (H.265)");
+        assert_eq!(EpStreamType::Reserved.label(), "unknown");
+        assert_eq!(EpStreamType::Unset.label(), "unknown");
+        assert_eq!(EpStreamType::Other(0xA).label(), "unknown");
+    }
+
+    #[test]
+    fn ep_stream_type_default_is_unset() {
+        assert_eq!(EpStreamType::default(), EpStreamType::Unset);
+        // Unset encodes as 0x0 for determinism on re-encode (matches
+        // Reserved semantically — the slot was never populated).
+        assert_eq!(EpStreamType::Unset.as_raw(), 0x0);
+    }
+
+    // -------------------------------------------------------------------
+    // EpMap::kind / EpEntry::kind / Cpi::primary_video_ep_map selector
+    // -------------------------------------------------------------------
+
+    fn ep_map(stream_pid: u16, ep_stream_type: u8) -> EpMap {
+        EpMap {
+            stream_pid,
+            ep_stream_type,
+            entries: vec![EpEntry {
+                is_angle_change_point: false,
+                i_end_position_offset: 0,
+                pts_ep_start: 0,
+                spn_ep_start: 0,
+                ep_stream_type,
+            }],
+        }
+    }
+
+    #[test]
+    fn ep_map_kind_matches_underlying_byte() {
+        assert_eq!(ep_map(0x1011, 0x1).kind(), EpStreamType::Mpeg2Video);
+        assert_eq!(ep_map(0x1011, 0x5).kind(), EpStreamType::AvcVideo);
+        assert_eq!(ep_map(0x1011, 0x6).kind(), EpStreamType::Vc1Video);
+        assert_eq!(ep_map(0x1011, 0x8).kind(), EpStreamType::HevcVideo);
+        assert!(ep_map(0x1011, 0x5).is_video());
+        assert!(!ep_map(0x1011, 0x0).is_video());
+    }
+
+    #[test]
+    fn ep_entry_kind_mirrors_enclosing_map() {
+        let map = ep_map(0x1011, 0x8);
+        assert_eq!(map.entries[0].kind(), EpStreamType::HevcVideo);
+    }
+
+    #[test]
+    fn primary_video_selector_picks_hevc_over_avc_on_uhd_layout() {
+        // UHD-BD authoring: AVC fallback EP_map at PID 0x1011 + HEVC
+        // main EP_map at PID 0x1015. Phase 1's min_by_key picked
+        // the AVC one (lower PID). The typed selector picks HEVC.
+        let cpi = Cpi {
+            ep_map: vec![ep_map(0x1011, 0x5), ep_map(0x1015, 0x8)],
+            ts_type_indicators: Vec::new(),
+        };
+        let picked = cpi.primary_video_ep_map().expect("video EP_map");
+        assert_eq!(picked.stream_pid, 0x1015);
+        assert_eq!(picked.kind(), EpStreamType::HevcVideo);
+    }
+
+    #[test]
+    fn primary_video_selector_picks_avc_when_only_avc_present() {
+        let cpi = Cpi {
+            ep_map: vec![ep_map(0x1011, 0x5)],
+            ts_type_indicators: Vec::new(),
+        };
+        let picked = cpi.primary_video_ep_map().expect("video EP_map");
+        assert_eq!(picked.stream_pid, 0x1011);
+        assert_eq!(picked.kind(), EpStreamType::AvcVideo);
+    }
+
+    #[test]
+    fn primary_video_selector_picks_known_video_over_audio_pid() {
+        // Authoring with two EP_maps: one for AVC video at PID 0x1015,
+        // one for LPCM audio at PID 0x1100 with EP_stream_type=0
+        // (audio EP_map slots typically carry the Reserved code).
+        // min_by_key would pick 0x1015 anyway here, but if the audio
+        // PID were lower (0x1100 -> 0x0100), the typed selector still
+        // wins by skipping the Reserved row.
+        let cpi = Cpi {
+            ep_map: vec![ep_map(0x0100, 0x0), ep_map(0x1015, 0x5)],
+            ts_type_indicators: Vec::new(),
+        };
+        let picked = cpi.primary_video_ep_map().expect("video EP_map");
+        assert_eq!(picked.stream_pid, 0x1015);
+        assert_eq!(picked.kind(), EpStreamType::AvcVideo);
+    }
+
+    #[test]
+    fn primary_video_selector_falls_back_to_lowest_pid_on_unknown_codes() {
+        // Pre-existing fixtures that don't bother populating
+        // ep_stream_type still resolve via the min_by_key heuristic.
+        let cpi = Cpi {
+            ep_map: vec![
+                ep_map(0x1020, 0x0),
+                ep_map(0x1011, 0x0),
+                ep_map(0x1015, 0x0),
+            ],
+            ts_type_indicators: Vec::new(),
+        };
+        let picked = cpi.primary_video_ep_map().expect("fallback EP_map");
+        assert_eq!(picked.stream_pid, 0x1011);
+    }
+
+    #[test]
+    fn primary_video_selector_returns_none_when_cpi_empty() {
+        let cpi = Cpi::default();
+        assert!(cpi.primary_video_ep_map().is_none());
+    }
+
+    #[test]
+    fn ep_map_by_kind_returns_first_match() {
+        let cpi = Cpi {
+            ep_map: vec![ep_map(0x1011, 0x5), ep_map(0x1015, 0x8)],
+            ts_type_indicators: Vec::new(),
+        };
+        let avc = cpi.ep_map_by_kind(EpStreamType::AvcVideo).unwrap();
+        assert_eq!(avc.stream_pid, 0x1011);
+        let hevc = cpi.ep_map_by_kind(EpStreamType::HevcVideo).unwrap();
+        assert_eq!(hevc.stream_pid, 0x1015);
+        assert!(cpi.ep_map_by_kind(EpStreamType::Vc1Video).is_none());
+    }
+
+    #[test]
+    fn video_ep_maps_filters_out_reserved_slots() {
+        let cpi = Cpi {
+            ep_map: vec![
+                ep_map(0x0100, 0x0), // audio / reserved
+                ep_map(0x1011, 0x5), // AVC
+                ep_map(0x1015, 0x8), // HEVC
+                ep_map(0x1200, 0xA), // Other(0xA)
+            ],
+            ts_type_indicators: Vec::new(),
+        };
+        let pids: Vec<u16> = cpi.video_ep_maps().map(|m| m.stream_pid).collect();
+        assert_eq!(pids, vec![0x1011, 0x1015]);
     }
 }

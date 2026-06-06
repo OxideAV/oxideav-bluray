@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CPI EP_stream_type typed accessor (`EpStreamType`)** — new enum
+  parallel to `StreamCodingType` (BD-ROM AV §5.7 4-bit
+  `EP_stream_type` field). Variants: `Reserved` (0x0),
+  `Mpeg2Video` (0x1), `AvcVideo` (0x5), `Vc1Video` (0x6),
+  `HevcVideo` (0x8 — UHD-BD per BD-ROM-AV HEVC whitepaper),
+  `Other(u8)` (raw 4-bit catch-all), `Unset` (`Default`). Methods:
+  `from_raw(u8) -> Self` (masks the high nibble so a stale byte
+  still classifies), `as_raw(self) -> u8` (round-trips through the
+  wire format; `Unset` encodes as `Reserved` for determinism on
+  re-encode), `is_video()` (true for the four known BD video
+  codes), `is_hevc()`, `label() -> &'static str` (short
+  UI-friendly token). `EpMap::kind()` / `EpEntry::kind()` /
+  `EpMap::is_video()` expose the typed view directly on the
+  already-parsed CPI structures, so a flat iterator over EP_map
+  entries is self-describing without re-fetching the parent header.
+- **`Cpi::primary_video_ep_map() -> Option<&EpMap>`** — principled
+  selector for the EP_map a keyframe-seeker should drive against.
+  HEVC wins over AVC / MPEG-2 / VC-1 on UHD-BD authoring patterns
+  that ship both an HEVC main EP_map and an AVC fallback EP_map
+  inside the same CPI block; the older `min_by_key(stream_pid)`
+  heuristic became the fallback when every EP_map carries an
+  unknown `EP_stream_type` byte (legacy fixtures, future BD
+  profiles). Two companion accessors land alongside:
+  `Cpi::ep_map_by_kind(EpStreamType) -> Option<&EpMap>` for callers
+  that want a specific track (e.g. forcing AVC fallback on a UHD
+  title), and `Cpi::video_ep_maps()` for a UI listing of every
+  seekable video EP_map. `disc::load_clip_meta` now drives off
+  `primary_video_ep_map()` instead of the lowest-PID heuristic, so
+  UHD-BD titles whose AVC fallback EP_map sits at a numerically
+  smaller PID than the HEVC main now seek against the HEVC entry
+  points — the only EP_map whose keyframes a UHD-BD player would
+  actually decode. Synthetic regression fixture covers the
+  authoring pattern (`primary_video_selector_picks_hevc_over_avc_on_uhd_layout`).
+  16 new unit tests in `bdmv::clpi::tests`. Spec basis: BD-ROM AV
+  §5.7 (EP_map 4-bit `EP_stream_type` header field) + BD-ROM-AV
+  HEVC whitepaper (UHD-BD HEVC profile mapping to code 0x8).
+
 - **ExtendedFileEntry (§14.17) parsing** — `FileEntry::parse` now
   recognises Tag 266 alongside Tag 261 and decodes the full §14.17
   layout: 40-byte-longer prefix (216 vs 176), `Object Size` (u64 at
