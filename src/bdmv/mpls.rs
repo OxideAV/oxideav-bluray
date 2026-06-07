@@ -490,14 +490,85 @@ pub struct SubPath {
     pub num_sub_play_items: u16,
 }
 
+/// Typed view of the `PlayList_playback_type` byte recorded in
+/// [`AppInfoPlayList`] (BD-ROM Part 3 §5.4 AppInfoPlayList). Mirrors the
+/// raw-byte enumeration the wire layout records — `1` = sequential
+/// playback of the listed PlayItems, `2` = random selection without
+/// replacement, `3` = shuffle (random selection with replacement).
+///
+/// Surfaced as a thin type wrapper over [`AppInfoPlayList::playback_type`]
+/// so callers can pattern-match on the documented semantics without
+/// scattering magic numbers; obtained via
+/// [`AppInfoPlayList::playback_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlayListPlaybackType {
+    /// `0x01` — Sequential. PlayItems play in the order recorded.
+    Sequential,
+    /// `0x02` — Random. PlayItems are selected at random *without*
+    /// replacement, so each plays at most once per traversal.
+    Random,
+    /// `0x03` — Shuffle. PlayItems are selected at random *with*
+    /// replacement (the same PlayItem may play repeatedly).
+    Shuffle,
+    /// Any other raw value, preserved for diagnostics.
+    Other(u8),
+}
+
+impl PlayListPlaybackType {
+    /// Decode the wire byte into a typed variant. Unknown bytes round
+    /// through [`Self::Other`] rather than failing.
+    pub fn from_raw(v: u8) -> Self {
+        match v {
+            0x01 => Self::Sequential,
+            0x02 => Self::Random,
+            0x03 => Self::Shuffle,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Encode this variant back to its wire byte. Round-trips with
+    /// [`Self::from_raw`].
+    pub fn as_raw(self) -> u8 {
+        match self {
+            Self::Sequential => 0x01,
+            Self::Random => 0x02,
+            Self::Shuffle => 0x03,
+            Self::Other(v) => v,
+        }
+    }
+
+    /// True when PlayItems play in the recorded order — i.e. the
+    /// sequential variant. False for both random-pick variants and any
+    /// other value the wire records.
+    pub fn is_sequential(self) -> bool {
+        matches!(self, Self::Sequential)
+    }
+
+    /// True when the wire value selects a randomised traversal —
+    /// either random-without-replacement or shuffle-with-replacement.
+    /// `false` for sequential and for any other byte recorded.
+    pub fn is_randomised(self) -> bool {
+        matches!(self, Self::Random | Self::Shuffle)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppInfoPlayList {
-    /// 1 = sequential, 2 = random, 3 = shuffle.
+    /// Wire byte `PlayList_playback_type` — see
+    /// [`PlayListPlaybackType`] for the typed view.
     pub playback_type: u8,
     pub playback_count: u16,
     pub random_access_flag: u8,
     pub audio_mix_app_flag: u8,
     pub lossless_may_bypass_mixer_flag: u8,
+}
+
+impl AppInfoPlayList {
+    /// Typed view of [`Self::playback_type`] — see
+    /// [`PlayListPlaybackType`] for the variant set.
+    pub fn playback_kind(&self) -> PlayListPlaybackType {
+        PlayListPlaybackType::from_raw(self.playback_type)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1462,6 +1533,91 @@ mod tests {
         assert!(MarkType::EntryMark.is_chapter());
         assert!(!MarkType::LinkPoint.is_chapter());
         assert!(!MarkType::Other(7).is_chapter());
+    }
+
+    #[test]
+    fn playback_type_from_raw_named_variants() {
+        assert_eq!(
+            PlayListPlaybackType::from_raw(0x01),
+            PlayListPlaybackType::Sequential,
+        );
+        assert_eq!(
+            PlayListPlaybackType::from_raw(0x02),
+            PlayListPlaybackType::Random,
+        );
+        assert_eq!(
+            PlayListPlaybackType::from_raw(0x03),
+            PlayListPlaybackType::Shuffle,
+        );
+    }
+
+    #[test]
+    fn playback_type_other_round_trips() {
+        for v in [0x00u8, 0x04, 0x10, 0x7F, 0xFF] {
+            let parsed = PlayListPlaybackType::from_raw(v);
+            assert_eq!(parsed, PlayListPlaybackType::Other(v));
+            assert_eq!(parsed.as_raw(), v);
+            assert!(!parsed.is_sequential());
+            assert!(!parsed.is_randomised());
+        }
+    }
+
+    #[test]
+    fn playback_type_as_raw_matches_known_codes() {
+        assert_eq!(PlayListPlaybackType::Sequential.as_raw(), 0x01);
+        assert_eq!(PlayListPlaybackType::Random.as_raw(), 0x02);
+        assert_eq!(PlayListPlaybackType::Shuffle.as_raw(), 0x03);
+    }
+
+    #[test]
+    fn playback_type_helpers() {
+        assert!(PlayListPlaybackType::Sequential.is_sequential());
+        assert!(!PlayListPlaybackType::Sequential.is_randomised());
+        assert!(!PlayListPlaybackType::Random.is_sequential());
+        assert!(PlayListPlaybackType::Random.is_randomised());
+        assert!(!PlayListPlaybackType::Shuffle.is_sequential());
+        assert!(PlayListPlaybackType::Shuffle.is_randomised());
+    }
+
+    #[test]
+    fn app_info_playback_kind_typed_accessor() {
+        for (raw, want) in [
+            (0x01u8, PlayListPlaybackType::Sequential),
+            (0x02, PlayListPlaybackType::Random),
+            (0x03, PlayListPlaybackType::Shuffle),
+            (0x77, PlayListPlaybackType::Other(0x77)),
+        ] {
+            let app = AppInfoPlayList {
+                playback_type: raw,
+                playback_count: 0,
+                random_access_flag: 0,
+                audio_mix_app_flag: 0,
+                lossless_may_bypass_mixer_flag: 0,
+            };
+            assert_eq!(app.playback_kind(), want);
+            // Round-trip via the typed view should preserve the raw byte.
+            assert_eq!(app.playback_kind().as_raw(), raw);
+        }
+    }
+
+    #[test]
+    fn playback_kind_survives_encode_decode_round_trip() {
+        // Drive the typed view through the full encode → parse path so
+        // wire preservation of the raw byte is covered end-to-end. We
+        // emit each documented variant and a sentinel `Other(0x42)`.
+        for variant in [
+            PlayListPlaybackType::Sequential,
+            PlayListPlaybackType::Random,
+            PlayListPlaybackType::Shuffle,
+            PlayListPlaybackType::Other(0x42),
+        ] {
+            let mut m = sample_mpls();
+            m.app_info.playback_type = variant.as_raw();
+            let bytes = m.encode();
+            let parsed = PlayListMpls::parse(&bytes).unwrap();
+            assert_eq!(parsed.app_info.playback_type, variant.as_raw());
+            assert_eq!(parsed.app_info.playback_kind(), variant);
+        }
     }
 
     #[test]

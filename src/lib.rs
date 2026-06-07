@@ -85,8 +85,9 @@ pub use bdmv::{
     mpls::{
         AngleClip, AngleClipRef, AppInfoPlayList, Chapter, ConnectionCondition,
         IgsInteractiveStream, MarkType, PgsSubtitleStream, PipPgStream, PlayItem, PlayList,
-        PlayListMark, PlayListMpls, PrimaryAudioStream, PrimaryVideoStream, SecondaryAudioStream,
-        SecondaryVideoStream, StnTable, StreamCodingType, SubPath, TextSubtitleStream,
+        PlayListMark, PlayListMpls, PlayListPlaybackType, PrimaryAudioStream, PrimaryVideoStream,
+        SecondaryAudioStream, SecondaryVideoStream, StnTable, StreamCodingType, SubPath,
+        TextSubtitleStream,
     },
 };
 pub use decrypt::{DecryptError, StreamDecryptor};

@@ -135,6 +135,14 @@ bluray://                          → auto-detect first BD-ROM mount
   emission. `TitleInfo::languages` is now populated at mount time from
   every audio + subtitle entry's 3-byte ISO 639-2/T tag (sorted,
   deduplicated, lowercased — disc authors ship a mix of `ENG` / `eng`).
+- **PlayList `playback_type` typed accessor** —
+  `AppInfoPlayList::playback_kind()` returns a `PlayListPlaybackType`
+  (the typed view of the `PlayList_playback_type` byte recorded in
+  `AppInfoPlayList()` per BD-ROM Part 3 §5.4) so callers can pattern-match
+  on `Sequential` / `Random` / `Shuffle` / `Other(u8)` instead of
+  comparing against magic numbers. `from_raw` / `as_raw` round-trip
+  through the wire byte; `is_sequential` / `is_randomised` cover the
+  common UI predicate (one indicator for both random-pick variants).
 - `bluray://` URI handler registered with `oxideav_core::SourceRegistry`
   under the default-on `registry` cargo feature.
 - Pluggable [`StreamDecryptor`] trait so `oxideav-aacs` can plug in

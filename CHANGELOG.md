@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **PlayList `playback_type` typed accessor (`PlayListPlaybackType`)**
+  — new enum parallel to `MarkType` / `ConnectionCondition` /
+  `StreamCodingType`, covering the documented values that the
+  `PlayList_playback_type` byte recorded in `AppInfoPlayList()` carries
+  (BD-ROM Part 3 §5.4 AppInfoPlayList). Variants: `Sequential` (0x01),
+  `Random` (0x02 — random pick without replacement), `Shuffle` (0x03 —
+  random pick with replacement), `Other(u8)` catch-all preserved for
+  forward-compatibility. Methods: `from_raw(u8) -> Self`,
+  `as_raw(self) -> u8` (round-trips through the wire byte),
+  `is_sequential(self)` (true only for the recorded-order variant),
+  `is_randomised(self)` (true for both random-pick variants — useful
+  for a UI that wants a single "non-sequential" indicator).
+  `AppInfoPlayList::playback_kind() -> PlayListPlaybackType` exposes
+  the typed view directly on the already-parsed AppInfo. The raw
+  `playback_type: u8` field stays public so existing consumers
+  continue to compile, the typed accessor sits alongside as the
+  pattern-match-friendly surface. Six new unit tests cover the named
+  variants, `Other` round-trips for five sentinel bytes, the
+  `is_sequential` / `is_randomised` helpers, the `playback_kind()`
+  accessor on a constructed `AppInfoPlayList`, and an end-to-end
+  encode → parse round-trip through `PlayListMpls` for every variant
+  (so the typed view stays consistent with the wire layout
+  `PlayListMpls::encode` / `parse` already exercise). `PlayListPlaybackType`
+  re-exported from the crate root next to `AppInfoPlayList`.
 - **CPI EP_stream_type typed accessor (`EpStreamType`)** — new enum
   parallel to `StreamCodingType` (BD-ROM AV §5.7 4-bit
   `EP_stream_type` field). Variants: `Reserved` (0x0),
