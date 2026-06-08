@@ -56,6 +56,7 @@
 //! ```
 
 use crate::bdmv::common::{BdmvHeader, Reader};
+use crate::bdmv::mpls::{FrameRate, VideoFormat};
 use crate::error::{BlurayError, Result};
 
 /// AppInfoBDMV section (fixed structure, no variable extensions in
@@ -66,6 +67,23 @@ pub struct AppInfoBdmv {
     pub content_exist_flag: u8,             // 1 bit
     pub video_format: u8, // 4 bits (1=480i, 2=576i, 3=480p, 4=1080i, 5=720p, 6=1080p, 7=576p, 8=2160p)
     pub frame_rate: u8,   // 4 bits (1=23.976, 2=24, 3=25, 4=29.97, 6=50, 7=59.94)
+}
+
+impl AppInfoBdmv {
+    /// Typed view of [`Self::video_format`] (BD-ROM Part 3
+    /// AppInfoBDMV §5.3). Shares the [`VideoFormat`] enum with
+    /// per-PlayItem video attributes so a player can use one switch
+    /// for both the disc-wide default and the per-stream view.
+    pub fn video_format_kind(&self) -> VideoFormat {
+        VideoFormat::from_raw(self.video_format)
+    }
+
+    /// Typed view of [`Self::frame_rate`] (BD-ROM Part 3
+    /// AppInfoBDMV §5.3). Shares the [`FrameRate`] enum with
+    /// per-PlayItem video attributes.
+    pub fn frame_rate_kind(&self) -> FrameRate {
+        FrameRate::from_raw(self.frame_rate)
+    }
 }
 
 /// Object referenced by an `IndexEntry` — either an HDMV movie-object
@@ -343,5 +361,65 @@ mod tests {
         let mut bytes = sample_index().encode();
         bytes[0] = b'X';
         assert!(IndexBdmv::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn app_info_typed_video_frame_rate_accessors() {
+        // Disc-wide default is 1080p / 29.97 in `sample_index`.
+        let idx = sample_index();
+        assert_eq!(idx.app_info.video_format_kind(), VideoFormat::Video1080p);
+        assert_eq!(idx.app_info.frame_rate_kind(), FrameRate::Fps29_97);
+        assert!(idx.app_info.video_format_kind().is_progressive());
+        assert!(idx.app_info.frame_rate_kind().is_fractional());
+
+        // Drive the typed view across every documented BD-AV
+        // video_format / frame_rate code so an UHD-BD authoring (2160p /
+        // 23.976) and a PAL SD authoring (576i / 25) both round-trip.
+        for (video_raw, want_v) in [
+            (1u8, VideoFormat::Video480i),
+            (2, VideoFormat::Video576i),
+            (3, VideoFormat::Video480p),
+            (4, VideoFormat::Video1080i),
+            (5, VideoFormat::Video720p),
+            (6, VideoFormat::Video1080p),
+            (7, VideoFormat::Video576p),
+            (8, VideoFormat::Video2160p),
+        ] {
+            let mut a = idx.app_info;
+            a.video_format = video_raw;
+            assert_eq!(a.video_format_kind(), want_v);
+            assert_eq!(a.video_format_kind().as_raw(), video_raw);
+        }
+        for (rate_raw, want_r) in [
+            (1u8, FrameRate::Fps23_976),
+            (2, FrameRate::Fps24),
+            (3, FrameRate::Fps25),
+            (4, FrameRate::Fps29_97),
+            (6, FrameRate::Fps50),
+            (7, FrameRate::Fps59_94),
+        ] {
+            let mut a = idx.app_info;
+            a.frame_rate = rate_raw;
+            assert_eq!(a.frame_rate_kind(), want_r);
+            assert_eq!(a.frame_rate_kind().as_raw(), rate_raw);
+        }
+    }
+
+    #[test]
+    fn app_info_typed_accessors_survive_round_trip() {
+        // The wire bit-packing of `video_format(4) | frame_rate(4)` is
+        // load-bearing for the typed accessors; verify by emitting the
+        // index.bdmv bytes, parsing back, and reading the typed view.
+        let mut idx = sample_index();
+        idx.app_info.video_format = 8; // 2160p (UHD-BD)
+        idx.app_info.frame_rate = 1; // 24000/1001
+        let bytes = idx.encode();
+        let parsed = IndexBdmv::parse(&bytes).unwrap();
+        assert_eq!(parsed.app_info.video_format_kind(), VideoFormat::Video2160p);
+        assert_eq!(parsed.app_info.frame_rate_kind(), FrameRate::Fps23_976);
+        assert_eq!(
+            parsed.app_info.frame_rate_kind().fps_q(),
+            Some((24_000, 1_001))
+        );
     }
 }

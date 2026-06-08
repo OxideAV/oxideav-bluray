@@ -83,11 +83,11 @@ pub use bdmv::{
     index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType},
     movie_object::{MovieObject, NavCommand},
     mpls::{
-        AngleClip, AngleClipRef, AppInfoPlayList, Chapter, ConnectionCondition,
-        IgsInteractiveStream, MarkType, PgsSubtitleStream, PipPgStream, PlayItem, PlayList,
-        PlayListMark, PlayListMpls, PlayListPlaybackType, PrimaryAudioStream, PrimaryVideoStream,
-        SecondaryAudioStream, SecondaryVideoStream, StnTable, StreamCodingType, SubPath,
-        TextSubtitleStream,
+        AngleClip, AngleClipRef, AppInfoPlayList, AspectRatio, AudioFormat, Chapter,
+        ConnectionCondition, FrameRate, IgsInteractiveStream, MarkType, PgsSubtitleStream,
+        PipPgStream, PlayItem, PlayList, PlayListMark, PlayListMpls, PlayListPlaybackType,
+        PrimaryAudioStream, PrimaryVideoStream, SampleRate, SecondaryAudioStream,
+        SecondaryVideoStream, StnTable, StreamCodingType, SubPath, TextSubtitleStream, VideoFormat,
     },
 };
 pub use decrypt::{DecryptError, StreamDecryptor};

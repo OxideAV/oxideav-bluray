@@ -218,6 +218,389 @@ impl StreamCodingType {
     }
 }
 
+/// Typed view of the 4-bit `video_format` nibble recorded inside the
+/// per-PlayItem video `stream_attributes` block (BD-ROM Part 3
+/// §5.4.4.4) and the `index.bdmv` AppInfoBDMV header. Names follow the
+/// canonical BD-ROM AV video format code table (active-line count +
+/// scan kind), so a player labelling its video track has a single
+/// enum to switch over instead of duplicating the magic numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VideoFormat {
+    /// `0x1` — 480i (NTSC SD interlaced).
+    Video480i,
+    /// `0x2` — 576i (PAL SD interlaced).
+    Video576i,
+    /// `0x3` — 480p (NTSC SD progressive).
+    Video480p,
+    /// `0x4` — 1080i HD interlaced.
+    Video1080i,
+    /// `0x5` — 720p HD progressive.
+    Video720p,
+    /// `0x6` — 1080p HD progressive.
+    Video1080p,
+    /// `0x7` — 576p (PAL SD progressive).
+    Video576p,
+    /// `0x8` — 2160p (UHD-BD, BD-ROM-AV HEVC whitepaper).
+    Video2160p,
+    /// Any other recorded nibble — preserved for diagnostics.
+    Other(u8),
+}
+
+impl Default for VideoFormat {
+    fn default() -> Self {
+        Self::Other(0)
+    }
+}
+
+impl VideoFormat {
+    /// Decode the wire nibble into a typed variant. Bits above the
+    /// low nibble are masked off so a caller can pass the raw byte
+    /// (`video_format(4) | frame_rate(4)`) directly without shifting.
+    pub fn from_raw(v: u8) -> Self {
+        match v & 0x0F {
+            0x1 => Self::Video480i,
+            0x2 => Self::Video576i,
+            0x3 => Self::Video480p,
+            0x4 => Self::Video1080i,
+            0x5 => Self::Video720p,
+            0x6 => Self::Video1080p,
+            0x7 => Self::Video576p,
+            0x8 => Self::Video2160p,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Encode this variant back to its 4-bit wire nibble. Round-trips
+    /// with [`Self::from_raw`].
+    pub fn as_raw(self) -> u8 {
+        match self {
+            Self::Video480i => 0x1,
+            Self::Video576i => 0x2,
+            Self::Video480p => 0x3,
+            Self::Video1080i => 0x4,
+            Self::Video720p => 0x5,
+            Self::Video1080p => 0x6,
+            Self::Video576p => 0x7,
+            Self::Video2160p => 0x8,
+            Self::Other(v) => v & 0x0F,
+        }
+    }
+
+    /// True when the format encodes a progressive scan (480p / 576p /
+    /// 720p / 1080p / 2160p). `false` for the two interlaced variants
+    /// and for any unknown nibble.
+    pub fn is_progressive(self) -> bool {
+        matches!(
+            self,
+            Self::Video480p
+                | Self::Video576p
+                | Self::Video720p
+                | Self::Video1080p
+                | Self::Video2160p
+        )
+    }
+
+    /// Active line count for the variant — convenient for muxers that
+    /// want to label the track height (`480` for 480i/p, `1080` for
+    /// 1080i/p, etc.). Returns `None` for `Other` since the spec leaves
+    /// reserved nibbles open for future profiles.
+    pub fn vertical_lines(self) -> Option<u16> {
+        Some(match self {
+            Self::Video480i | Self::Video480p => 480,
+            Self::Video576i | Self::Video576p => 576,
+            Self::Video720p => 720,
+            Self::Video1080i | Self::Video1080p => 1080,
+            Self::Video2160p => 2160,
+            Self::Other(_) => return None,
+        })
+    }
+}
+
+/// Typed view of the 4-bit `frame_rate` nibble recorded inside the
+/// per-PlayItem video `stream_attributes` block (BD-ROM Part 3
+/// §5.4.4.4) and the `index.bdmv` AppInfoBDMV header. The wire
+/// nibble encodes a small fixed set of broadcast / cinematic rates;
+/// [`Self::fps_q`] returns the exact rational the rate expands to so
+/// callers do not have to keep the BD-AV table in mind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrameRate {
+    /// `0x1` — 24000/1001 (NTSC film).
+    Fps23_976,
+    /// `0x2` — 24/1 (true cinema).
+    Fps24,
+    /// `0x3` — 25/1 (PAL).
+    Fps25,
+    /// `0x4` — 30000/1001 (NTSC video).
+    Fps29_97,
+    /// `0x6` — 50/1 (PAL doubled).
+    Fps50,
+    /// `0x7` — 60000/1001 (NTSC video doubled).
+    Fps59_94,
+    /// Any other recorded nibble — preserved for diagnostics.
+    Other(u8),
+}
+
+impl Default for FrameRate {
+    fn default() -> Self {
+        Self::Other(0)
+    }
+}
+
+impl FrameRate {
+    /// Decode the wire nibble into a typed variant. Bits above the
+    /// low nibble are masked off.
+    pub fn from_raw(v: u8) -> Self {
+        match v & 0x0F {
+            0x1 => Self::Fps23_976,
+            0x2 => Self::Fps24,
+            0x3 => Self::Fps25,
+            0x4 => Self::Fps29_97,
+            0x6 => Self::Fps50,
+            0x7 => Self::Fps59_94,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Encode this variant back to its 4-bit wire nibble. Round-trips
+    /// with [`Self::from_raw`].
+    pub fn as_raw(self) -> u8 {
+        match self {
+            Self::Fps23_976 => 0x1,
+            Self::Fps24 => 0x2,
+            Self::Fps25 => 0x3,
+            Self::Fps29_97 => 0x4,
+            Self::Fps50 => 0x6,
+            Self::Fps59_94 => 0x7,
+            Self::Other(v) => v & 0x0F,
+        }
+    }
+
+    /// Exact frame rate as `(numerator, denominator)` — the safe form
+    /// for stream-metadata propagation. `None` for `Other`.
+    pub fn fps_q(self) -> Option<(u32, u32)> {
+        Some(match self {
+            Self::Fps23_976 => (24_000, 1_001),
+            Self::Fps24 => (24, 1),
+            Self::Fps25 => (25, 1),
+            Self::Fps29_97 => (30_000, 1_001),
+            Self::Fps50 => (50, 1),
+            Self::Fps59_94 => (60_000, 1_001),
+            Self::Other(_) => return None,
+        })
+    }
+
+    /// True when the rate is one of the NTSC / cinema-pulldown
+    /// fractional variants (`24000/1001`, `30000/1001`, `60000/1001`).
+    pub fn is_fractional(self) -> bool {
+        matches!(self, Self::Fps23_976 | Self::Fps29_97 | Self::Fps59_94)
+    }
+}
+
+/// Typed view of the 4-bit `aspect_ratio` nibble recorded inside the
+/// per-PlayItem video `stream_attributes` block (BD-ROM Part 3
+/// §5.4.4.4). Only the two common display ratios are documented; any
+/// other nibble round-trips as [`Self::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AspectRatio {
+    /// `0x2` — 4:3 display aspect.
+    Ratio4x3,
+    /// `0x3` — 16:9 display aspect.
+    Ratio16x9,
+    /// Any other recorded nibble — preserved for diagnostics.
+    Other(u8),
+}
+
+impl Default for AspectRatio {
+    fn default() -> Self {
+        Self::Other(0)
+    }
+}
+
+impl AspectRatio {
+    /// Decode the wire nibble into a typed variant. The
+    /// `aspect_ratio(4) | reserved(4)` byte should be shifted down
+    /// before calling this (the parser already does so); callers that
+    /// hand in the un-shifted byte get the low nibble extracted
+    /// implicitly via masking.
+    pub fn from_raw(v: u8) -> Self {
+        match v & 0x0F {
+            0x2 => Self::Ratio4x3,
+            0x3 => Self::Ratio16x9,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Encode this variant back to its 4-bit wire nibble.
+    pub fn as_raw(self) -> u8 {
+        match self {
+            Self::Ratio4x3 => 0x2,
+            Self::Ratio16x9 => 0x3,
+            Self::Other(v) => v & 0x0F,
+        }
+    }
+
+    /// Display aspect as `(width, height)` — `(4, 3)` / `(16, 9)`. `None`
+    /// for `Other`.
+    pub fn ratio(self) -> Option<(u8, u8)> {
+        Some(match self {
+            Self::Ratio4x3 => (4, 3),
+            Self::Ratio16x9 => (16, 9),
+            Self::Other(_) => return None,
+        })
+    }
+
+    /// True for 16:9. Convenient one-shot predicate for a UI that only
+    /// needs to flag widescreen content.
+    pub fn is_widescreen(self) -> bool {
+        matches!(self, Self::Ratio16x9)
+    }
+}
+
+/// Typed view of the 4-bit `audio_format` nibble recorded inside the
+/// per-PlayItem audio `stream_attributes` block (BD-ROM Part 3
+/// §5.4.4.4). Names follow the BD-AV channel-layout convention
+/// (`Mono` = 1.0, `Stereo` = 2.0, `Multi` = 5.1, `Combo` = 5.1 +
+/// stereo downmix carried side-band) so a player can decide which
+/// downmix to feed the decoder without re-deriving the layout from
+/// the raw nibble.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AudioFormat {
+    /// `0x1` — Mono (1.0).
+    Mono,
+    /// `0x3` — Stereo (2.0).
+    Stereo,
+    /// `0x6` — Multi-channel (5.1).
+    Multi,
+    /// `0xC` — Combo (5.1 + side-band stereo downmix).
+    Combo,
+    /// Any other recorded nibble — preserved for diagnostics.
+    Other(u8),
+}
+
+impl Default for AudioFormat {
+    fn default() -> Self {
+        Self::Other(0)
+    }
+}
+
+impl AudioFormat {
+    /// Decode the wire nibble into a typed variant.
+    pub fn from_raw(v: u8) -> Self {
+        match v & 0x0F {
+            0x1 => Self::Mono,
+            0x3 => Self::Stereo,
+            0x6 => Self::Multi,
+            0xC => Self::Combo,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Encode this variant back to its 4-bit wire nibble.
+    pub fn as_raw(self) -> u8 {
+        match self {
+            Self::Mono => 0x1,
+            Self::Stereo => 0x3,
+            Self::Multi => 0x6,
+            Self::Combo => 0xC,
+            Self::Other(v) => v & 0x0F,
+        }
+    }
+
+    /// Number of audio channels the layout carries — `1` for mono,
+    /// `2` for stereo, `6` for multi-channel. `Combo` reports `6` (the
+    /// primary 5.1 mix; the side-band stereo downmix is an additional
+    /// fallback layer rather than a separate channel count). `None`
+    /// for `Other`.
+    pub fn channel_count(self) -> Option<u8> {
+        Some(match self {
+            Self::Mono => 1,
+            Self::Stereo => 2,
+            Self::Multi | Self::Combo => 6,
+            Self::Other(_) => return None,
+        })
+    }
+
+    /// True for `Combo` — the layout that carries a stereo downmix
+    /// alongside the primary 5.1 mix.
+    pub fn has_downmix(self) -> bool {
+        matches!(self, Self::Combo)
+    }
+}
+
+/// Typed view of the 4-bit `sample_rate` nibble recorded inside the
+/// per-PlayItem audio `stream_attributes` block (BD-ROM Part 3
+/// §5.4.4.4). BD-AV uses a small fixed set of sample rates documented
+/// in the spec's audio attribute table; combination variants (`4896` /
+/// `48192`) cover the dual-rate carriage some lossless audio codecs
+/// use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SampleRate {
+    /// `0x1` — 48 kHz.
+    Hz48000,
+    /// `0x4` — 96 kHz.
+    Hz96000,
+    /// `0x5` — 192 kHz.
+    Hz192000,
+    /// `0xC` — Combo 48 / 192 kHz (dual-rate carriage).
+    Combo48_192,
+    /// `0xE` — Combo 48 / 96 kHz (dual-rate carriage).
+    Combo48_96,
+    /// Any other recorded nibble — preserved for diagnostics.
+    Other(u8),
+}
+
+impl Default for SampleRate {
+    fn default() -> Self {
+        Self::Other(0)
+    }
+}
+
+impl SampleRate {
+    /// Decode the wire nibble into a typed variant.
+    pub fn from_raw(v: u8) -> Self {
+        match v & 0x0F {
+            0x1 => Self::Hz48000,
+            0x4 => Self::Hz96000,
+            0x5 => Self::Hz192000,
+            0xC => Self::Combo48_192,
+            0xE => Self::Combo48_96,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Encode this variant back to its 4-bit wire nibble.
+    pub fn as_raw(self) -> u8 {
+        match self {
+            Self::Hz48000 => 0x1,
+            Self::Hz96000 => 0x4,
+            Self::Hz192000 => 0x5,
+            Self::Combo48_192 => 0xC,
+            Self::Combo48_96 => 0xE,
+            Self::Other(v) => v & 0x0F,
+        }
+    }
+
+    /// Primary sample rate in Hz — the highest rate of a combo variant
+    /// or the only rate of a single-rate variant. Returns `None` for
+    /// `Other`.
+    pub fn primary_hz(self) -> Option<u32> {
+        Some(match self {
+            Self::Hz48000 => 48_000,
+            Self::Hz96000 => 96_000,
+            Self::Hz192000 => 192_000,
+            Self::Combo48_192 => 192_000,
+            Self::Combo48_96 => 96_000,
+            Self::Other(_) => return None,
+        })
+    }
+
+    /// `true` when the variant carries two rates (the lossless dual-rate
+    /// carriages `Combo48_192` and `Combo48_96`).
+    pub fn is_combo(self) -> bool {
+        matches!(self, Self::Combo48_192 | Self::Combo48_96)
+    }
+}
+
 /// One primary-video stream entry inside [`StnTable::primary_video`]
 /// (BD-ROM Part 3 §5.4.4.4 "video stream_attributes").
 ///
@@ -244,6 +627,23 @@ pub struct PrimaryVideoStream {
     pub aspect_ratio: u8, // 4-bit
 }
 
+impl PrimaryVideoStream {
+    /// Typed view of [`Self::video_format`] (BD-ROM Part 3 §5.4.4.4).
+    pub fn video_format_kind(&self) -> VideoFormat {
+        VideoFormat::from_raw(self.video_format)
+    }
+
+    /// Typed view of [`Self::frame_rate`] (BD-ROM Part 3 §5.4.4.4).
+    pub fn frame_rate_kind(&self) -> FrameRate {
+        FrameRate::from_raw(self.frame_rate)
+    }
+
+    /// Typed view of [`Self::aspect_ratio`] (BD-ROM Part 3 §5.4.4.4).
+    pub fn aspect_ratio_kind(&self) -> AspectRatio {
+        AspectRatio::from_raw(self.aspect_ratio)
+    }
+}
+
 /// One primary-audio stream entry inside [`StnTable::primary_audio`]
 /// (BD-ROM Part 3 §5.4.4.4 "audio stream_attributes").
 ///
@@ -258,6 +658,18 @@ pub struct PrimaryAudioStream {
     pub audio_format: u8, // 4-bit
     pub sample_rate: u8,  // 4-bit
     pub language_code: [u8; 3],
+}
+
+impl PrimaryAudioStream {
+    /// Typed view of [`Self::audio_format`] (BD-ROM Part 3 §5.4.4.4).
+    pub fn audio_format_kind(&self) -> AudioFormat {
+        AudioFormat::from_raw(self.audio_format)
+    }
+
+    /// Typed view of [`Self::sample_rate`] (BD-ROM Part 3 §5.4.4.4).
+    pub fn sample_rate_kind(&self) -> SampleRate {
+        SampleRate::from_raw(self.sample_rate)
+    }
 }
 
 /// One Presentation Graphic Stream (BD bitmap subtitle) entry.
@@ -289,6 +701,18 @@ pub struct SecondaryAudioStream {
     pub language_code: [u8; 3],
 }
 
+impl SecondaryAudioStream {
+    /// Typed view of [`Self::audio_format`] (BD-ROM Part 3 §5.4.4.4).
+    pub fn audio_format_kind(&self) -> AudioFormat {
+        AudioFormat::from_raw(self.audio_format)
+    }
+
+    /// Typed view of [`Self::sample_rate`] (BD-ROM Part 3 §5.4.4.4).
+    pub fn sample_rate_kind(&self) -> SampleRate {
+        SampleRate::from_raw(self.sample_rate)
+    }
+}
+
 /// One secondary-video stream entry (Picture-in-Picture overlay).
 /// Layout matches [`PrimaryVideoStream`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -298,6 +722,23 @@ pub struct SecondaryVideoStream {
     pub video_format: u8,
     pub frame_rate: u8,
     pub aspect_ratio: u8,
+}
+
+impl SecondaryVideoStream {
+    /// Typed view of [`Self::video_format`] (BD-ROM Part 3 §5.4.4.4).
+    pub fn video_format_kind(&self) -> VideoFormat {
+        VideoFormat::from_raw(self.video_format)
+    }
+
+    /// Typed view of [`Self::frame_rate`] (BD-ROM Part 3 §5.4.4.4).
+    pub fn frame_rate_kind(&self) -> FrameRate {
+        FrameRate::from_raw(self.frame_rate)
+    }
+
+    /// Typed view of [`Self::aspect_ratio`] (BD-ROM Part 3 §5.4.4.4).
+    pub fn aspect_ratio_kind(&self) -> AspectRatio {
+        AspectRatio::from_raw(self.aspect_ratio)
+    }
 }
 
 /// One Picture-in-Picture Presentation Graphic Stream entry.
@@ -1921,8 +2362,8 @@ mod tests {
                         primary_video: vec![PrimaryVideoStream {
                             elementary_pid: 0x1011,
                             coding_type: StreamCodingType::AvcVideo,
-                            video_format: 0x06, // 1080
-                            frame_rate: 0x03,   // 24000/1001
+                            video_format: 0x06, // 1080p
+                            frame_rate: 0x03,   // 25 fps (BD-AV §5.4.4.4)
                             aspect_ratio: 0x03, // 16:9
                         }],
                         primary_audio: vec![
@@ -1936,8 +2377,8 @@ mod tests {
                             PrimaryAudioStream {
                                 elementary_pid: 0x1101,
                                 coding_type: StreamCodingType::DtsHdMaAudio,
-                                audio_format: 0x06, // multichannel
-                                sample_rate: 0x05,  // 96 kHz combo
+                                audio_format: 0x06, // multichannel (5.1)
+                                sample_rate: 0x05,  // 192 kHz (BD-AV §5.4.4.4)
                                 language_code: *b"jpn",
                             },
                         ],
@@ -2083,5 +2524,266 @@ mod tests {
         let stn = &m.play_list.play_items[0].stn_table;
         let from: StnTableSummary = stn.into();
         assert_eq!(from, stn.summary());
+    }
+
+    // -----------------------------------------------------------------
+    // VideoFormat / FrameRate / AspectRatio / AudioFormat / SampleRate
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn video_format_named_round_trip() {
+        let pairs = [
+            (VideoFormat::Video480i, 0x1u8),
+            (VideoFormat::Video576i, 0x2),
+            (VideoFormat::Video480p, 0x3),
+            (VideoFormat::Video1080i, 0x4),
+            (VideoFormat::Video720p, 0x5),
+            (VideoFormat::Video1080p, 0x6),
+            (VideoFormat::Video576p, 0x7),
+            (VideoFormat::Video2160p, 0x8),
+        ];
+        for (variant, raw) in pairs {
+            assert_eq!(VideoFormat::from_raw(raw), variant);
+            assert_eq!(variant.as_raw(), raw);
+        }
+        // Bits above the low nibble are masked off — the wire packs
+        // `video_format(4) | frame_rate(4)` into one byte, so a caller
+        // can pass the un-shifted upper-nibble byte and still get the
+        // right variant.
+        assert_eq!(VideoFormat::from_raw(0xF6), VideoFormat::Video1080p);
+        // Unknown low nibbles surface as Other and round-trip.
+        for v in [0x0u8, 0x9, 0xA, 0xF] {
+            assert_eq!(VideoFormat::from_raw(v), VideoFormat::Other(v));
+            assert_eq!(VideoFormat::Other(v).as_raw(), v);
+        }
+        // Other masking — an oversized inner byte still encodes as a
+        // 4-bit nibble.
+        assert_eq!(VideoFormat::Other(0xFF).as_raw(), 0x0F);
+    }
+
+    #[test]
+    fn video_format_helpers() {
+        assert!(VideoFormat::Video1080p.is_progressive());
+        assert!(VideoFormat::Video720p.is_progressive());
+        assert!(VideoFormat::Video2160p.is_progressive());
+        assert!(VideoFormat::Video480p.is_progressive());
+        assert!(VideoFormat::Video576p.is_progressive());
+        assert!(!VideoFormat::Video480i.is_progressive());
+        assert!(!VideoFormat::Video576i.is_progressive());
+        assert!(!VideoFormat::Video1080i.is_progressive());
+        assert!(!VideoFormat::Other(0x0).is_progressive());
+
+        assert_eq!(VideoFormat::Video480i.vertical_lines(), Some(480));
+        assert_eq!(VideoFormat::Video576i.vertical_lines(), Some(576));
+        assert_eq!(VideoFormat::Video720p.vertical_lines(), Some(720));
+        assert_eq!(VideoFormat::Video1080p.vertical_lines(), Some(1080));
+        assert_eq!(VideoFormat::Video2160p.vertical_lines(), Some(2160));
+        assert_eq!(VideoFormat::Other(0xA).vertical_lines(), None);
+    }
+
+    #[test]
+    fn frame_rate_named_round_trip() {
+        let pairs = [
+            (FrameRate::Fps23_976, 0x1u8),
+            (FrameRate::Fps24, 0x2),
+            (FrameRate::Fps25, 0x3),
+            (FrameRate::Fps29_97, 0x4),
+            (FrameRate::Fps50, 0x6),
+            (FrameRate::Fps59_94, 0x7),
+        ];
+        for (variant, raw) in pairs {
+            assert_eq!(FrameRate::from_raw(raw), variant);
+            assert_eq!(variant.as_raw(), raw);
+        }
+        // The reserved nibble `0x5` (skipped between 0x4 and 0x6 in the
+        // spec table) surfaces as Other — caller sees the unknown byte
+        // rather than a silently wrong rate.
+        assert_eq!(FrameRate::from_raw(0x5), FrameRate::Other(0x5));
+        // Bits above the low nibble are masked off.
+        assert_eq!(FrameRate::from_raw(0x63), FrameRate::Fps25);
+    }
+
+    #[test]
+    fn frame_rate_helpers() {
+        assert_eq!(FrameRate::Fps23_976.fps_q(), Some((24_000, 1_001)));
+        assert_eq!(FrameRate::Fps24.fps_q(), Some((24, 1)));
+        assert_eq!(FrameRate::Fps25.fps_q(), Some((25, 1)));
+        assert_eq!(FrameRate::Fps29_97.fps_q(), Some((30_000, 1_001)));
+        assert_eq!(FrameRate::Fps50.fps_q(), Some((50, 1)));
+        assert_eq!(FrameRate::Fps59_94.fps_q(), Some((60_000, 1_001)));
+        assert_eq!(FrameRate::Other(0x5).fps_q(), None);
+        assert!(FrameRate::Fps23_976.is_fractional());
+        assert!(FrameRate::Fps29_97.is_fractional());
+        assert!(FrameRate::Fps59_94.is_fractional());
+        assert!(!FrameRate::Fps24.is_fractional());
+        assert!(!FrameRate::Fps25.is_fractional());
+        assert!(!FrameRate::Fps50.is_fractional());
+    }
+
+    #[test]
+    fn aspect_ratio_round_trip() {
+        assert_eq!(AspectRatio::from_raw(0x2), AspectRatio::Ratio4x3);
+        assert_eq!(AspectRatio::from_raw(0x3), AspectRatio::Ratio16x9);
+        assert_eq!(AspectRatio::Ratio4x3.as_raw(), 0x2);
+        assert_eq!(AspectRatio::Ratio16x9.as_raw(), 0x3);
+        assert_eq!(AspectRatio::from_raw(0xA), AspectRatio::Other(0xA));
+        assert_eq!(AspectRatio::Ratio4x3.ratio(), Some((4, 3)));
+        assert_eq!(AspectRatio::Ratio16x9.ratio(), Some((16, 9)));
+        assert_eq!(AspectRatio::Other(0xA).ratio(), None);
+        assert!(AspectRatio::Ratio16x9.is_widescreen());
+        assert!(!AspectRatio::Ratio4x3.is_widescreen());
+        assert!(!AspectRatio::Other(0xA).is_widescreen());
+        // Masking — the wire byte stores `aspect_ratio(4) | reserved(4)`
+        // and the parser strips the reserved nibble before storing, but
+        // a caller who hands in the raw byte still gets the right view.
+        assert_eq!(AspectRatio::from_raw(0xF3), AspectRatio::Ratio16x9);
+    }
+
+    #[test]
+    fn audio_format_named_round_trip() {
+        let pairs = [
+            (AudioFormat::Mono, 0x1u8),
+            (AudioFormat::Stereo, 0x3),
+            (AudioFormat::Multi, 0x6),
+            (AudioFormat::Combo, 0xC),
+        ];
+        for (variant, raw) in pairs {
+            assert_eq!(AudioFormat::from_raw(raw), variant);
+            assert_eq!(variant.as_raw(), raw);
+        }
+        // Reserved nibbles surface as Other.
+        for v in [0x0u8, 0x2, 0x4, 0x5, 0x7, 0xF] {
+            assert_eq!(AudioFormat::from_raw(v), AudioFormat::Other(v));
+        }
+    }
+
+    #[test]
+    fn audio_format_helpers() {
+        assert_eq!(AudioFormat::Mono.channel_count(), Some(1));
+        assert_eq!(AudioFormat::Stereo.channel_count(), Some(2));
+        assert_eq!(AudioFormat::Multi.channel_count(), Some(6));
+        assert_eq!(AudioFormat::Combo.channel_count(), Some(6));
+        assert_eq!(AudioFormat::Other(0x2).channel_count(), None);
+        assert!(AudioFormat::Combo.has_downmix());
+        assert!(!AudioFormat::Multi.has_downmix());
+        assert!(!AudioFormat::Stereo.has_downmix());
+    }
+
+    #[test]
+    fn sample_rate_named_round_trip() {
+        let pairs = [
+            (SampleRate::Hz48000, 0x1u8),
+            (SampleRate::Hz96000, 0x4),
+            (SampleRate::Hz192000, 0x5),
+            (SampleRate::Combo48_192, 0xC),
+            (SampleRate::Combo48_96, 0xE),
+        ];
+        for (variant, raw) in pairs {
+            assert_eq!(SampleRate::from_raw(raw), variant);
+            assert_eq!(variant.as_raw(), raw);
+        }
+        assert_eq!(SampleRate::from_raw(0x0), SampleRate::Other(0x0));
+        assert_eq!(SampleRate::from_raw(0xF), SampleRate::Other(0xF));
+    }
+
+    #[test]
+    fn sample_rate_helpers() {
+        assert_eq!(SampleRate::Hz48000.primary_hz(), Some(48_000));
+        assert_eq!(SampleRate::Hz96000.primary_hz(), Some(96_000));
+        assert_eq!(SampleRate::Hz192000.primary_hz(), Some(192_000));
+        // Combo variants report the highest carried rate so a player
+        // sizing its downstream resampler can pick the dominant rate.
+        assert_eq!(SampleRate::Combo48_192.primary_hz(), Some(192_000));
+        assert_eq!(SampleRate::Combo48_96.primary_hz(), Some(96_000));
+        assert_eq!(SampleRate::Other(0x0).primary_hz(), None);
+        assert!(SampleRate::Combo48_192.is_combo());
+        assert!(SampleRate::Combo48_96.is_combo());
+        assert!(!SampleRate::Hz48000.is_combo());
+        assert!(!SampleRate::Hz192000.is_combo());
+    }
+
+    #[test]
+    fn primary_video_stream_typed_accessors() {
+        // 1080p / 23.976 / 16:9 — the most common BD-AV main-feature
+        // authoring pattern.
+        let v = PrimaryVideoStream {
+            elementary_pid: 0x1011,
+            coding_type: StreamCodingType::AvcVideo,
+            video_format: 0x06,
+            frame_rate: 0x01,
+            aspect_ratio: 0x03,
+        };
+        assert_eq!(v.video_format_kind(), VideoFormat::Video1080p);
+        assert_eq!(v.frame_rate_kind(), FrameRate::Fps23_976);
+        assert_eq!(v.aspect_ratio_kind(), AspectRatio::Ratio16x9);
+        assert!(v.video_format_kind().is_progressive());
+        assert!(v.aspect_ratio_kind().is_widescreen());
+    }
+
+    #[test]
+    fn primary_audio_stream_typed_accessors() {
+        let a = PrimaryAudioStream {
+            elementary_pid: 0x1100,
+            coding_type: StreamCodingType::DtsHdMaAudio,
+            audio_format: 0x06,
+            sample_rate: 0x04,
+            language_code: *b"eng",
+        };
+        assert_eq!(a.audio_format_kind(), AudioFormat::Multi);
+        assert_eq!(a.sample_rate_kind(), SampleRate::Hz96000);
+        assert_eq!(a.audio_format_kind().channel_count(), Some(6));
+        assert_eq!(a.sample_rate_kind().primary_hz(), Some(96_000));
+    }
+
+    #[test]
+    fn secondary_audio_video_typed_accessors() {
+        let sv = SecondaryVideoStream {
+            elementary_pid: 0x1B00,
+            coding_type: StreamCodingType::AvcVideo,
+            video_format: 0x05,
+            frame_rate: 0x07,
+            aspect_ratio: 0x03,
+        };
+        assert_eq!(sv.video_format_kind(), VideoFormat::Video720p);
+        assert_eq!(sv.frame_rate_kind(), FrameRate::Fps59_94);
+        assert_eq!(sv.aspect_ratio_kind(), AspectRatio::Ratio16x9);
+
+        let sa = SecondaryAudioStream {
+            elementary_pid: 0x1A00,
+            coding_type: StreamCodingType::EAc3SecondaryAudio,
+            audio_format: 0x03,
+            sample_rate: 0x01,
+            language_code: *b"jpn",
+        };
+        assert_eq!(sa.audio_format_kind(), AudioFormat::Stereo);
+        assert_eq!(sa.sample_rate_kind(), SampleRate::Hz48000);
+    }
+
+    #[test]
+    fn typed_video_audio_accessors_survive_mpls_round_trip() {
+        // The wire encoder packs nibbles into bytes; the typed accessor
+        // surface needs to keep producing the right variants after a
+        // full encode → parse cycle. Run one PlayItem with a video +
+        // audio attribute set whose nibbles cover both halves of every
+        // byte the wire layout packs.
+        let m = stn_table_mpls();
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        let stn = &parsed.play_list.play_items[0].stn_table;
+
+        let pv = stn.primary_video[0];
+        assert_eq!(pv.video_format_kind(), VideoFormat::Video1080p);
+        assert_eq!(pv.frame_rate_kind(), FrameRate::Fps25);
+        assert_eq!(pv.aspect_ratio_kind(), AspectRatio::Ratio16x9);
+
+        let pa_eng = stn.primary_audio[0];
+        assert_eq!(pa_eng.audio_format_kind(), AudioFormat::Stereo);
+        assert_eq!(pa_eng.sample_rate_kind(), SampleRate::Hz48000);
+        assert_eq!(&pa_eng.language_code, b"eng");
+
+        let pa_jpn = stn.primary_audio[1];
+        assert_eq!(pa_jpn.audio_format_kind(), AudioFormat::Multi);
+        assert_eq!(pa_jpn.sample_rate_kind(), SampleRate::Hz192000);
+        assert_eq!(&pa_jpn.language_code, b"jpn");
     }
 }

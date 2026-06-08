@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **STN_table video / audio attribute typed accessors
+  (`VideoFormat` / `FrameRate` / `AspectRatio` / `AudioFormat` /
+  `SampleRate`)** — five new enums covering the 4-bit nibbles
+  BD-ROM Part 3 §5.4.4.4 records inside each PlayItem's per-stream
+  `stream_attributes` block, plus the matching disc-wide-default
+  nibbles in `index.bdmv` AppInfoBDMV §5.3. Variants follow the
+  documented BD-AV codes: `VideoFormat` = 480i / 576i / 480p /
+  1080i / 720p / 1080p / 576p / 2160p; `FrameRate` = 23.976 / 24 /
+  25 / 29.97 / 50 / 59.94; `AspectRatio` = 4:3 / 16:9;
+  `AudioFormat` = Mono / Stereo / Multi (5.1) / Combo (5.1 + stereo
+  downmix); `SampleRate` = 48 kHz / 96 kHz / 192 kHz / 48-192 combo /
+  48-96 combo. Each enum carries an `Other(u8)` catch-all so a
+  reserved nibble round-trips losslessly. Methods on each:
+  `from_raw(u8) -> Self` (masks the low nibble — callers can pass
+  the un-shifted wire byte `video_format(4) | frame_rate(4)`
+  directly), `as_raw(self) -> u8` (round-trips through the 4-bit
+  field), plus per-enum helpers — `VideoFormat::is_progressive()` +
+  `vertical_lines() -> Option<u16>`, `FrameRate::fps_q() ->
+  Option<(u32, u32)>` (exact rational for safe metadata
+  propagation) + `is_fractional()`, `AspectRatio::ratio() ->
+  Option<(u8, u8)>` + `is_widescreen()`,
+  `AudioFormat::channel_count() -> Option<u8>` + `has_downmix()`,
+  `SampleRate::primary_hz() -> Option<u32>` + `is_combo()`. Typed
+  accessors `video_format_kind()` / `frame_rate_kind()` /
+  `aspect_ratio_kind()` land directly on `PrimaryVideoStream` and
+  `SecondaryVideoStream`; `audio_format_kind()` /
+  `sample_rate_kind()` land on `PrimaryAudioStream` and
+  `SecondaryAudioStream`; `AppInfoBdmv` exposes
+  `video_format_kind()` / `frame_rate_kind()` for the disc-wide
+  defaults (sharing the same enum lets a player run one switch
+  over both the disc default and the per-stream view). The raw
+  `u8` fields stay public so existing consumers compile unchanged.
+  15 new unit tests cover the named-variant round-trips, the
+  `Other` catch-all for reserved nibbles, nibble masking on the
+  un-shifted wire byte, the per-enum helper predicates, the
+  per-stream accessors on `PrimaryVideoStream` /
+  `PrimaryAudioStream` / `SecondaryVideoStream` /
+  `SecondaryAudioStream`, the `AppInfoBdmv` accessors with full
+  variant coverage, and end-to-end MPLS + `index.bdmv` encode →
+  parse round-trips so the typed view stays consistent with the
+  wire bit-packing `PlayListMpls::encode` / `IndexBdmv::encode`
+  already exercise. Re-exported from the crate root next to the
+  existing `StreamCodingType` / `PlayListPlaybackType`. Spec basis:
+  BD-ROM Part 3 §5.4.4.4 (per-stream `stream_attributes` table) +
+  AppInfoBDMV §5.3 (disc-wide default nibbles).
 - **PlayList `playback_type` typed accessor (`PlayListPlaybackType`)**
   — new enum parallel to `MarkType` / `ConnectionCondition` /
   `StreamCodingType`, covering the documented values that the

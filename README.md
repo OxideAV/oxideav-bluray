@@ -143,6 +143,33 @@ bluray://                          → auto-detect first BD-ROM mount
   comparing against magic numbers. `from_raw` / `as_raw` round-trip
   through the wire byte; `is_sequential` / `is_randomised` cover the
   common UI predicate (one indicator for both random-pick variants).
+- **STN_table video / audio attribute typed accessors** — five new
+  enums (`VideoFormat`, `FrameRate`, `AspectRatio`, `AudioFormat`,
+  `SampleRate`) cover the 4-bit nibbles BD-ROM Part 3 §5.4.4.4 packs
+  into each PlayItem's per-stream `stream_attributes` block plus the
+  matching nibbles in `index.bdmv` AppInfoBDMV §5.3 (disc-wide
+  defaults). `VideoFormat` covers 480i / 576i / 480p / 1080i / 720p /
+  1080p / 576p / 2160p with `is_progressive()` + `vertical_lines()`;
+  `FrameRate` covers 23.976 / 24 / 25 / 29.97 / 50 / 59.94 with
+  `fps_q() -> (num, den)` for safe rational propagation +
+  `is_fractional()`; `AspectRatio` covers 4:3 / 16:9 with
+  `ratio() -> (w, h)` + `is_widescreen()`; `AudioFormat` covers Mono /
+  Stereo / Multi (5.1) / Combo (5.1 + downmix) with `channel_count()`
+  + `has_downmix()`; `SampleRate` covers 48k / 96k / 192k plus the
+  dual-rate combos `48/192` and `48/96` with `primary_hz()` +
+  `is_combo()`. `from_raw` masks the low nibble so callers can pass
+  the un-shifted wire byte directly; `as_raw` round-trips through the
+  4-bit field. Surfaces as typed methods (`video_format_kind` /
+  `frame_rate_kind` / `aspect_ratio_kind` / `audio_format_kind` /
+  `sample_rate_kind`) on `PrimaryVideoStream` /
+  `SecondaryVideoStream` / `PrimaryAudioStream` / `SecondaryAudioStream`
+  and `AppInfoBdmv`. 15 new unit tests cover the named round-trips,
+  the helper predicates, the `Other` catch-all for reserved nibbles,
+  nibble masking on the un-shifted wire byte, the per-stream
+  accessors, and a full MPLS encode → parse roundtrip end-to-end so
+  the typed view stays consistent with the wire packing
+  `PlayListMpls::encode` / `parse` already exercise. Re-exported
+  from the crate root.
 - `bluray://` URI handler registered with `oxideav_core::SourceRegistry`
   under the default-on `registry` cargo feature.
 - Pluggable [`StreamDecryptor`] trait so `oxideav-aacs` can plug in
