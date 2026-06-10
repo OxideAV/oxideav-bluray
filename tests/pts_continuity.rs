@@ -26,8 +26,8 @@ use oxideav_bluray::bdmv::clpi::{
 };
 use oxideav_bluray::bdmv::index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType};
 use oxideav_bluray::bdmv::mpls::{
-    AppInfoPlayList, ConnectionCondition, PlayItem, PlayList, PlayListMpls, PrimaryAudioStream,
-    PrimaryVideoStream, StnTable, StreamCodingType,
+    AppInfoPlayList, ConnectionCondition, PlayItem, PlayItemFlags, PlayList, PlayListMpls,
+    PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
 };
 use oxideav_bluray::{Disc, M2TS_PACKET_LEN, TS_PACKET_LEN};
 
@@ -201,6 +201,7 @@ fn three_playitems_emit_three_continuity_segments_with_correct_byte_pts_bounds()
             multi_clip_count: 1,
             angles: Vec::new(),
             stn_table: primary_video_stn(),
+            flags: PlayItemFlags::default(),
         });
     }
 
@@ -325,6 +326,7 @@ fn first_playitem_connection_condition_normalised_to_nonseamless() {
                 multi_clip_count: 1,
                 angles: Vec::new(),
                 stn_table: primary_video_stn(),
+                flags: PlayItemFlags::default(),
             }],
             sub_paths: vec![],
         },
@@ -378,6 +380,7 @@ fn missing_sequence_info_falls_back_to_zero_stc_origin() {
                 multi_clip_count: 1,
                 angles: Vec::new(),
                 stn_table: primary_video_stn(),
+                flags: PlayItemFlags::default(),
             }],
             sub_paths: vec![],
         },
@@ -456,6 +459,7 @@ fn map_clip_pts_to_title_pts_walks_across_playitem_seams() {
                     multi_clip_count: 1,
                     angles: Vec::new(),
                     stn_table: primary_video_stn(),
+                    flags: PlayItemFlags::default(),
                 },
                 PlayItem {
                     clip_information_file_name: "00002".into(),
@@ -470,6 +474,7 @@ fn map_clip_pts_to_title_pts_walks_across_playitem_seams() {
                     multi_clip_count: 1,
                     angles: Vec::new(),
                     stn_table: primary_video_stn(),
+                    flags: PlayItemFlags::default(),
                 },
             ],
             sub_paths: vec![],
@@ -564,6 +569,7 @@ fn segment_for_playitem_after_in_offset_advances_clip_axis_correctly() {
                 multi_clip_count: 1,
                 angles: Vec::new(),
                 stn_table: primary_video_stn(),
+                flags: PlayItemFlags::default(),
             }],
             sub_paths: vec![],
         },

@@ -28,8 +28,8 @@ use oxideav_bluray::bdmv::clpi::{
 };
 use oxideav_bluray::bdmv::index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType};
 use oxideav_bluray::bdmv::mpls::{
-    AngleClip, AppInfoPlayList, ConnectionCondition, PlayItem, PlayList, PlayListMpls,
-    PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
+    AngleClip, AppInfoPlayList, ConnectionCondition, PlayItem, PlayItemFlags, PlayList,
+    PlayListMpls, PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
 };
 use oxideav_bluray::{Disc, M2TS_PACKET_LEN, TS_PACKET_LEN};
 
@@ -194,6 +194,7 @@ fn build_disc(root: &Path) {
                         primary_audio: primary_audio(),
                         ..StnTable::default()
                     },
+                    flags: PlayItemFlags::default(),
                 },
                 PlayItem {
                     clip_information_file_name: "00200".into(),
@@ -220,6 +221,7 @@ fn build_disc(root: &Path) {
                         primary_audio: primary_audio(),
                         ..StnTable::default()
                     },
+                    flags: PlayItemFlags::default(),
                 },
             ],
             sub_paths: vec![],
@@ -420,6 +422,7 @@ fn in_point_drops_pre_in_acp_rows() {
                     primary_audio: primary_audio(),
                     ..StnTable::default()
                 },
+                flags: PlayItemFlags::default(),
             }],
             sub_paths: vec![],
         },
@@ -485,6 +488,7 @@ fn no_acp_rows_yields_empty_list() {
                     primary_audio: primary_audio(),
                     ..StnTable::default()
                 },
+                flags: PlayItemFlags::default(),
             }],
             sub_paths: vec![],
         },

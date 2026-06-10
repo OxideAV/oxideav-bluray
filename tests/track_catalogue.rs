@@ -17,8 +17,8 @@ use std::path::Path;
 
 use oxideav_bluray::bdmv::index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType};
 use oxideav_bluray::bdmv::mpls::{
-    AppInfoPlayList, ConnectionCondition, PgsSubtitleStream, PlayItem, PlayList, PlayListMpls,
-    PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
+    AppInfoPlayList, ConnectionCondition, PgsSubtitleStream, PlayItem, PlayItemFlags, PlayList,
+    PlayListMpls, PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
 };
 use oxideav_bluray::{Disc, TrackKind, M2TS_PACKET_LEN, TS_PACKET_LEN};
 
@@ -98,6 +98,7 @@ fn synth_disc(root: &Path) {
                     multi_clip_count: 1,
                     angles: Vec::new(),
                     stn_table: shared_stn_table(),
+                    flags: PlayItemFlags::default(),
                 },
                 PlayItem {
                     clip_information_file_name: "00002".into(),
@@ -109,6 +110,7 @@ fn synth_disc(root: &Path) {
                     multi_clip_count: 1,
                     angles: Vec::new(),
                     stn_table: shared_stn_table(),
+                    flags: PlayItemFlags::default(),
                 },
             ],
             sub_paths: vec![],
@@ -278,6 +280,7 @@ fn title_streams_skips_zero_pid_subpath_entries() {
                     }],
                     ..StnTable::default()
                 },
+                flags: PlayItemFlags::default(),
             }],
             sub_paths: vec![],
         },

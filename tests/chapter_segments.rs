@@ -17,8 +17,8 @@ use oxideav_bluray::bdmv::clpi::{
 };
 use oxideav_bluray::bdmv::index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType};
 use oxideav_bluray::bdmv::mpls::{
-    AppInfoPlayList, ConnectionCondition, PlayItem, PlayList, PlayListMark, PlayListMpls,
-    PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
+    AppInfoPlayList, ConnectionCondition, PlayItem, PlayItemFlags, PlayList, PlayListMark,
+    PlayListMpls, PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
 };
 use oxideav_bluray::{ChapterSelector, Disc, M2TS_PACKET_LEN, TS_PACKET_LEN};
 use std::fs;
@@ -145,6 +145,7 @@ fn synth_three_chapter_disc(root: &Path) {
                     multi_clip_count: 1,
                     angles: Vec::new(),
                     stn_table: primary_video_stn(),
+                    flags: PlayItemFlags::default(),
                 },
                 PlayItem {
                     clip_information_file_name: "00002".into(),
@@ -156,6 +157,7 @@ fn synth_three_chapter_disc(root: &Path) {
                     multi_clip_count: 1,
                     angles: Vec::new(),
                     stn_table: primary_video_stn(),
+                    flags: PlayItemFlags::default(),
                 },
             ],
             sub_paths: vec![],

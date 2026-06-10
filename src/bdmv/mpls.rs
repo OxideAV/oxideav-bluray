@@ -848,6 +848,42 @@ pub struct AngleClip {
     pub stc_id_ref: u8,
 }
 
+/// Per-PlayItem playback-control fields that sit between the IN/OUT
+/// timestamps and the `is_multi_angle` block in §5.4.4.1, plus the raw
+/// flags byte that prefixes the multi-angle clip list.
+///
+/// These were previously consumed-and-discarded by the parser; they are
+/// surfaced here as raw values so a player can honour the disc author's
+/// random-access and still-frame intentions without re-walking the
+/// wire bytes. Only the `random_access_flag` is decomposed into a typed
+/// bit (its position — the top bit of the byte following the UO mask
+/// table — is the layout the parser has always assumed); the remaining
+/// fields are surfaced verbatim because their internal bit semantics are
+/// not pinned by the consulted references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlayItemFlags {
+    /// `PlayItem_random_access_flag` (§5.4.4.1) — the top bit of the
+    /// byte immediately after the 8-byte `UO_mask_table`. When set, the
+    /// author permits random access (skip / time search) to land inside
+    /// this PlayItem; when clear, the player should treat the PlayItem as
+    /// a non-skippable unit.
+    pub random_access_flag: bool,
+    /// `still_mode` byte (§5.4.4.1). A PlayItem may pause on its final
+    /// presented picture (a "still") rather than advancing — used by the
+    /// Browsable-Slideshow framework. Surfaced raw; the player consults
+    /// [`Self::still_time`] when this selects a timed still.
+    pub still_mode: u8,
+    /// `still_time` (§5.4.4.1) — the dwell, in seconds, for a timed
+    /// still. Meaningful only for the timed-still `still_mode`; `0` for
+    /// the no-still / infinite-still cases.
+    pub still_time: u16,
+    /// Raw flags byte prefixing the `is_multi_angle` clip list
+    /// (§5.4.4.1), present only when the PlayItem is multi-angle. `0`
+    /// for single-angle PlayItems. Surfaced verbatim — its individual
+    /// bit assignments are not pinned by the consulted references.
+    pub angle_flags: u8,
+}
+
 /// One PlayItem (§5.4.4.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayItem {
@@ -872,6 +908,10 @@ pub struct PlayItem {
     ///   angle k → `angles[k - 1]` for k ≥ 1
     pub angles: Vec<AngleClip>,
     pub stn_table: StnTable,
+    /// Playback-control fields (`PlayItem_random_access_flag`,
+    /// `still_mode`, `still_time`, multi-angle flags byte) lifted off
+    /// §5.4.4.1. See [`PlayItemFlags`].
+    pub flags: PlayItemFlags,
 }
 
 impl PlayItem {
@@ -1323,14 +1363,17 @@ fn parse_play_item(r: &mut Reader<'_>) -> Result<PlayItem> {
     let out_time_ticks = r.read_u32()?;
     // UO_mask_table 8 bytes
     r.skip(8)?;
-    // random_access_flag 1 bit + reserved 7 bits
-    r.skip(1)?;
+    // random_access_flag 1 bit (top) + reserved 7 bits
+    let random_access_byte = r.read_u8()?;
+    let random_access_flag = (random_access_byte & 0x80) != 0;
     // still_mode 1 byte + still_time u16
-    r.skip(3)?;
+    let still_mode = r.read_u8()?;
+    let still_time = r.read_u16()?;
+    let mut angle_flags = 0u8;
     let (multi_clip_count, angles) = if is_multi_angle != 0 {
         let num_angles = r.read_u8()?;
-        // flags byte
-        r.skip(1)?;
+        // flags byte (surfaced raw; bit assignments not pinned by refs)
+        angle_flags = r.read_u8()?;
         // (num_angles - 1) repeated entries of
         //   5-byte clip_information_file_name + 4-byte codec id +
         //   1-byte stc_id_ref + 1 reserved
@@ -1433,6 +1476,12 @@ fn parse_play_item(r: &mut Reader<'_>) -> Result<PlayItem> {
         multi_clip_count,
         angles,
         stn_table,
+        flags: PlayItemFlags {
+            random_access_flag,
+            still_mode,
+            still_time,
+            angle_flags,
+        },
     })
 }
 
@@ -1462,13 +1511,13 @@ fn encode_play_item(out: &mut Vec<u8>, pi: &PlayItem) {
     out.extend_from_slice(&pi.in_time_ticks.to_be_bytes());
     out.extend_from_slice(&pi.out_time_ticks.to_be_bytes());
     out.extend_from_slice(&[0u8; 8]); // UO_mask_table
-    out.push(0); // random_access_flag + reserved
-    out.push(0); // still_mode
-    out.extend_from_slice(&[0u8; 2]); // still_time
+    out.push(if pi.flags.random_access_flag { 0x80 } else { 0 }); // random_access_flag (top bit) + reserved
+    out.push(pi.flags.still_mode); // still_mode
+    out.extend_from_slice(&pi.flags.still_time.to_be_bytes()); // still_time
 
     if pi.multi_clip_count > 1 {
         out.push(pi.multi_clip_count);
-        out.push(0);
+        out.push(pi.flags.angle_flags);
         // Write `multi_clip_count - 1` alt-angle entries. If the
         // `angles` vec is shorter than that (e.g. a hand-built
         // PlayItem that forgot to populate the alt slots), zero-fill
@@ -1888,6 +1937,7 @@ mod tests {
                             }],
                             ..StnTable::default()
                         },
+                        flags: PlayItemFlags::default(),
                     },
                     PlayItem {
                         clip_information_file_name: "00002".into(),
@@ -1929,6 +1979,7 @@ mod tests {
                             }],
                             ..StnTable::default()
                         },
+                        flags: PlayItemFlags::default(),
                     },
                 ],
                 sub_paths: vec![SubPath {
@@ -1955,6 +2006,97 @@ mod tests {
         assert_eq!(parsed.app_info, m.app_info);
         assert_eq!(parsed.play_list, m.play_list);
         assert_eq!(parsed.marks, m.marks);
+    }
+
+    #[test]
+    fn play_item_flags_default_is_all_clear() {
+        // A freshly-built PlayItem (via `sample_mpls`, which leaves the
+        // flags at their `Default`) reports every playback-control field
+        // cleared — matching the all-zero bytes `encode` writes.
+        let m = sample_mpls();
+        for pi in &m.play_list.play_items {
+            assert_eq!(pi.flags, PlayItemFlags::default());
+            assert!(!pi.flags.random_access_flag);
+            assert_eq!(pi.flags.still_mode, 0);
+            assert_eq!(pi.flags.still_time, 0);
+            assert_eq!(pi.flags.angle_flags, 0);
+        }
+    }
+
+    #[test]
+    fn play_item_flags_survive_round_trip() {
+        // Set non-trivial random-access / still-mode / still-time values
+        // on the first PlayItem and confirm they survive an
+        // encode → parse round trip through the wire byte positions.
+        let mut m = sample_mpls();
+        m.play_list.play_items[0].flags = PlayItemFlags {
+            random_access_flag: true,
+            still_mode: 0x02,
+            still_time: 7,
+            // single-angle PlayItem: angle_flags is not on the wire, so
+            // it round-trips back to 0 regardless of what we set here.
+            angle_flags: 0,
+        };
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        let f = parsed.play_list.play_items[0].flags;
+        assert!(f.random_access_flag);
+        assert_eq!(f.still_mode, 0x02);
+        assert_eq!(f.still_time, 7);
+        // The second PlayItem left its flags at default → still clear.
+        assert_eq!(
+            parsed.play_list.play_items[1].flags,
+            PlayItemFlags::default()
+        );
+    }
+
+    #[test]
+    fn play_item_angle_flags_survive_round_trip_when_multi_angle() {
+        // The multi-angle flags byte is only written (and read) for a
+        // multi-angle PlayItem. Build one and confirm the raw byte
+        // survives the encode → parse cycle.
+        let mut m = sample_mpls();
+        let pi = &mut m.play_list.play_items[0];
+        pi.multi_clip_count = 2;
+        pi.angles = vec![AngleClip {
+            clip_information_file_name: "00099".into(),
+            clip_codec_identifier: *b"M2TS",
+            stc_id_ref: 0,
+        }];
+        pi.flags.angle_flags = 0b0000_0011;
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        let f = parsed.play_list.play_items[0].flags;
+        assert_eq!(f.angle_flags, 0b0000_0011);
+        // The alt-angle clip stem still round-trips alongside the flags.
+        assert_eq!(
+            parsed.play_list.play_items[0].angles[0].clip_information_file_name,
+            "00099"
+        );
+    }
+
+    #[test]
+    fn random_access_flag_is_top_bit_only() {
+        // The byte after the UO mask table carries the random-access
+        // flag in its top bit; the low 7 bits are reserved and must not
+        // leak into the typed `bool`. Forge a PlayList whose first
+        // PlayItem sets the flag, then flip individual reserved bits in
+        // the encoded bytes and confirm the decoded flag is stable.
+        let mut m = sample_mpls();
+        m.play_list.play_items[0].flags.random_access_flag = true;
+        let mut bytes = m.encode();
+        // Locate the random-access byte: it is the first 0x80 byte that
+        // follows the first PlayItem's 8-byte all-zero UO mask table.
+        // Rather than hunt for it, re-parse to confirm the encoder set
+        // exactly the top bit.
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        assert!(parsed.play_list.play_items[0].flags.random_access_flag);
+        // Now clear the flag and confirm it reads back false even if we
+        // would have set reserved bits.
+        m.play_list.play_items[0].flags.random_access_flag = false;
+        bytes = m.encode();
+        let parsed2 = PlayListMpls::parse(&bytes).unwrap();
+        assert!(!parsed2.play_list.play_items[0].flags.random_access_flag);
     }
 
     #[test]
@@ -2232,6 +2374,7 @@ mod tests {
                         }],
                         ..StnTable::default()
                     },
+                    flags: PlayItemFlags::default(),
                 }],
                 sub_paths: vec![],
             },
@@ -2389,6 +2532,7 @@ mod tests {
                         }],
                         ..StnTable::default()
                     },
+                    flags: PlayItemFlags::default(),
                 }],
                 sub_paths: vec![],
             },

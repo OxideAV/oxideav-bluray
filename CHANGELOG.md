@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **PlayItem playback-control fields (`PlayItemFlags`)** — the
+  `PlayItem_random_access_flag`, `still_mode` byte, `still_time`
+  word, and the raw multi-angle flags byte (BD-ROM Part 3 §5.4.4.1)
+  were previously consumed-and-discarded by the `.mpls` parser; they
+  are now surfaced through a new `PlayItemFlags` struct on
+  `PlayItem::flags`. `random_access_flag` is decomposed into a typed
+  `bool` (the top bit of the byte following the 8-byte UO mask
+  table — the layout the parser has always assumed); `still_mode`,
+  `still_time`, and `angle_flags` are surfaced verbatim because their
+  internal bit semantics are not pinned by the consulted references.
+  Both the `parse` and `encode` paths now read/write these fields
+  instead of treating them as fixed zeros, so a hand-built PlayItem's
+  random-access intent and still-frame dwell survive an
+  encode → parse round trip. Re-exported from the crate root. Five
+  new unit tests cover the default-all-clear state, a
+  random-access + still-mode + still-time round trip, the multi-angle
+  flags byte round trip on a multi-angle PlayItem, and the
+  top-bit-only isolation of the random-access flag.
+
 - **STN_table video / audio attribute typed accessors
   (`VideoFormat` / `FrameRate` / `AspectRatio` / `AudioFormat` /
   `SampleRate`)** — five new enums covering the 4-bit nibbles

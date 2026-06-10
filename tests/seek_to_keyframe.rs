@@ -18,8 +18,8 @@ use oxideav_bluray::bdmv::clpi::{
 };
 use oxideav_bluray::bdmv::index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType};
 use oxideav_bluray::bdmv::mpls::{
-    AppInfoPlayList, ConnectionCondition, PlayItem, PlayList, PlayListMark, PlayListMpls,
-    PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
+    AppInfoPlayList, ConnectionCondition, PlayItem, PlayItemFlags, PlayList, PlayListMark,
+    PlayListMpls, PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
 };
 use oxideav_bluray::{Disc, M2TS_PACKET_LEN, TS_PACKET_LEN};
 
@@ -154,6 +154,7 @@ fn seek_to_lands_on_keyframe_packet() {
                         }],
                         ..StnTable::default()
                     },
+                    flags: PlayItemFlags::default(),
                 },
                 PlayItem {
                     clip_information_file_name: "00002".into(),
@@ -181,6 +182,7 @@ fn seek_to_lands_on_keyframe_packet() {
                         }],
                         ..StnTable::default()
                     },
+                    flags: PlayItemFlags::default(),
                 },
             ],
             sub_paths: vec![],
@@ -332,6 +334,7 @@ fn seek_to_without_cpi_falls_back_to_clip_start() {
                     }],
                     ..StnTable::default()
                 },
+                flags: PlayItemFlags::default(),
             }],
             sub_paths: vec![],
         },
@@ -436,6 +439,7 @@ fn disc_chapters_map_to_seekable_keyframes() {
                         }],
                         ..StnTable::default()
                     },
+                    flags: PlayItemFlags::default(),
                 },
                 PlayItem {
                     clip_information_file_name: "00002".into(),
@@ -463,6 +467,7 @@ fn disc_chapters_map_to_seekable_keyframes() {
                         }],
                         ..StnTable::default()
                     },
+                    flags: PlayItemFlags::default(),
                 },
             ],
             sub_paths: vec![],

@@ -143,6 +143,17 @@ bluray://                          → auto-detect first BD-ROM mount
   comparing against magic numbers. `from_raw` / `as_raw` round-trip
   through the wire byte; `is_sequential` / `is_randomised` cover the
   common UI predicate (one indicator for both random-pick variants).
+- **PlayItem playback-control fields (`PlayItemFlags`)** — the
+  `PlayItem_random_access_flag`, `still_mode` byte, `still_time` word,
+  and the raw multi-angle flags byte (BD-ROM Part 3 §5.4.4.1) — fields
+  the `.mpls` parser previously consumed and discarded — are now
+  surfaced through `PlayItem::flags`. `random_access_flag` decomposes
+  into a typed `bool` (the top bit of the byte after the 8-byte UO
+  mask table — the layout the parser has always assumed); `still_mode`,
+  `still_time`, and `angle_flags` are surfaced verbatim. The `parse`
+  and `encode` paths read/write these fields instead of fixed zeros, so
+  a PlayItem's random-access intent + still-frame dwell survive an
+  encode → parse round trip. Re-exported from the crate root.
 - **STN_table video / audio attribute typed accessors** — five new
   enums (`VideoFormat`, `FrameRate`, `AspectRatio`, `AudioFormat`,
   `SampleRate`) cover the 4-bit nibbles BD-ROM Part 3 §5.4.4.4 packs

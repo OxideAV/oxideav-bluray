@@ -19,8 +19,8 @@ use std::path::Path;
 
 use oxideav_bluray::bdmv::index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType};
 use oxideav_bluray::bdmv::mpls::{
-    AngleClip, AppInfoPlayList, ConnectionCondition, PlayItem, PlayList, PlayListMpls,
-    PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
+    AngleClip, AppInfoPlayList, ConnectionCondition, PlayItem, PlayItemFlags, PlayList,
+    PlayListMpls, PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
 };
 use oxideav_bluray::{Disc, M2TS_PACKET_LEN, TS_PACKET_LEN};
 
@@ -99,6 +99,7 @@ fn build_disc(root: &Path) {
                     }],
                     ..StnTable::default()
                 },
+                flags: PlayItemFlags::default(),
             }],
             sub_paths: vec![],
         },
