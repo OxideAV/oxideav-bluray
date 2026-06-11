@@ -14,14 +14,26 @@ bluray://                          → auto-detect first BD-ROM mount
 ## Scope (Phase 1)
 
 - UDF 2.50 read-only mount (sector layout, Volume Descriptor
-  Sequence, File Set Descriptor, File Entry / ICB short-allocation
-  walks). The File Entry parser accepts both Tag 261 (plain FE
-  §14.9) and Tag 266 (ExtendedFileEntry §14.17); EFE carries the
-  extra `Object Size` field (§14.17.11) surfaced through
+  Sequence, File Set Descriptor, File Entry / ICB allocation walks).
+  The File Entry parser accepts both Tag 261 (plain FE §14.9) and
+  Tag 266 (ExtendedFileEntry §14.17); EFE carries the extra
+  `Object Size` field (§14.17.11) surfaced through
   `FileEntry::object_size`, and the 40-byte-longer prefix
   (creation_time + stream_directory_icb + extra reserved word) is
   decoded transparently so authoring tools that emit EFE for the BDMV
-  root mount without an `unsupported` bail.
+  root mount without an `unsupported` bail. All three ECMA-167
+  allocation-descriptor flavours are walked: short_ad (§14.14.1),
+  long_ad (§14.14.2) and ext_ad (§14.14.3), normalised through
+  `FileEntry::extents() -> Vec<AllocExtent>` so the file walk runs one
+  loop regardless of flavour. Long/extended extents must reference
+  the mounted partition (`UdfDisc::partition_number`, the
+  single-partition BD-ROM assumption) — a cross-partition `lb_addr`
+  is refused rather than misresolved against the wrong partition
+  base; an ext_ad whose `Recorded Length` differs from its
+  `Information Length` (a compressed extent, §14.14.3 Note 46) is
+  refused at parse time, and an ext_ad extent contributes its
+  `Information Length` bytes (not the block-rounded Extent Length)
+  to the file body.
 - BDMV parsers — `index.bdmv` titles, `MovieObject.bdmv` nav-command
   enumeration, `PLAYLIST/*.mpls` PlayList + PlayItem + STN_table
   summary + ClipMark, `CLIPINF/*.clpi` ClipInfo + SequenceInfo +
@@ -217,9 +229,19 @@ bluray://                          → auto-detect first BD-ROM mount
   PES reproject is fully driven by it; what's still deferred is having
   `TitleSource::read()` *itself* rewrite outgoing PES PTS so a remuxer
   doesn't even need the map.
-- ICB strategy types other than 4, long/extended allocation
-  descriptors, multi-extent partition maps. (ExtendedFileEntry §14.17
-  parsing now landed — listed in Scope above.)
+- ICB strategy types other than 4, multi-extent partition maps,
+  Allocation Extent Descriptor continuation chains (§14.5 / extent
+  type 3). (ExtendedFileEntry §14.17 parsing and long/extended
+  allocation descriptors §14.14.2–3 now landed — listed in Scope
+  above.)
+- HDMV navigation-command opcode decode (operand counts,
+  branch/set/compare groups, operand addressing). The staged BDA
+  whitepapers describe the three operation groups only at the
+  overview level (§2.2.1.5.1); the per-opcode syntax tables live in
+  the member-gated Part 3 normative books, which `docs/` does not
+  carry — `MovieObject.bdmv` commands stay surfaced as opaque
+  12-byte `NavCommand` records until a clean-room trace for the
+  command tables is staged.
 
 ## Standalone build
 
@@ -238,7 +260,16 @@ the `bluray://` registry plumbing disappears.
 All fixtures are synthetic — the crate ships zero bytes from real
 Blu-ray discs and references no real titles. Test categories:
 
-- UDF descriptor round-trips (tag checksum, lb_addr, short_ad, d-string).
+- UDF descriptor round-trips (tag checksum, lb_addr, short_ad,
+  ext_ad, d-string).
+- Allocation-descriptor flavours (§14.14): a File Entry recording two
+  long_ads parses + normalises through `extents()`; an uncompressed
+  ext_ad contributes its Information Length; a compressed ext_ad
+  (recorded ≠ information) is rejected `Unsupported`; an extent-type-3
+  continuation long_ad is rejected; end-to-end, a synthetic-image
+  file recorded through a two-block long_ad reads back byte-exact and
+  a long_ad naming a foreign `partition_ref` is refused
+  (`tests/udf_minimal_image.rs`).
 - ExtendedFileEntry (Tag 266 / §14.17) parsing: an embedded-directory
   EFE with non-trivial `object_size`, a single-extent EFE pointing at
   block 42, a regression that plain FE reports `object_size == None`,

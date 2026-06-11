@@ -14,9 +14,14 @@
 //!   Logical Volume Descriptor (§10.6), Partition Descriptor (§10.5).
 //! - File Set Descriptor (§14.1).
 //! - File Identifier Descriptor (§14.4) + File Entry / ICB (§14.9).
-//! - Short Allocation Descriptors (§14.14.1). Long + Extended ADs are
-//!   read but the parser refuses any with `extent_type != 0` (recorded
-//!   + allocated) and any AD type other than short.
+//! - Short Allocation Descriptors (§14.14.1), Long Allocation
+//!   Descriptors (§14.14.2) and Extended Allocation Descriptors
+//!   (§14.14.3) in File Entries. Long / extended extents must point
+//!   into the mounted partition (the single-partition BD-ROM
+//!   assumption); an ext_ad whose `Recorded Length` differs from its
+//!   `Information Length` (a compressed extent, §14.14.3 Note 46) is
+//!   refused. The file walk refuses any extent with
+//!   `extent_type != 0` (recorded + allocated).
 //!
 //! ## What's not implemented (Phase 1 — surface `Unsupported`)
 //!
@@ -339,6 +344,82 @@ impl LongAd {
         out[10..16].copy_from_slice(&self.implementation_use);
         out
     }
+}
+
+// ─────────────────────── ext_ad (§14.14.3) ───────────────────────
+
+/// `ext_ad`: 20-byte Extended Allocation Descriptor (§14.14.3).
+///
+/// ```text
+///   0  Extent Length        u32  (top 2 bits = extent type, §14.14.1.1)
+///   4  Recorded Length      u32  (bytes actually recorded; top 2 bits reserved)
+///   8  Information Length   u32  (bytes of information starting at the extent)
+///  12  Extent Location      lb_addr (6 bytes)
+///  18  Implementation Use   2 bytes
+/// ```
+///
+/// `Recorded Length < Information Length` signals a compressed extent
+/// (§14.14.3 Note 46) — the mounter refuses those.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtAd {
+    pub length: u32,
+    pub extent_type: u8,
+    pub recorded_length: u32,
+    pub information_length: u32,
+    pub location: LbAddr,
+    pub implementation_use: [u8; 2],
+}
+
+impl ExtAd {
+    pub const SIZE: usize = 20;
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::SIZE {
+            return Err(BlurayError::malformed("ext_ad truncated"));
+        }
+        let raw_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let recorded_length =
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) & 0x3FFF_FFFF;
+        let information_length = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let location = LbAddr::parse(&bytes[12..18])?;
+        Ok(Self {
+            length: raw_len & 0x3FFF_FFFF,
+            extent_type: ((raw_len >> 30) & 0b11) as u8,
+            recorded_length,
+            information_length,
+            location,
+            implementation_use: [bytes[18], bytes[19]],
+        })
+    }
+
+    pub fn encode(self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        let raw_len = (self.length & 0x3FFF_FFFF) | ((self.extent_type as u32 & 0b11) << 30);
+        out[0..4].copy_from_slice(&raw_len.to_le_bytes());
+        out[4..8].copy_from_slice(&(self.recorded_length & 0x3FFF_FFFF).to_le_bytes());
+        out[8..12].copy_from_slice(&self.information_length.to_le_bytes());
+        out[12..18].copy_from_slice(&self.location.encode());
+        out[18..20].copy_from_slice(&self.implementation_use);
+        out
+    }
+}
+
+/// One allocation extent normalised across the three AD flavours
+/// (§14.14.1 short / §14.14.2 long / §14.14.3 extended) so the file
+/// walk can run a single loop.
+#[derive(Debug, Clone, Copy)]
+pub struct AllocExtent {
+    /// Bytes this extent contributes to the file body. For an ext_ad
+    /// this is its `Information Length`; for short/long it's the
+    /// 30-bit Extent Length.
+    pub length: u32,
+    /// §14.14.1.1 extent type (0 = recorded and allocated).
+    pub extent_type: u8,
+    /// Logical block number of the extent within its partition.
+    pub block: u32,
+    /// `None` for a short_ad (the partition the descriptor is
+    /// recorded on is implied, §14.14.1.2); `Some(ref)` for long /
+    /// extended ADs whose `lb_addr` names a partition explicitly.
+    pub partition_ref: Option<u16>,
 }
 
 // ─────────────────────── d-string / OSTA compressed unicode ───────────────────────
@@ -729,8 +810,12 @@ pub struct FileEntry {
     pub object_size: Option<u64>,
     pub length_of_extended_attributes: u32,
     pub length_of_allocation_descriptors: u32,
-    /// Resolved short-ad extents (we refuse long/extended in Phase 1).
+    /// Resolved short_ad extents (§14.14.1), when `ad_type == Short`.
     pub short_ads: Vec<ShortAd>,
+    /// Resolved long_ad extents (§14.14.2), when `ad_type == Long`.
+    pub long_ads: Vec<LongAd>,
+    /// Resolved ext_ad extents (§14.14.3), when `ad_type == Extended`.
+    pub ext_ads: Vec<ExtAd>,
     /// Raw embedded data, when `ad_type == EmbeddedInIcb` (a single
     /// directory listing or a tiny file).
     pub embedded_data: Vec<u8>,
@@ -836,6 +921,8 @@ impl FileEntry {
         }
 
         let mut short_ads = Vec::new();
+        let mut long_ads = Vec::new();
+        let mut ext_ads = Vec::new();
         let mut embedded_data = Vec::new();
         match ad_type {
             AdType::Short => {
@@ -855,10 +942,44 @@ impl FileEntry {
                 }
             }
             AdType::Long => {
-                return Err(BlurayError::unsupported("long_ad in FileEntry"));
+                let mut o = 0;
+                while o + LongAd::SIZE <= l_ad as usize {
+                    let ad = LongAd::parse(&bytes[ad_off + o..ad_off + o + LongAd::SIZE])?;
+                    if ad.length == 0 {
+                        break;
+                    }
+                    if ad.extent_type == 3 {
+                        return Err(BlurayError::unsupported(
+                            "Allocation Extent Descriptor continuation",
+                        ));
+                    }
+                    long_ads.push(ad);
+                    o += LongAd::SIZE;
+                }
             }
             AdType::Extended => {
-                return Err(BlurayError::unsupported("extended_ad in FileEntry"));
+                let mut o = 0;
+                while o + ExtAd::SIZE <= l_ad as usize {
+                    let ad = ExtAd::parse(&bytes[ad_off + o..ad_off + o + ExtAd::SIZE])?;
+                    if ad.length == 0 {
+                        break;
+                    }
+                    if ad.extent_type == 3 {
+                        return Err(BlurayError::unsupported(
+                            "Allocation Extent Descriptor continuation",
+                        ));
+                    }
+                    if ad.recorded_length != ad.information_length {
+                        // §14.14.3 Note 46: a Recorded Length that differs
+                        // from the Information Length signals a compressed
+                        // extent — we have no way to decode it.
+                        return Err(BlurayError::unsupported(
+                            "compressed ext_ad extent (recorded != information length)",
+                        ));
+                    }
+                    ext_ads.push(ad);
+                    o += ExtAd::SIZE;
+                }
             }
             AdType::EmbeddedInIcb => {
                 embedded_data.extend_from_slice(&bytes[ad_off..ad_end]);
@@ -881,9 +1002,50 @@ impl FileEntry {
             length_of_extended_attributes: l_ea,
             length_of_allocation_descriptors: l_ad,
             short_ads,
+            long_ads,
+            ext_ads,
             embedded_data,
             ad_type,
         })
+    }
+
+    /// The allocation extents normalised across the AD flavour this
+    /// File Entry recorded (§14.14). Empty when
+    /// `ad_type == EmbeddedInIcb` — use [`Self::embedded_data`].
+    pub fn extents(&self) -> Vec<AllocExtent> {
+        match self.ad_type {
+            AdType::Short => self
+                .short_ads
+                .iter()
+                .map(|ad| AllocExtent {
+                    length: ad.length,
+                    extent_type: ad.extent_type,
+                    block: ad.block_location,
+                    partition_ref: None,
+                })
+                .collect(),
+            AdType::Long => self
+                .long_ads
+                .iter()
+                .map(|ad| AllocExtent {
+                    length: ad.length,
+                    extent_type: ad.extent_type,
+                    block: ad.location.block,
+                    partition_ref: Some(ad.location.partition_ref),
+                })
+                .collect(),
+            AdType::Extended => self
+                .ext_ads
+                .iter()
+                .map(|ad| AllocExtent {
+                    length: ad.information_length,
+                    extent_type: ad.extent_type,
+                    block: ad.location.block,
+                    partition_ref: Some(ad.location.partition_ref),
+                })
+                .collect(),
+            AdType::EmbeddedInIcb => Vec::new(),
+        }
     }
 
     pub fn is_directory(&self) -> bool {
@@ -940,6 +1102,9 @@ pub fn probe_vrs<R: Read + Seek>(r: &mut R) -> Result<bool> {
 pub struct UdfDisc<R: Read + Seek> {
     reader: R,
     pub partition_start_sector: u64,
+    /// `Partition Number` of the mounted (single) partition (§10.5);
+    /// long / extended allocation extents must reference it.
+    pub partition_number: u16,
     pub logical_block_size: u32,
     pub root_directory_icb: LongAd,
     pub volume_identifier: String,
@@ -1017,6 +1182,7 @@ impl<R: Read + Seek> UdfDisc<R> {
         Ok(Self {
             reader,
             partition_start_sector: pd.partition_starting_location as u64,
+            partition_number: pd.partition_number,
             logical_block_size: lvd.logical_block_size,
             root_directory_icb: fsd.root_directory_icb,
             volume_identifier: pvd.volume_identifier,
@@ -1051,15 +1217,22 @@ impl<R: Read + Seek> UdfDisc<R> {
             return Ok(fe.embedded_data[..want.min(fe.embedded_data.len())].to_vec());
         }
         let mut out = Vec::with_capacity(want);
-        for ad in &fe.short_ads {
-            if ad.extent_type != 0 {
+        for ext in fe.extents() {
+            if ext.extent_type != 0 {
                 return Err(BlurayError::unsupported("non-recorded extent in file"));
             }
-            let blocks = (ad.length as u64).div_ceil(SECTOR_SIZE);
+            if let Some(p) = ext.partition_ref {
+                if p != self.partition_number {
+                    return Err(BlurayError::unsupported(
+                        "extent references a different partition",
+                    ));
+                }
+            }
+            let blocks = (ext.length as u64).div_ceil(SECTOR_SIZE);
             for i in 0..blocks {
-                let buf = self.read_partition_block(ad.block_location as u64 + i)?;
+                let buf = self.read_partition_block(ext.block as u64 + i)?;
                 let to_copy =
-                    (ad.length as usize).saturating_sub(i as usize * SECTOR_SIZE as usize);
+                    (ext.length as usize).saturating_sub(i as usize * SECTOR_SIZE as usize);
                 let take = to_copy.min(SECTOR_SIZE as usize);
                 out.extend_from_slice(&buf[..take]);
                 if out.len() >= want {
@@ -1437,6 +1610,156 @@ mod tests {
         let fe = FileEntry::parse(&buf).unwrap();
         assert!(!fe.is_extended());
         assert_eq!(fe.object_size, None);
+    }
+
+    /// Hand-roll a plain File Entry (§14.9) with `file_type` 5 and the
+    /// given ad-type flags + raw allocation-descriptor payload.
+    fn build_plain_fe_with_ads(ad_flags: u16, info_len: u64, ad_payload: &[u8]) -> Vec<u8> {
+        let mut buf = build_fe_header(TagId::FileEntry, ad_flags, 5);
+        buf.extend_from_slice(&[0u8; 4 * 3]); // uid/gid/perm
+        buf.extend_from_slice(&1u16.to_le_bytes()); // file_link_count
+        buf.push(0); // record_format
+        buf.push(0); // record_display_attributes
+        buf.extend_from_slice(&0u32.to_le_bytes()); // record_length
+        buf.extend_from_slice(&info_len.to_le_bytes()); // information_length
+        buf.extend_from_slice(&0u64.to_le_bytes()); // logical_blocks_recorded
+        buf.extend_from_slice(&[0u8; 3 * 12]); // 3 timestamps
+        buf.extend_from_slice(&0u32.to_le_bytes()); // checkpoint
+        buf.extend_from_slice(&[0u8; 16]); // ext_attr_icb
+        buf.extend_from_slice(&[0u8; 32]); // impl_ident
+        buf.extend_from_slice(&0u64.to_le_bytes()); // unique_id
+        buf.extend_from_slice(&0u32.to_le_bytes()); // L_EA
+        buf.extend_from_slice(&(ad_payload.len() as u32).to_le_bytes()); // L_AD
+        assert_eq!(buf.len(), FileEntry::PREFIX_SIZE);
+        buf.extend_from_slice(ad_payload);
+        buf
+    }
+
+    #[test]
+    fn ext_ad_round_trip() {
+        let ad = ExtAd {
+            length: 6144,
+            extent_type: 1,
+            recorded_length: 4096,
+            information_length: 4000,
+            location: LbAddr {
+                block: 77,
+                partition_ref: 3,
+            },
+            implementation_use: [0xAB, 0xCD],
+        };
+        let parsed = ExtAd::parse(&ad.encode()).unwrap();
+        assert_eq!(parsed.length, 6144);
+        assert_eq!(parsed.extent_type, 1);
+        assert_eq!(parsed.recorded_length, 4096);
+        assert_eq!(parsed.information_length, 4000);
+        assert_eq!(parsed.location, ad.location);
+        assert_eq!(parsed.implementation_use, [0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn file_entry_long_ad_extents() {
+        // ad_type 1 = Long. Two long_ads in the same partition.
+        let ads: Vec<u8> = [
+            LongAd {
+                length: 4096,
+                extent_type: 0,
+                location: LbAddr {
+                    block: 10,
+                    partition_ref: 0,
+                },
+                implementation_use: [0u8; 6],
+            },
+            LongAd {
+                length: 2048,
+                extent_type: 0,
+                location: LbAddr {
+                    block: 50,
+                    partition_ref: 0,
+                },
+                implementation_use: [0u8; 6],
+            },
+        ]
+        .iter()
+        .flat_map(|ad| ad.encode())
+        .collect();
+        let fe = FileEntry::parse(&build_plain_fe_with_ads(1, 6144, &ads)).unwrap();
+        assert_eq!(fe.ad_type, AdType::Long);
+        assert_eq!(fe.long_ads.len(), 2);
+        assert!(fe.short_ads.is_empty());
+        let ext = fe.extents();
+        assert_eq!(ext.len(), 2);
+        assert_eq!(ext[0].length, 4096);
+        assert_eq!(ext[0].block, 10);
+        assert_eq!(ext[0].partition_ref, Some(0));
+        assert_eq!(ext[1].length, 2048);
+        assert_eq!(ext[1].block, 50);
+    }
+
+    #[test]
+    fn file_entry_ext_ad_extents() {
+        // ad_type 2 = Extended. Uncompressed (recorded == information).
+        let ad = ExtAd {
+            length: 4096,
+            extent_type: 0,
+            recorded_length: 3000,
+            information_length: 3000,
+            location: LbAddr {
+                block: 21,
+                partition_ref: 0,
+            },
+            implementation_use: [0u8; 2],
+        };
+        let fe = FileEntry::parse(&build_plain_fe_with_ads(2, 3000, &ad.encode())).unwrap();
+        assert_eq!(fe.ad_type, AdType::Extended);
+        assert_eq!(fe.ext_ads.len(), 1);
+        let ext = fe.extents();
+        assert_eq!(ext.len(), 1);
+        // The normalised length is the Information Length, not the
+        // (block-rounded) Extent Length.
+        assert_eq!(ext[0].length, 3000);
+        assert_eq!(ext[0].block, 21);
+        assert_eq!(ext[0].partition_ref, Some(0));
+    }
+
+    #[test]
+    fn file_entry_compressed_ext_ad_rejected() {
+        // recorded_length != information_length → compressed extent
+        // (§14.14.3 Note 46) → Unsupported.
+        let ad = ExtAd {
+            length: 4096,
+            extent_type: 0,
+            recorded_length: 1000,
+            information_length: 3000,
+            location: LbAddr {
+                block: 21,
+                partition_ref: 0,
+            },
+            implementation_use: [0u8; 2],
+        };
+        assert!(matches!(
+            FileEntry::parse(&build_plain_fe_with_ads(2, 3000, &ad.encode())),
+            Err(BlurayError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn file_entry_long_ad_continuation_rejected() {
+        // extent_type 3 = next extent of allocation descriptors
+        // (Allocation Extent Descriptor chain) → Unsupported.
+        let ad = LongAd {
+            length: 2048,
+            extent_type: 3,
+            location: LbAddr {
+                block: 99,
+                partition_ref: 0,
+            },
+            implementation_use: [0u8; 6],
+        };
+        assert!(matches!(
+            FileEntry::parse(&build_plain_fe_with_ads(1, 0, &ad.encode())),
+            Err(BlurayError::Unsupported(_))
+        ));
     }
 
     #[test]

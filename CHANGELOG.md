@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Long + Extended Allocation Descriptors in File Entries (ECMA-167
+  §14.14.2 / §14.14.3)** — the UDF File Entry allocation walk
+  previously refused any ICB-tag ad-type other than short_ad /
+  embedded. The parser now decodes `long_ad` (16-byte: Extent Length
+  with the §14.14.1.1 type bits, `lb_addr` Extent Location,
+  6 implementation-use bytes) and the new `ExtAd` (20-byte ext_ad:
+  Extent Length, Recorded Length, Information Length, `lb_addr`,
+  2 implementation-use bytes) areas into `FileEntry::long_ads` /
+  `FileEntry::ext_ads`, and a new `FileEntry::extents() ->
+  Vec<AllocExtent>` normalises all three flavours (length /
+  extent_type / block / optional partition_ref) so
+  `UdfDisc::read_file` runs a single extent loop. Per the
+  single-partition BD-ROM assumption, a long/extended extent whose
+  `lb_addr` names a partition other than the mounted one
+  (`UdfDisc::partition_number`, newly surfaced from the Partition
+  Descriptor §10.5) is refused `Unsupported` instead of being
+  misresolved against the wrong partition base. An ext_ad whose
+  Recorded Length differs from its Information Length — a compressed
+  extent per §14.14.3 Note 46 — is refused at parse time; an
+  accepted ext_ad contributes its Information Length bytes (not the
+  block-rounded Extent Length) to the file body. Extent-type-3
+  continuation pointers (Allocation Extent Descriptor chains) stay
+  refused for every flavour. 7 new tests: ext_ad round-trip,
+  two-long_ad File Entry normalisation, uncompressed ext_ad
+  normalisation, compressed-ext_ad rejection, continuation-long_ad
+  rejection, plus two synthetic-image end-to-end cases (a two-block
+  long_ad file reading back byte-exact through `read_path`, and a
+  cross-partition long_ad refused). (HDMV navigation-command opcode
+  decode was investigated for this round and is blocked on docs
+  staging: the BDA whitepapers cover the HDMV programming model only
+  at the overview level — §2.2.1.5.1, three operation groups +
+  register file — and `docs/container/bluray/`'s own README lists
+  "all MOBJ opcodes" among the member-gated gaps, so
+  `MovieObject.bdmv` commands stay opaque 12-byte `NavCommand`
+  records; see README "Deferred".)
+
 - **PlayItem playback-control fields (`PlayItemFlags`)** — the
   `PlayItem_random_access_flag`, `still_mode` byte, `still_time`
   word, and the raw multi-angle flags byte (BD-ROM Part 3 §5.4.4.1)

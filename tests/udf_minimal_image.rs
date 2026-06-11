@@ -17,6 +17,10 @@
 //!   sector 260      Terminating Descriptor
 //!   sector 300      File Set Descriptor (root dir ICB at partition block 1)
 //!   sector 301      Root directory File Entry (embedded FIDs)
+//!   sector 302      "TEST" File Entry (embedded payload)
+//!   sector 303      "LONG" File Entry (long_ad → partition blocks 4..6)
+//!   sector 304..305 "LONG" file body
+//!   sector 306      "XPART" File Entry (long_ad naming partition_ref 1)
 //! ```
 //!
 //! All bytes are entirely fabricated; no real disc data is read.
@@ -307,6 +311,8 @@ fn build_synthetic_udf_image() -> Vec<u8> {
     };
     fids.extend_from_slice(&parent_fid);
     fids.extend_from_slice(&make_fid("TEST", 2, 0, false));
+    fids.extend_from_slice(&make_fid("LONG", 3, 0, false));
+    fids.extend_from_slice(&make_fid("XPART", 6, 0, false));
     place(&mut image, 301, &make_root_directory_file_entry(301, &fids));
 
     // The "TEST" file's FE at partition block 2 / sector 302. Embedded
@@ -324,7 +330,66 @@ fn build_synthetic_udf_image() -> Vec<u8> {
     test_fe[176..181].copy_from_slice(b"HELLO");
     place(&mut image, 302, &test_fe);
 
+    // The "LONG" file's FE at partition block 3 / sector 303 records a
+    // single long_ad (§14.14.2) covering partition blocks 4..6
+    // (sectors 304..306); information_length 2500 spans into the
+    // second block.
+    let long_body: Vec<u8> = (0..LONG_FILE_LEN).map(|i| (i % 251) as u8).collect();
+    place(&mut image, 304, &long_body);
+    let long_extent = LongAd {
+        length: 2 * SECTOR_SIZE as u32,
+        extent_type: 0,
+        location: LbAddr {
+            block: 4,
+            partition_ref: 0,
+        },
+        implementation_use: [0u8; 6],
+    };
+    place(
+        &mut image,
+        303,
+        &make_long_ad_file_entry(303, LONG_FILE_LEN as u64, long_extent),
+    );
+
+    // The "XPART" file's FE at partition block 6 / sector 306 records
+    // a long_ad whose lb_addr names partition_ref 1 — a partition this
+    // single-partition volume doesn't have.
+    let foreign_extent = LongAd {
+        length: SECTOR_SIZE as u32,
+        extent_type: 0,
+        location: LbAddr {
+            block: 4,
+            partition_ref: 1,
+        },
+        implementation_use: [0u8; 6],
+    };
+    place(
+        &mut image,
+        306,
+        &make_long_ad_file_entry(306, SECTOR_SIZE, foreign_extent),
+    );
+
     image
+}
+
+/// Body length of the synthetic "LONG" file (spans two blocks).
+const LONG_FILE_LEN: usize = 2500;
+
+/// Build a plain File Entry (file_type 5) whose allocation area holds
+/// exactly one long_ad (ICB-tag ad_type flags = 1, §14.6.8).
+fn make_long_ad_file_entry(location: u32, info_len: u64, extent: LongAd) -> Vec<u8> {
+    let mut buf = vec![0u8; SECTOR];
+    let t = tag(TagId::FileEntry, location, 200);
+    buf[0..16].copy_from_slice(&t.encode());
+    buf[20..22].copy_from_slice(&4u16.to_le_bytes()); // strategy_type
+    buf[24..26].copy_from_slice(&1u16.to_le_bytes()); // max_entries
+    buf[27] = 5; // file_type = file (5)
+    buf[34..36].copy_from_slice(&1u16.to_le_bytes()); // flags ad_type = long (1)
+    buf[48..50].copy_from_slice(&1u16.to_le_bytes()); // link count
+    buf[56..64].copy_from_slice(&info_len.to_le_bytes()); // info_len
+    buf[172..176].copy_from_slice(&16u32.to_le_bytes()); // l_ad = one long_ad
+    buf[176..192].copy_from_slice(&extent.encode());
+    buf
 }
 
 #[test]
@@ -339,12 +404,14 @@ fn mount_synthetic_udf_and_walk_root() {
     // Walk the root and find "TEST".
     let root_icb = disc.root_directory_icb;
     let entries = disc.read_directory(root_icb).expect("read root");
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name, "TEST");
-    assert!(!entries[0].is_directory);
+    assert_eq!(entries.len(), 3);
+    let test = entries
+        .iter()
+        .find(|e| e.name == "TEST")
+        .expect("TEST entry");
+    assert!(!test.is_directory);
 
-    let test_icb = entries[0].icb;
-    let content = disc.read_file(test_icb).expect("read TEST");
+    let content = disc.read_file(test.icb).expect("read TEST");
     assert_eq!(content, b"HELLO");
 
     // Path lookup also works.
@@ -362,6 +429,32 @@ fn mount_synthetic_udf_and_walk_root() {
         std::any::type_name::<PrimaryVolumeDescriptor>(),
         std::any::type_name::<ShortAd>(),
     );
+}
+
+#[test]
+fn long_ad_file_reads_across_blocks() {
+    // The "LONG" file's body is recorded through a long_ad (§14.14.2)
+    // covering two partition blocks; information_length (2500) trims
+    // the block-rounded extent.
+    let image = build_synthetic_udf_image();
+    let mut disc = UdfDisc::open(Cursor::new(image)).expect("mount synthetic UDF");
+    assert_eq!(disc.partition_number, 0);
+
+    let content = disc.read_path("LONG").expect("read LONG via long_ad");
+    assert_eq!(content.len(), LONG_FILE_LEN);
+    let expected: Vec<u8> = (0..LONG_FILE_LEN).map(|i| (i % 251) as u8).collect();
+    assert_eq!(content, expected);
+}
+
+#[test]
+fn cross_partition_long_ad_is_refused() {
+    // "XPART"'s long_ad names partition_ref 1 — not the mounted
+    // partition. The single-partition mounter must refuse rather than
+    // misresolve the block against the wrong partition base.
+    let image = build_synthetic_udf_image();
+    let mut disc = UdfDisc::open(Cursor::new(image)).expect("mount synthetic UDF");
+    let err = disc.read_path("XPART").expect_err("cross-partition extent");
+    assert!(matches!(err, oxideav_bluray::BlurayError::Unsupported(_)));
 }
 
 #[test]
