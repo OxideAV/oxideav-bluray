@@ -21,6 +21,15 @@
 //!   sector 303      "LONG" File Entry (long_ad → partition blocks 4..6)
 //!   sector 304..305 "LONG" file body
 //!   sector 306      "XPART" File Entry (long_ad naming partition_ref 1)
+//!   sector 307      "CHAIN" File Entry (long_ad → block 8, then a
+//!                   type-3 continuation pointer → block 9)
+//!   sector 308      "CHAIN" body, first extent
+//!   sector 309      Allocation Extent Descriptor (§14.5) + one more
+//!                   long_ad → block 10
+//!   sector 310      "CHAIN" body, second extent
+//!   sector 311      "CYCLE" File Entry (type-3 pointer → block 12)
+//!   sector 312      AED whose only descriptor is a type-3 pointer
+//!                   back to block 12 (a cycle)
 //! ```
 //!
 //! All bytes are entirely fabricated; no real disc data is read.
@@ -28,9 +37,9 @@
 use std::io::Cursor;
 
 use oxideav_bluray::udf::{
-    AnchorVolumeDescriptorPointer, DescriptorTag, ExtentAd, FileEntry, FileSetDescriptor, LbAddr,
-    LogicalVolumeDescriptor, LongAd, PartitionDescriptor, PrimaryVolumeDescriptor, ShortAd, TagId,
-    UdfDisc, AVDP_SECTOR, SECTOR_SIZE,
+    AllocationExtentDescriptor, AnchorVolumeDescriptorPointer, DescriptorTag, ExtentAd, FileEntry,
+    FileSetDescriptor, LbAddr, LogicalVolumeDescriptor, LongAd, PartitionDescriptor,
+    PrimaryVolumeDescriptor, ShortAd, TagId, UdfDisc, AVDP_SECTOR, SECTOR_SIZE,
 };
 
 const SECTOR: usize = SECTOR_SIZE as usize;
@@ -313,6 +322,8 @@ fn build_synthetic_udf_image() -> Vec<u8> {
     fids.extend_from_slice(&make_fid("TEST", 2, 0, false));
     fids.extend_from_slice(&make_fid("LONG", 3, 0, false));
     fids.extend_from_slice(&make_fid("XPART", 6, 0, false));
+    fids.extend_from_slice(&make_fid("CHAIN", 7, 0, false));
+    fids.extend_from_slice(&make_fid("CYCLE", 11, 0, false));
     place(&mut image, 301, &make_root_directory_file_entry(301, &fids));
 
     // The "TEST" file's FE at partition block 2 / sector 302. Embedded
@@ -348,7 +359,7 @@ fn build_synthetic_udf_image() -> Vec<u8> {
     place(
         &mut image,
         303,
-        &make_long_ad_file_entry(303, LONG_FILE_LEN as u64, long_extent),
+        &make_long_ad_file_entry(303, LONG_FILE_LEN as u64, &[long_extent]),
     );
 
     // The "XPART" file's FE at partition block 6 / sector 306 records
@@ -366,18 +377,77 @@ fn build_synthetic_udf_image() -> Vec<u8> {
     place(
         &mut image,
         306,
-        &make_long_ad_file_entry(306, SECTOR_SIZE, foreign_extent),
+        &make_long_ad_file_entry(306, SECTOR_SIZE, &[foreign_extent]),
+    );
+
+    // The "CHAIN" file's FE at partition block 7 / sector 307 records
+    // one data long_ad (block 8) and a type-3 continuation pointer
+    // (§14.14.1.1) to block 9, where an Allocation Extent Descriptor
+    // (§14.5) carries one further data long_ad (block 10). The body
+    // spans both data extents; information_length (3048) trims the
+    // second one.
+    let chain_body: Vec<u8> = (0..CHAIN_FILE_LEN)
+        .map(|i| ((i * 7 + 3) % 253) as u8)
+        .collect();
+    place(&mut image, 308, &chain_body[..SECTOR]);
+    place(&mut image, 310, &chain_body[SECTOR..]);
+    let chain_first = LongAd {
+        length: SECTOR_SIZE as u32,
+        extent_type: 0,
+        location: LbAddr {
+            block: 8,
+            partition_ref: 0,
+        },
+        implementation_use: [0u8; 6],
+    };
+    place(
+        &mut image,
+        307,
+        &make_long_ad_file_entry(
+            307,
+            CHAIN_FILE_LEN as u64,
+            &[chain_first, continuation_long_ad(9)],
+        ),
+    );
+    let chain_second = LongAd {
+        length: SECTOR_SIZE as u32,
+        extent_type: 0,
+        location: LbAddr {
+            block: 10,
+            partition_ref: 0,
+        },
+        implementation_use: [0u8; 6],
+    };
+    place(&mut image, 309, &make_aed_block(309, &[chain_second]));
+
+    // The "CYCLE" file's FE at partition block 11 / sector 311 records
+    // only a type-3 pointer to block 12, where the AED's single
+    // descriptor is a type-3 pointer back to block 12 — a cyclic AED
+    // chain the mounter must refuse rather than walk forever.
+    place(
+        &mut image,
+        311,
+        &make_long_ad_file_entry(311, 0, &[continuation_long_ad(12)]),
+    );
+    place(
+        &mut image,
+        312,
+        &make_aed_block(312, &[continuation_long_ad(12)]),
     );
 
     image
 }
 
+/// Body length of the synthetic "CHAIN" file (first extent full, the
+/// AED-continued second extent trimmed to 1000 bytes).
+const CHAIN_FILE_LEN: usize = SECTOR + 1000;
+
 /// Body length of the synthetic "LONG" file (spans two blocks).
 const LONG_FILE_LEN: usize = 2500;
 
 /// Build a plain File Entry (file_type 5) whose allocation area holds
-/// exactly one long_ad (ICB-tag ad_type flags = 1, §14.6.8).
-fn make_long_ad_file_entry(location: u32, info_len: u64, extent: LongAd) -> Vec<u8> {
+/// the given long_ads (ICB-tag ad_type flags = 1, §14.6.8).
+fn make_long_ad_file_entry(location: u32, info_len: u64, extents: &[LongAd]) -> Vec<u8> {
     let mut buf = vec![0u8; SECTOR];
     let t = tag(TagId::FileEntry, location, 200);
     buf[0..16].copy_from_slice(&t.encode());
@@ -387,9 +457,48 @@ fn make_long_ad_file_entry(location: u32, info_len: u64, extent: LongAd) -> Vec<
     buf[34..36].copy_from_slice(&1u16.to_le_bytes()); // flags ad_type = long (1)
     buf[48..50].copy_from_slice(&1u16.to_le_bytes()); // link count
     buf[56..64].copy_from_slice(&info_len.to_le_bytes()); // info_len
-    buf[172..176].copy_from_slice(&16u32.to_le_bytes()); // l_ad = one long_ad
-    buf[176..192].copy_from_slice(&extent.encode());
+    let l_ad = (extents.len() * 16) as u32;
+    buf[172..176].copy_from_slice(&l_ad.to_le_bytes());
+    let mut off = 176;
+    for extent in extents {
+        buf[off..off + 16].copy_from_slice(&extent.encode());
+        off += 16;
+    }
     buf
+}
+
+/// Build a continuation extent of allocation descriptors per §12
+/// figure 7: an Allocation Extent Descriptor (§14.5) followed by the
+/// given long_ads.
+fn make_aed_block(location: u32, extents: &[LongAd]) -> Vec<u8> {
+    let mut buf = vec![0u8; SECTOR];
+    let l_ad = (extents.len() * 16) as u32;
+    let aed = AllocationExtentDescriptor {
+        tag: tag(TagId::AllocationExtent, location, (8 + l_ad) as u16),
+        previous_allocation_extent_location: 0,
+        length_of_allocation_descriptors: l_ad,
+    };
+    buf[0..24].copy_from_slice(&aed.encode());
+    let mut off = AllocationExtentDescriptor::HEADER_SIZE;
+    for extent in extents {
+        buf[off..off + 16].copy_from_slice(&extent.encode());
+        off += 16;
+    }
+    buf
+}
+
+/// A type-3 ("next extent of allocation descriptors", §14.14.1.1)
+/// long_ad pointing at one logical block.
+fn continuation_long_ad(block: u32) -> LongAd {
+    LongAd {
+        length: SECTOR_SIZE as u32,
+        extent_type: 3,
+        location: LbAddr {
+            block,
+            partition_ref: 0,
+        },
+        implementation_use: [0u8; 6],
+    }
 }
 
 #[test]
@@ -404,7 +513,7 @@ fn mount_synthetic_udf_and_walk_root() {
     // Walk the root and find "TEST".
     let root_icb = disc.root_directory_icb;
     let entries = disc.read_directory(root_icb).expect("read root");
-    assert_eq!(entries.len(), 3);
+    assert_eq!(entries.len(), 5);
     let test = entries
         .iter()
         .find(|e| e.name == "TEST")
@@ -444,6 +553,33 @@ fn long_ad_file_reads_across_blocks() {
     assert_eq!(content.len(), LONG_FILE_LEN);
     let expected: Vec<u8> = (0..LONG_FILE_LEN).map(|i| (i % 251) as u8).collect();
     assert_eq!(content, expected);
+}
+
+#[test]
+fn aed_continuation_chain_reads_full_file() {
+    // "CHAIN"'s File Entry ends its AD field in a type-3 pointer
+    // (§14.14.1.1) to an Allocation Extent Descriptor block (§14.5);
+    // the mounter must follow the chain and read the body across both
+    // the in-entry and the continued extent.
+    let image = build_synthetic_udf_image();
+    let mut disc = UdfDisc::open(Cursor::new(image)).expect("mount synthetic UDF");
+
+    let content = disc.read_path("CHAIN").expect("read CHAIN via AED chain");
+    assert_eq!(content.len(), CHAIN_FILE_LEN);
+    let expected: Vec<u8> = (0..CHAIN_FILE_LEN)
+        .map(|i| ((i * 7 + 3) % 253) as u8)
+        .collect();
+    assert_eq!(content, expected);
+}
+
+#[test]
+fn cyclic_aed_chain_is_refused() {
+    // "CYCLE"'s AED chain points back at itself; the depth-capped walk
+    // must surface Malformed instead of looping forever.
+    let image = build_synthetic_udf_image();
+    let mut disc = UdfDisc::open(Cursor::new(image)).expect("mount synthetic UDF");
+    let err = disc.read_path("CYCLE").expect_err("cyclic AED chain");
+    assert!(matches!(err, oxideav_bluray::BlurayError::Malformed(_)));
 }
 
 #[test]

@@ -33,7 +33,16 @@ bluray://                          → auto-detect first BD-ROM mount
   `Information Length` (a compressed extent, §14.14.3 Note 46) is
   refused at parse time, and an ext_ad extent contributes its
   `Information Length` bytes (not the block-rounded Extent Length)
-  to the file body.
+  to the file body. Allocation Extent Descriptor continuation chains
+  (§14.5 / §12 figure 7) are followed: an AD whose extent type is 3
+  ("the extent is the next extent of allocation descriptors",
+  §14.14.1.1) terminates its field per §12 and names the extent
+  holding an AED (Tag 258) + further descriptors of the same
+  flavour; `UdfDisc::read_file_entry` walks the chain (depth-capped
+  at 32 to refuse cyclic chains, each continuation extent bounded to
+  1 MiB) so `FileEntry::extents()` always sees the full flattened
+  sequence. A standalone `FileEntry::parse` (no disc reader)
+  surfaces the unresolved pointer via `FileEntry::continuation`.
 - BDMV parsers — `index.bdmv` titles, `MovieObject.bdmv` nav-command
   enumeration, `PLAYLIST/*.mpls` PlayList + PlayItem + STN_table
   summary + ClipMark, `CLIPINF/*.clpi` ClipInfo + SequenceInfo +
@@ -229,11 +238,10 @@ bluray://                          → auto-detect first BD-ROM mount
   PES reproject is fully driven by it; what's still deferred is having
   `TitleSource::read()` *itself* rewrite outgoing PES PTS so a remuxer
   doesn't even need the map.
-- ICB strategy types other than 4, multi-extent partition maps,
-  Allocation Extent Descriptor continuation chains (§14.5 / extent
-  type 3). (ExtendedFileEntry §14.17 parsing and long/extended
-  allocation descriptors §14.14.2–3 now landed — listed in Scope
-  above.)
+- ICB strategy types other than 4, multi-extent partition maps.
+  (ExtendedFileEntry §14.17 parsing, long/extended allocation
+  descriptors §14.14.2–3, and Allocation Extent Descriptor
+  continuation chains §14.5 now landed — listed in Scope above.)
 - HDMV navigation-command opcode decode (operand counts,
   branch/set/compare groups, operand addressing). The staged BDA
   whitepapers describe the three operation groups only at the
@@ -265,10 +273,19 @@ Blu-ray discs and references no real titles. Test categories:
 - Allocation-descriptor flavours (§14.14): a File Entry recording two
   long_ads parses + normalises through `extents()`; an uncompressed
   ext_ad contributes its Information Length; a compressed ext_ad
-  (recorded ≠ information) is rejected `Unsupported`; an extent-type-3
-  continuation long_ad is rejected; end-to-end, a synthetic-image
-  file recorded through a two-block long_ad reads back byte-exact and
-  a long_ad naming a foreign `partition_ref` is refused
+  (recorded ≠ information) is rejected `Unsupported`; end-to-end, a
+  synthetic-image file recorded through a two-block long_ad reads
+  back byte-exact and a long_ad naming a foreign `partition_ref` is
+  refused (`tests/udf_minimal_image.rs`).
+- AED continuation chains (§14.5 / §12): a type-3 AD terminates its
+  field (a trailing AD after it is not consumed) and surfaces through
+  `FileEntry::continuation` for all three flavours (short_ad with
+  implied partition; ext_ad pointer exempt from the compressed-extent
+  check); the 24-byte AED header round-trips and a non-258 tag is
+  rejected; end-to-end, a synthetic-image file whose AD field chains
+  through an AED block reads back byte-exact across both extents, and
+  a cyclic AED chain (an AED pointing at itself) is refused
+  `Malformed` by the depth cap instead of looping
   (`tests/udf_minimal_image.rs`).
 - ExtendedFileEntry (Tag 266 / §14.17) parsing: an embedded-directory
   EFE with non-trivial `object_size`, a single-extent EFE pointing at

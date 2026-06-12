@@ -22,6 +22,14 @@
 //!   `Information Length` (a compressed extent, §14.14.3 Note 46) is
 //!   refused. The file walk refuses any extent with
 //!   `extent_type != 0` (recorded + allocated).
+//! - Allocation Extent Descriptor continuation chains (§14.5 / §12
+//!   figure 7): an allocation descriptor with `extent_type == 3`
+//!   terminates its field (§12) and names the extent holding the next
+//!   AED (Tag 258) + further descriptors; [`UdfDisc::read_file_entry`]
+//!   follows the chain (depth-capped) so [`FileEntry::extents`] sees
+//!   the full flattened sequence. [`FileEntry::parse`] alone (no
+//!   reader) surfaces the unresolved pointer via
+//!   [`FileEntry::continuation`].
 //!
 //! ## What's not implemented (Phase 1 — surface `Unsupported`)
 //!
@@ -29,7 +37,6 @@
 //! - ICB strategy types other than 4 (the spec's "default" linear).
 //! - Extended Attributes / Symbolic Links / Streams.
 //! - Sparse / sequential files.
-//! - Allocation Extent Descriptors (§14.5).
 //! - UDF 1.50 or earlier (we look at the LVD identifier suffix).
 //!
 //! ## ExtendedFileEntry (§14.17)
@@ -420,6 +427,85 @@ pub struct AllocExtent {
     /// recorded on is implied, §14.14.1.2); `Some(ref)` for long /
     /// extended ADs whose `lb_addr` names a partition explicitly.
     pub partition_ref: Option<u16>,
+}
+
+/// Pointer to a continuation extent of allocation descriptors — an
+/// allocation descriptor whose extent type is 3 ("the extent is the
+/// next extent of allocation descriptors", §14.14.1.1 figure 42).
+/// Per §12 such a descriptor *terminates* the field it appears in;
+/// the named extent is recorded per figure 7 as an Allocation Extent
+/// Descriptor (§14.5) followed by one or more further allocation
+/// descriptors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdContinuation {
+    /// 30-bit Extent Length, in bytes, of the continuation extent.
+    pub length: u32,
+    /// Logical block number of the continuation extent within its
+    /// partition.
+    pub block: u32,
+    /// `None` when the pointer came from a short_ad (partition
+    /// implied, §14.14.1.2); `Some(ref)` for long / extended ADs.
+    pub partition_ref: Option<u16>,
+}
+
+// ─────────────────────── Allocation Extent Descriptor (§14.5) ───────────────────────
+
+/// Allocation Extent Descriptor (§14.5, Tag 258) — the 24-byte header
+/// at the start of a continuation extent of allocation descriptors:
+///
+/// ```text
+///   0  Descriptor Tag                        tag (Tag = 258)
+///  16  Previous Allocation Extent Location   u32 LE  (§14.5.2)
+///  20  Length of Allocation Descriptors      u32 LE  (= L_AD, §14.5.3)
+/// ```
+///
+/// The continued allocation descriptors follow immediately at BP 24.
+#[derive(Debug, Clone, Copy)]
+pub struct AllocationExtentDescriptor {
+    pub tag: DescriptorTag,
+    /// Address, within the partition the descriptor is recorded on, of
+    /// the previous allocation extent (0-length ⇒ unspecified, §14.5.2).
+    pub previous_allocation_extent_location: u32,
+    /// Length, in bytes, of the allocation descriptors recorded after
+    /// this descriptor (§14.5.3).
+    pub length_of_allocation_descriptors: u32,
+}
+
+impl AllocationExtentDescriptor {
+    /// Header size in bytes; the continued ADs start here.
+    pub const HEADER_SIZE: usize = 24;
+
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::HEADER_SIZE {
+            return Err(BlurayError::malformed("AED truncated"));
+        }
+        let tag = DescriptorTag::parse(bytes)?;
+        if tag.id != TagId::AllocationExtent {
+            return Err(BlurayError::malformed(format!(
+                "expected AED tag (258), got {:?}",
+                tag.id
+            )));
+        }
+        Ok(Self {
+            tag,
+            previous_allocation_extent_location: u32::from_le_bytes([
+                bytes[16], bytes[17], bytes[18], bytes[19],
+            ]),
+            length_of_allocation_descriptors: u32::from_le_bytes([
+                bytes[20], bytes[21], bytes[22], bytes[23],
+            ]),
+        })
+    }
+
+    /// Encode the 24-byte AED header (the tag's checksum is recomputed
+    /// by [`DescriptorTag::encode`]).
+    pub fn encode(&self) -> [u8; Self::HEADER_SIZE] {
+        let mut out = [0u8; Self::HEADER_SIZE];
+        out[0..16].copy_from_slice(&self.tag.encode());
+        out[16..20].copy_from_slice(&self.previous_allocation_extent_location.to_le_bytes());
+        out[20..24].copy_from_slice(&self.length_of_allocation_descriptors.to_le_bytes());
+        out
+    }
 }
 
 // ─────────────────────── d-string / OSTA compressed unicode ───────────────────────
@@ -820,6 +906,95 @@ pub struct FileEntry {
     /// directory listing or a tiny file).
     pub embedded_data: Vec<u8>,
     pub ad_type: AdType,
+    /// Unresolved pointer to a continuation extent of allocation
+    /// descriptors (§12 / §14.5), when the in-entry AD field ended in
+    /// an `extent_type == 3` descriptor. [`UdfDisc::read_file_entry`]
+    /// follows the chain and leaves this `None`; it stays `Some` only
+    /// when [`FileEntry::parse`] is called without a disc reader, in
+    /// which case [`Self::extents`] is incomplete.
+    pub continuation: Option<AdContinuation>,
+}
+
+/// Parse a field of allocation descriptors of one flavour (§14.14),
+/// appending parsed descriptors to the matching vector. Stops at the
+/// end of the field, at a descriptor whose Extent Length is 0, or at
+/// an `extent_type == 3` continuation pointer (§12) — in the last
+/// case the pointer is returned and nothing after it is consumed.
+fn parse_ad_area(
+    ad_type: AdType,
+    area: &[u8],
+    short_ads: &mut Vec<ShortAd>,
+    long_ads: &mut Vec<LongAd>,
+    ext_ads: &mut Vec<ExtAd>,
+) -> Result<Option<AdContinuation>> {
+    match ad_type {
+        AdType::Short => {
+            let mut o = 0;
+            while o + ShortAd::SIZE <= area.len() {
+                let ad = ShortAd::parse(&area[o..o + ShortAd::SIZE])?;
+                if ad.length == 0 {
+                    break;
+                }
+                if ad.extent_type == 3 {
+                    return Ok(Some(AdContinuation {
+                        length: ad.length,
+                        block: ad.block_location,
+                        partition_ref: None,
+                    }));
+                }
+                short_ads.push(ad);
+                o += ShortAd::SIZE;
+            }
+        }
+        AdType::Long => {
+            let mut o = 0;
+            while o + LongAd::SIZE <= area.len() {
+                let ad = LongAd::parse(&area[o..o + LongAd::SIZE])?;
+                if ad.length == 0 {
+                    break;
+                }
+                if ad.extent_type == 3 {
+                    return Ok(Some(AdContinuation {
+                        length: ad.length,
+                        block: ad.location.block,
+                        partition_ref: Some(ad.location.partition_ref),
+                    }));
+                }
+                long_ads.push(ad);
+                o += LongAd::SIZE;
+            }
+        }
+        AdType::Extended => {
+            let mut o = 0;
+            while o + ExtAd::SIZE <= area.len() {
+                let ad = ExtAd::parse(&area[o..o + ExtAd::SIZE])?;
+                if ad.length == 0 {
+                    break;
+                }
+                if ad.extent_type == 3 {
+                    // A continuation pointer carries no file data —
+                    // the compressed-extent check below does not apply.
+                    return Ok(Some(AdContinuation {
+                        length: ad.length,
+                        block: ad.location.block,
+                        partition_ref: Some(ad.location.partition_ref),
+                    }));
+                }
+                if ad.recorded_length != ad.information_length {
+                    // §14.14.3 Note 46: a Recorded Length that differs
+                    // from the Information Length signals a compressed
+                    // extent — we have no way to decode it.
+                    return Err(BlurayError::unsupported(
+                        "compressed ext_ad extent (recorded != information length)",
+                    ));
+                }
+                ext_ads.push(ad);
+                o += ExtAd::SIZE;
+            }
+        }
+        AdType::EmbeddedInIcb => unreachable!("embedded data is not an AD sequence"),
+    }
+    Ok(None)
 }
 
 impl FileEntry {
@@ -924,67 +1099,18 @@ impl FileEntry {
         let mut long_ads = Vec::new();
         let mut ext_ads = Vec::new();
         let mut embedded_data = Vec::new();
-        match ad_type {
-            AdType::Short => {
-                let mut o = 0;
-                while o + ShortAd::SIZE <= l_ad as usize {
-                    let ad = ShortAd::parse(&bytes[ad_off + o..ad_off + o + ShortAd::SIZE])?;
-                    if ad.length == 0 {
-                        break;
-                    }
-                    if ad.extent_type == 3 {
-                        return Err(BlurayError::unsupported(
-                            "Allocation Extent Descriptor continuation",
-                        ));
-                    }
-                    short_ads.push(ad);
-                    o += ShortAd::SIZE;
-                }
-            }
-            AdType::Long => {
-                let mut o = 0;
-                while o + LongAd::SIZE <= l_ad as usize {
-                    let ad = LongAd::parse(&bytes[ad_off + o..ad_off + o + LongAd::SIZE])?;
-                    if ad.length == 0 {
-                        break;
-                    }
-                    if ad.extent_type == 3 {
-                        return Err(BlurayError::unsupported(
-                            "Allocation Extent Descriptor continuation",
-                        ));
-                    }
-                    long_ads.push(ad);
-                    o += LongAd::SIZE;
-                }
-            }
-            AdType::Extended => {
-                let mut o = 0;
-                while o + ExtAd::SIZE <= l_ad as usize {
-                    let ad = ExtAd::parse(&bytes[ad_off + o..ad_off + o + ExtAd::SIZE])?;
-                    if ad.length == 0 {
-                        break;
-                    }
-                    if ad.extent_type == 3 {
-                        return Err(BlurayError::unsupported(
-                            "Allocation Extent Descriptor continuation",
-                        ));
-                    }
-                    if ad.recorded_length != ad.information_length {
-                        // §14.14.3 Note 46: a Recorded Length that differs
-                        // from the Information Length signals a compressed
-                        // extent — we have no way to decode it.
-                        return Err(BlurayError::unsupported(
-                            "compressed ext_ad extent (recorded != information length)",
-                        ));
-                    }
-                    ext_ads.push(ad);
-                    o += ExtAd::SIZE;
-                }
-            }
-            AdType::EmbeddedInIcb => {
-                embedded_data.extend_from_slice(&bytes[ad_off..ad_end]);
-            }
-        }
+        let continuation = if ad_type == AdType::EmbeddedInIcb {
+            embedded_data.extend_from_slice(&bytes[ad_off..ad_end]);
+            None
+        } else {
+            parse_ad_area(
+                ad_type,
+                &bytes[ad_off..ad_end],
+                &mut short_ads,
+                &mut long_ads,
+                &mut ext_ads,
+            )?
+        };
 
         Ok(Self {
             tag,
@@ -1006,12 +1132,16 @@ impl FileEntry {
             ext_ads,
             embedded_data,
             ad_type,
+            continuation,
         })
     }
 
     /// The allocation extents normalised across the AD flavour this
     /// File Entry recorded (§14.14). Empty when
     /// `ad_type == EmbeddedInIcb` — use [`Self::embedded_data`].
+    /// Incomplete while [`Self::continuation`] is `Some` (an
+    /// unresolved §14.5 AED chain — resolved automatically when the
+    /// entry came through [`UdfDisc::read_file_entry`]).
     pub fn extents(&self) -> Vec<AllocExtent> {
         match self.ad_type {
             AdType::Short => self
@@ -1122,6 +1252,16 @@ impl<R: Read + Seek> std::fmt::Debug for UdfDisc<R> {
 }
 
 impl<R: Read + Seek> UdfDisc<R> {
+    /// Maximum number of chained continuation extents of allocation
+    /// descriptors (§12) followed per File Entry. ECMA-167 places no
+    /// bound; the cap exists to refuse a cyclic chain on a hostile /
+    /// corrupt image rather than loop forever.
+    const MAX_AED_CHAIN: usize = 32;
+    /// Maximum accepted byte length of one continuation extent. Real
+    /// volumes record a single logical block; the 30-bit Extent Length
+    /// field could otherwise demand a ~1 GiB materialisation.
+    const MAX_AED_EXTENT_BYTES: usize = 1 << 20;
+
     /// Mount the volume. Reads the AVDP, the Volume Descriptor
     /// Sequence (PVD + LVD + PD), and the File Set Descriptor.
     pub fn open(mut reader: R) -> Result<Self> {
@@ -1197,13 +1337,78 @@ impl<R: Read + Seek> UdfDisc<R> {
         read_sector_into_vec(&mut self.reader, sec)
     }
 
-    /// Read the File Entry at the given partition ICB.
+    /// Read the File Entry at the given partition ICB, following any
+    /// Allocation Extent Descriptor continuation chain (§14.5) so the
+    /// returned entry's [`FileEntry::extents`] is complete.
     fn read_file_entry(&mut self, icb: LongAd) -> Result<FileEntry> {
         if icb.length == 0 {
             return Err(BlurayError::malformed("FE ICB length 0"));
         }
         let buf = self.read_partition_block(icb.location.block as u64)?;
-        FileEntry::parse(&buf)
+        let mut fe = FileEntry::parse(&buf)?;
+        self.resolve_ad_continuations(&mut fe)?;
+        Ok(fe)
+    }
+
+    /// Follow the chain of continuation extents of allocation
+    /// descriptors (§12 figure 7): each is an Allocation Extent
+    /// Descriptor (§14.5) followed by `L_AD` bytes of further
+    /// descriptors of the File Entry's AD flavour, possibly ending in
+    /// another `extent_type == 3` pointer. Parsed extents are appended
+    /// to the entry's AD vectors; on success `fe.continuation` is
+    /// `None`. The walk is depth-capped (a cycle of AEDs would
+    /// otherwise loop forever) and each continuation extent is bounded
+    /// to [`Self::MAX_AED_EXTENT_BYTES`].
+    fn resolve_ad_continuations(&mut self, fe: &mut FileEntry) -> Result<()> {
+        let mut depth = 0usize;
+        while let Some(cont) = fe.continuation.take() {
+            depth += 1;
+            if depth > Self::MAX_AED_CHAIN {
+                return Err(BlurayError::malformed(
+                    "AED continuation chain exceeds depth cap (cyclic chain?)",
+                ));
+            }
+            if let Some(p) = cont.partition_ref {
+                if p != self.partition_number {
+                    return Err(BlurayError::unsupported(
+                        "AED continuation references a different partition",
+                    ));
+                }
+            }
+            let len = cont.length as usize;
+            if len < AllocationExtentDescriptor::HEADER_SIZE {
+                return Err(BlurayError::malformed(
+                    "AED continuation extent shorter than the AED header",
+                ));
+            }
+            if len > Self::MAX_AED_EXTENT_BYTES {
+                return Err(BlurayError::unsupported(
+                    "oversized AED continuation extent",
+                ));
+            }
+            let blocks = (cont.length as u64).div_ceil(SECTOR_SIZE);
+            let mut buf = Vec::with_capacity((blocks * SECTOR_SIZE) as usize);
+            for i in 0..blocks {
+                buf.extend_from_slice(&self.read_partition_block(cont.block as u64 + i)?);
+            }
+            let aed = AllocationExtentDescriptor::parse(&buf)?;
+            let ad_end = AllocationExtentDescriptor::HEADER_SIZE
+                + aed.length_of_allocation_descriptors as usize;
+            if ad_end > len {
+                return Err(BlurayError::malformed(
+                    "AED allocation area overruns its continuation extent",
+                ));
+            }
+            let area = &buf[AllocationExtentDescriptor::HEADER_SIZE..ad_end];
+            fe.continuation = parse_ad_area(
+                fe.ad_type,
+                area,
+                &mut fe.short_ads,
+                &mut fe.long_ads,
+                &mut fe.ext_ads,
+            )?;
+        }
+        Ok(())
     }
 
     /// Read the full content of a file, materialised into a `Vec<u8>`.
@@ -1744,10 +1949,22 @@ mod tests {
     }
 
     #[test]
-    fn file_entry_long_ad_continuation_rejected() {
-        // extent_type 3 = next extent of allocation descriptors
-        // (Allocation Extent Descriptor chain) → Unsupported.
-        let ad = LongAd {
+    fn file_entry_long_ad_continuation_surfaced_and_terminates_field() {
+        // extent_type 3 = "the extent is the next extent of allocation
+        // descriptors" (§14.14.1.1 figure 42). Per §12 it terminates
+        // the field: the data AD before it is kept, the pointer is
+        // surfaced via `continuation`, and an AD recorded *after* it
+        // must not be consumed.
+        let data = LongAd {
+            length: 4096,
+            extent_type: 0,
+            location: LbAddr {
+                block: 10,
+                partition_ref: 0,
+            },
+            implementation_use: [0u8; 6],
+        };
+        let cont = LongAd {
             length: 2048,
             extent_type: 3,
             location: LbAddr {
@@ -1756,9 +1973,116 @@ mod tests {
             },
             implementation_use: [0u8; 6],
         };
+        let trailing = LongAd {
+            length: 1024,
+            extent_type: 0,
+            location: LbAddr {
+                block: 7,
+                partition_ref: 0,
+            },
+            implementation_use: [0u8; 6],
+        };
+        let ads: Vec<u8> = [data, cont, trailing]
+            .iter()
+            .flat_map(|ad| ad.encode())
+            .collect();
+        let fe = FileEntry::parse(&build_plain_fe_with_ads(1, 4096, &ads)).unwrap();
+        assert_eq!(fe.long_ads.len(), 1);
+        assert_eq!(fe.long_ads[0].location.block, 10);
+        assert_eq!(
+            fe.continuation,
+            Some(AdContinuation {
+                length: 2048,
+                block: 99,
+                partition_ref: Some(0),
+            })
+        );
+    }
+
+    #[test]
+    fn file_entry_short_ad_continuation_has_implied_partition() {
+        // A short_ad continuation pointer carries no partition_ref —
+        // the partition the descriptor is recorded on is implied
+        // (§14.14.1.2).
+        let cont = ShortAd {
+            length: 2048,
+            extent_type: 3,
+            block_location: 55,
+        };
+        let fe = FileEntry::parse(&build_plain_fe_with_ads(0, 0, &cont.encode())).unwrap();
+        assert!(fe.short_ads.is_empty());
+        assert_eq!(
+            fe.continuation,
+            Some(AdContinuation {
+                length: 2048,
+                block: 55,
+                partition_ref: None,
+            })
+        );
+    }
+
+    #[test]
+    fn ext_ad_continuation_skips_compressed_extent_check() {
+        // A continuation ext_ad carries no file data; the §14.14.3
+        // Note 46 compressed-extent refusal (recorded != information)
+        // must not apply to the pointer itself.
+        let cont = ExtAd {
+            length: 2048,
+            extent_type: 3,
+            recorded_length: 0,
+            information_length: 0xDEAD,
+            location: LbAddr {
+                block: 31,
+                partition_ref: 0,
+            },
+            implementation_use: [0u8; 2],
+        };
+        let fe = FileEntry::parse(&build_plain_fe_with_ads(2, 0, &cont.encode())).unwrap();
+        assert!(fe.ext_ads.is_empty());
+        assert_eq!(
+            fe.continuation,
+            Some(AdContinuation {
+                length: 2048,
+                block: 31,
+                partition_ref: Some(0),
+            })
+        );
+    }
+
+    #[test]
+    fn aed_header_round_trip_and_tag_check() {
+        let aed = AllocationExtentDescriptor {
+            tag: DescriptorTag {
+                id: TagId::AllocationExtent,
+                descriptor_version: 3,
+                serial_number: 1,
+                crc: 0,
+                crc_length: 8,
+                location: 99,
+            },
+            previous_allocation_extent_location: 12,
+            length_of_allocation_descriptors: 32,
+        };
+        let bytes = aed.encode();
+        let parsed = AllocationExtentDescriptor::parse(&bytes).unwrap();
+        assert_eq!(parsed.previous_allocation_extent_location, 12);
+        assert_eq!(parsed.length_of_allocation_descriptors, 32);
+        assert_eq!(parsed.tag.location, 99);
+
+        // A non-258 tag in the continuation extent is malformed.
+        let fe_tag = DescriptorTag {
+            id: TagId::FileEntry,
+            descriptor_version: 3,
+            serial_number: 1,
+            crc: 0,
+            crc_length: 8,
+            location: 99,
+        };
+        let mut wrong = [0u8; AllocationExtentDescriptor::HEADER_SIZE];
+        wrong[0..16].copy_from_slice(&fe_tag.encode());
         assert!(matches!(
-            FileEntry::parse(&build_plain_fe_with_ads(1, 0, &ad.encode())),
-            Err(BlurayError::Unsupported(_))
+            AllocationExtentDescriptor::parse(&wrong),
+            Err(BlurayError::Malformed(_))
         ));
     }
 

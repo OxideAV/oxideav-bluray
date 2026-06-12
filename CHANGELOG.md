@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Allocation Extent Descriptor continuation chains (ECMA-167 §14.5 /
+  §12 figure 7)** — an allocation descriptor whose §14.14.1.1 extent
+  type is 3 ("the extent is the next extent of allocation
+  descriptors") previously made `FileEntry::parse` bail `Unsupported`.
+  The pointer now terminates its AD field per §12 (a descriptor
+  recorded after it is not consumed) and is surfaced as
+  `FileEntry::continuation: Option<AdContinuation>` (length / block /
+  optional partition_ref — `None` for the short_ad flavour whose
+  partition is implied per §14.14.1.2; the ext_ad flavour is exempt
+  from the §14.14.3 Note 46 compressed-extent check since the pointer
+  carries no file data). `UdfDisc::read_file_entry` resolves the
+  chain: each continuation extent starts with an Allocation Extent
+  Descriptor (new `AllocationExtentDescriptor` parse/encode — Tag 258,
+  Previous Allocation Extent Location §14.5.2, L_AD §14.5.3) followed
+  by `L_AD` bytes of further descriptors of the File Entry's flavour,
+  appended to the entry's AD vectors so `FileEntry::extents()` sees
+  the full flattened sequence. The walk is depth-capped at 32 (a
+  cyclic chain is refused `Malformed` instead of looping forever),
+  refuses a continuation extent shorter than the 24-byte AED header
+  or larger than 1 MiB, and keeps the cross-partition refusal. The
+  per-flavour AD field parser is factored out of `FileEntry::parse`
+  so the in-entry field and every AED body decode identically. 6 new
+  tests: continuation surfaced + field-terminated for long_ad,
+  implied-partition short_ad pointer, compressed-check-exempt ext_ad
+  pointer, AED header round-trip + wrong-tag rejection, plus two
+  synthetic-image end-to-end cases (a file whose AD field chains
+  through an AED block reads back byte-exact across both extents, and
+  a self-pointing cyclic AED chain refused `Malformed`).
 - **Long + Extended Allocation Descriptors in File Entries (ECMA-167
   §14.14.2 / §14.14.3)** — the UDF File Entry allocation walk
   previously refused any ICB-tag ad-type other than short_ad /
