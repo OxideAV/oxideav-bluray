@@ -593,6 +593,13 @@ impl AnchorVolumeDescriptorPointer {
                 tag.id
             )));
         }
+        // §10.2: tag (16) + main extent_ad (8) + reserve extent_ad (8) =
+        // 32 bytes minimum. A buffer that passes the 16-byte tag checksum
+        // but is shorter than 32 bytes would otherwise panic on the
+        // fixed-offset slices below.
+        if bytes.len() < 32 {
+            return Err(BlurayError::malformed("AVDP truncated"));
+        }
         let main = ExtentAd::parse(&bytes[16..24])?;
         let reserve = ExtentAd::parse(&bytes[24..32])?;
         Ok(Self {
@@ -1583,6 +1590,27 @@ mod tests {
         bytes[12] ^= 0xFF;
         assert!(matches!(
             DescriptorTag::parse(&bytes),
+            Err(BlurayError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn avdp_truncated_after_valid_tag_is_rejected() {
+        // A 16-byte buffer carrying a valid AVDP descriptor tag (so the
+        // §7.2.3 checksum passes) but no room for the two extent_ad
+        // fields at BP 16/24. Must report malformed, not panic on the
+        // fixed-offset slices. (Regression: r296 fuzz finding.)
+        let tag = DescriptorTag {
+            id: TagId::AnchorVolumeDescriptorPointer,
+            descriptor_version: 3,
+            serial_number: 0,
+            crc: 0,
+            crc_length: 0,
+            location: 256,
+        };
+        let bytes = tag.encode(); // exactly 16 bytes
+        assert!(matches!(
+            AnchorVolumeDescriptorPointer::parse(&bytes),
             Err(BlurayError::Malformed(_))
         ));
     }

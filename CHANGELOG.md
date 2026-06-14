@@ -393,6 +393,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decode_lang_code` (sentinel rejection, non-ASCII rejection,
   lowercasing) and `class_order` (matches §5.4.4.4 declaration order).
 
+- **`cargo-fuzz` harness over the UDF / ECMA-167 descriptor parsers**
+  (`fuzz/fuzz_targets/udf_descriptors.rs`) — a libFuzzer target that
+  multiplexes every public `oxideav_bluray::udf` `parse(&[u8])` entry
+  point (descriptor tag, the §7.1/§14.14 allocation descriptors, the
+  §14.5 Allocation Extent Descriptor, the §10 volume descriptors, the
+  §14 File Set / File Identifier / File Entry / ICB Tag, and the OSTA
+  §2.1.3 d-string decoders) behind a one-byte selector. ~31M
+  executions crash-free. Built against the crate with
+  `default-features = false` so the fuzz binary pulls in only the
+  parser code.
+
+### Fixed
+
+- **`AnchorVolumeDescriptorPointer::parse` panic on a checksum-valid
+  but truncated buffer** (ECMA-167 §10.2) — the parser read its two
+  fixed-offset `extent_ad` fields at BP 16/24 without first checking
+  the buffer held the full 32-byte descriptor, so a 16-byte slice
+  carrying a valid AVDP descriptor tag (passing the §7.2.3 checksum)
+  panicked on the slice instead of returning an error. It now reports
+  `Malformed` for any buffer shorter than 32 bytes. Found by the new
+  `udf_descriptors` fuzz target; covered by regression test
+  `avdp_truncated_after_valid_tag_is_rejected`.
+
 ### Changed
 
 - **Tempdir helpers across `tests/` now use an atomic monotonic counter

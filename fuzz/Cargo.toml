@@ -1,0 +1,42 @@
+[package]
+name = "oxideav-bluray-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Coverage-guided harness over the UDF / ECMA-167 descriptor parsers in
+# `oxideav_bluray::udf`. Every entry point under test is a
+# `parse(&[u8]) -> Result<_>` that must return `Ok(_)` or
+# `Err(BlurayError)` for ANY byte slice — never panic, never overflow in
+# debug, never index out of bounds. The single `udf_descriptors` target
+# multiplexes the whole descriptor surface (tag, allocation descriptors,
+# volume descriptors, file-set / file-identifier / file-entry, and the
+# OSTA d-string decoders) behind a one-byte selector so cargo-fuzz can
+# minimise a shared corpus across all of them.
+#
+# The lib is built with `default-features = false` so the fuzz target
+# pulls in only the parser code — no `oxideav-core` registry plumbing,
+# no AACS / optical-drive dependency tree.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-bluray]
+path = ".."
+default-features = false
+
+# Keep the cargo-fuzz crate out of the umbrella workspace resolve graph;
+# libfuzzer-sys needs nightly and carries its own deps.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "udf_descriptors"
+path = "fuzz_targets/udf_descriptors.rs"
+test = false
+doc = false

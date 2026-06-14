@@ -326,6 +326,31 @@ Blu-ray discs and references no real titles. Test categories:
   the first flagged row at-or-after the current output position; a
   title with no flagged rows returns `NotFound` from `switch_angle`.
 
+## Fuzzing
+
+`fuzz/` carries a `cargo-fuzz` (libFuzzer) harness. The
+`udf_descriptors` target multiplexes every public
+`oxideav_bluray::udf` descriptor parser behind a one-byte selector —
+`DescriptorTag`, the §7.1/§14.14 allocation descriptors (`extent_ad`,
+`short_ad`, `long_ad`, `ext_ad`, `lb_addr`), the §14.5 Allocation
+Extent Descriptor, the §10 volume descriptors (AVDP / PVD / PD / LVD),
+the §14 File Set / File Identifier / File Entry / ICB Tag, and the
+OSTA §2.1.3 d-string decoders — so a single corpus exercises the whole
+parser surface. The contract is that any byte slice yields `Ok(_)` or
+`Err(BlurayError)` and never panics, overflows, or indexes out of
+bounds. Built against the crate with `default-features = false` (no
+registry / AACS deps). Run with:
+
+```sh
+cargo +nightly fuzz run udf_descriptors
+```
+
+Round 296 ran ~31M executions crash-free and fixed one reachable
+panic: `AnchorVolumeDescriptorPointer::parse` sliced its two
+fixed-offset `extent_ad` fields without a length check, so a 16-byte
+buffer carrying a checksum-valid AVDP tag panicked; it now reports
+`Malformed` (regression test `avdp_truncated_after_valid_tag_is_rejected`).
+
 ## Clean-room references
 
 Only these documents are consulted; no `libbluray` / `libudf` /
