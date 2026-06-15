@@ -33,6 +33,9 @@
 //!   raw bytes.
 
 use crate::bdmv::common::{BdmvHeader, Reader};
+use crate::bdmv::mpls::{
+    AspectRatio, AudioFormat, FrameRate, SampleRate, StreamCodingType, VideoFormat,
+};
 use crate::error::{BlurayError, Result};
 
 /// ClipInfo section (§5.5.4.1) — single fixed block.
@@ -72,16 +75,91 @@ pub struct SequenceInfo {
     pub atc_sequences: Vec<AtcSequence>,
 }
 
-/// One elementary stream entry inside ProgramInfo.
+/// One elementary stream entry inside ProgramInfo, decoded from the
+/// CLPI `stream_coding_info()` block (BD-ROM Part 3 §5.5.4.3). This is
+/// the *same* `stream_coding_info()` structure the MPLS STN_table
+/// carries per stream (§5.4.4.4): a length-prefixed body whose first
+/// byte is `stream_coding_type`, followed — for video / audio — by the
+/// packed attribute nibbles, and — for audio / graphics — by the
+/// 3-byte ISO 639-2/T language tag. The CLPI parser reads every byte
+/// inside the recorded `sc_len`, so the attributes that the MPLS
+/// STN_table surface already exposes are now available off the clip's
+/// own ProgramInfo without needing a matching `.mpls` open.
+///
+/// `format_info_byte` is preserved verbatim for back-compat: it packs
+/// `video_format` (high nibble) / `frame_rate` (low nibble) for video,
+/// or `audio_presentation_type` (high nibble) / `sampling_frequency`
+/// (low nibble) for audio — exactly the byte the typed accessors below
+/// decode. For PG / IG / text-subtitle streams the byte is reserved
+/// (zero) and the language tag carries the meaningful payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamCodingInfo {
     pub pid: u16,
     pub stream_coding_type: u8,
     /// 4-bit video_format / 4-bit frame_rate (for video) or
     /// 4-bit audio_presentation_type / 4-bit sampling_frequency (for
-    /// audio). Decoded into the raw byte; per-codec interpretation is
-    /// the caller's job.
+    /// audio). Preserved as the raw wire byte; use the typed accessors
+    /// for a decoded view.
     pub format_info_byte: u8,
+    /// 4-bit `aspect_ratio` nibble (high nibble of the byte after
+    /// `format_info_byte`) for a video stream; `0` for non-video.
+    pub aspect_ratio_nibble: u8,
+    /// 3-byte ISO 639-2/T language tag for an audio / PG / IG / text
+    /// stream; all-zero for video (which carries no language field).
+    pub language_code: [u8; 3],
+}
+
+impl StreamCodingInfo {
+    /// Typed view of the 8-bit `stream_coding_type` (the canonical PMT
+    /// `stream_type` for video, BDA-private codes for audio / graphics).
+    pub fn coding_type(&self) -> StreamCodingType {
+        StreamCodingType::from_raw(self.stream_coding_type)
+    }
+
+    /// `video_format` (resolution / scan) for a video stream — the high
+    /// nibble of `format_info_byte`. Meaningless for non-video streams.
+    pub fn video_format_kind(&self) -> VideoFormat {
+        VideoFormat::from_raw(self.format_info_byte >> 4)
+    }
+
+    /// `frame_rate` for a video stream — the low nibble of
+    /// `format_info_byte`.
+    pub fn frame_rate_kind(&self) -> FrameRate {
+        FrameRate::from_raw(self.format_info_byte & 0x0F)
+    }
+
+    /// `aspect_ratio` for a video stream — the high nibble of the byte
+    /// following `format_info_byte`.
+    pub fn aspect_ratio_kind(&self) -> AspectRatio {
+        AspectRatio::from_raw(self.aspect_ratio_nibble)
+    }
+
+    /// `audio_presentation_type` (channel layout) for an audio stream —
+    /// the high nibble of `format_info_byte`.
+    pub fn audio_format_kind(&self) -> AudioFormat {
+        AudioFormat::from_raw(self.format_info_byte >> 4)
+    }
+
+    /// `sampling_frequency` for an audio stream — the low nibble of
+    /// `format_info_byte`.
+    pub fn sample_rate_kind(&self) -> SampleRate {
+        SampleRate::from_raw(self.format_info_byte & 0x0F)
+    }
+
+    /// The 3-byte ISO 639-2/T language tag as a lowercased `String`
+    /// (e.g. `"eng"`), or `None` when the field is all-zero (a video
+    /// stream, or an audio / graphics stream with no recorded tag).
+    pub fn language(&self) -> Option<String> {
+        if self.language_code == [0, 0, 0] {
+            return None;
+        }
+        Some(
+            self.language_code
+                .iter()
+                .map(|&b| (b as char).to_ascii_lowercase())
+                .collect(),
+        )
+    }
 }
 
 /// One program inside ProgramInfo (§5.5.4.3).
@@ -467,17 +545,42 @@ impl ClipInformation {
             let mut streams = Vec::with_capacity(num_streams);
             for _ in 0..num_streams {
                 let pid = r.read_u16()?;
-                // length + body for stream_coding_info
+                // length + body for stream_coding_info (§5.5.4.3 — the
+                // same length-prefixed structure the MPLS STN_table
+                // carries per stream).
                 let sc_len = r.read_u8()? as usize;
                 let sc_start = r.pos;
-                let stream_coding_type = r.read_u8()?;
-                let format_info_byte = r.read_u8()?;
+                let sc_end = sc_start
+                    .checked_add(sc_len)
+                    .ok_or_else(|| BlurayError::malformed("stream_coding_info length overflow"))?;
+                if sc_end > buf.len() {
+                    return Err(BlurayError::malformed("stream_coding_info length past EOF"));
+                }
+                let stream_coding_type = if r.pos < sc_end { r.read_u8()? } else { 0 };
+                let format_info_byte = if r.pos < sc_end { r.read_u8()? } else { 0 };
+                let coding = StreamCodingType::from_raw(stream_coding_type);
+                // Video carries an aspect_ratio nibble after the
+                // format byte; audio / graphics carry a 3-byte language
+                // tag instead. Both stay inside the recorded `sc_len`
+                // body, so a stream that ships neither (a short body)
+                // simply leaves the extras at their defaults.
+                let mut aspect_ratio_nibble = 0u8;
+                let mut language_code = [0u8; 3];
+                if coding.is_video() {
+                    if r.pos < sc_end {
+                        aspect_ratio_nibble = (r.read_u8()? >> 4) & 0x0F;
+                    }
+                } else if r.pos + 3 <= sc_end {
+                    language_code.copy_from_slice(r.slice(3)?);
+                }
                 streams.push(StreamCodingInfo {
                     pid,
                     stream_coding_type,
                     format_info_byte,
+                    aspect_ratio_nibble,
+                    language_code,
                 });
-                r.seek(sc_start + sc_len)?;
+                r.seek(sc_end)?;
             }
             programs.push(ProgramEntry {
                 spn_program_sequence_start,
@@ -580,10 +683,18 @@ impl ClipInformation {
             out.push(0); // 1 reserved
             for s in &prog.streams {
                 out.extend_from_slice(&s.pid.to_be_bytes());
-                // sc_len = 2 (type + format byte)
-                out.push(2);
-                out.push(s.stream_coding_type);
-                out.push(s.format_info_byte);
+                // stream_coding_info body: type + format byte, then a
+                // video aspect_ratio nibble or an audio / graphics
+                // 3-byte language tag (matching the parse split on
+                // `coding_type().is_video()`).
+                let mut body = vec![s.stream_coding_type, s.format_info_byte];
+                if s.coding_type().is_video() {
+                    body.push((s.aspect_ratio_nibble << 4) & 0xF0);
+                } else if s.language_code != [0, 0, 0] {
+                    body.extend_from_slice(&s.language_code);
+                }
+                out.push(body.len() as u8);
+                out.extend_from_slice(&body);
             }
         }
         let prog_body_len = (out.len() - prog_body_start) as u32;
@@ -1051,11 +1162,15 @@ mod tests {
                             pid: 0x1011,
                             stream_coding_type: 0x1B, // H.264
                             format_info_byte: 0x64,   // 1080p / 29.97
+                            aspect_ratio_nibble: 0x3, // 16:9
+                            language_code: [0, 0, 0],
                         },
                         StreamCodingInfo {
                             pid: 0x1100,
                             stream_coding_type: 0x80, // LPCM
-                            format_info_byte: 0x33,
+                            format_info_byte: 0x61,   // Multi 5.1 / 48k
+                            aspect_ratio_nibble: 0,
+                            language_code: *b"eng",
                         },
                     ],
                 }],
@@ -1082,6 +1197,64 @@ mod tests {
         let mut bytes = sample_clpi().encode();
         bytes[0] = b'X';
         assert!(ClipInformation::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn stream_coding_info_typed_video_accessors() {
+        let parsed = ClipInformation::parse(&sample_clpi().encode()).unwrap();
+        let video = &parsed.program_info.programs[0].streams[0];
+        assert_eq!(video.coding_type(), StreamCodingType::AvcVideo);
+        assert!(video.coding_type().is_video());
+        assert_eq!(video.video_format_kind(), VideoFormat::Video1080p);
+        assert_eq!(video.frame_rate_kind(), FrameRate::Fps29_97);
+        assert_eq!(video.aspect_ratio_kind(), AspectRatio::Ratio16x9);
+        // Video streams carry no language field.
+        assert_eq!(video.language(), None);
+        assert_eq!(video.aspect_ratio_nibble, 0x3);
+    }
+
+    #[test]
+    fn stream_coding_info_typed_audio_accessors() {
+        let parsed = ClipInformation::parse(&sample_clpi().encode()).unwrap();
+        let audio = &parsed.program_info.programs[0].streams[1];
+        assert_eq!(audio.coding_type(), StreamCodingType::LpcmAudio);
+        assert!(audio.coding_type().is_audio());
+        assert_eq!(audio.audio_format_kind(), AudioFormat::Multi);
+        assert_eq!(audio.sample_rate_kind(), SampleRate::Hz48000);
+        assert_eq!(audio.language().as_deref(), Some("eng"));
+        // Audio carries no aspect_ratio.
+        assert_eq!(audio.aspect_ratio_nibble, 0);
+    }
+
+    #[test]
+    fn stream_coding_info_extra_fields_round_trip() {
+        // The video aspect_ratio nibble and the audio language tag must
+        // survive an encode -> parse cycle (the variable-length
+        // stream_coding_info body is reconstructed from the typed
+        // coding_type split).
+        let c = sample_clpi();
+        let parsed = ClipInformation::parse(&c.encode()).unwrap();
+        assert_eq!(parsed.program_info, c.program_info);
+        let v = &parsed.program_info.programs[0].streams[0];
+        let a = &parsed.program_info.programs[0].streams[1];
+        assert_eq!(v.aspect_ratio_nibble, 0x3);
+        assert_eq!(v.language_code, [0, 0, 0]);
+        assert_eq!(a.language_code, *b"eng");
+        assert_eq!(a.aspect_ratio_nibble, 0);
+    }
+
+    #[test]
+    fn stream_coding_info_lowercases_mixed_case_language() {
+        // Disc authors ship a mix of `ENG` / `eng`; `language()`
+        // normalises to lowercase like the title-catalogue path does.
+        let sci = StreamCodingInfo {
+            pid: 0x1100,
+            stream_coding_type: 0x81, // AC-3
+            format_info_byte: 0x31,   // Stereo / 48k
+            aspect_ratio_nibble: 0,
+            language_code: *b"FRA",
+        };
+        assert_eq!(sci.language().as_deref(), Some("fra"));
     }
 
     #[test]

@@ -53,7 +53,19 @@ bluray://                          → auto-detect first BD-ROM mount
   (`EpMap::kind()` / `EpEntry::kind()`); `Cpi::primary_video_ep_map()`
   uses it to pick the HEVC EP_map over a co-resident AVC fallback on
   UHD-BD authoring patterns, falling back to lowest-PID when every
-  EP_map carries an unknown 4-bit code.
+  EP_map carries an unknown 4-bit code. The CLPI ProgramInfo
+  `stream_coding_info()` block (§5.5.4.3) is decoded with the same
+  typed surface as the MPLS STN_table (§5.4.4.4): `StreamCodingInfo`
+  now reads the full `sc_len` body — exposing `aspect_ratio_nibble` +
+  the 3-byte ISO 639-2/T `language_code` the parser previously
+  discarded — and offers `coding_type()`, `video_format_kind()` /
+  `frame_rate_kind()` / `aspect_ratio_kind()` (video),
+  `audio_format_kind()` / `sample_rate_kind()` (audio), and
+  `language()` accessors reusing the `StreamCodingType` / `VideoFormat`
+  / `FrameRate` / `AspectRatio` / `AudioFormat` / `SampleRate` enums, so
+  a remuxer reads each clip's per-stream codec + resolution + channel
+  layout + language straight off its own ProgramInfo without a matching
+  `.mpls` open.
 - `.m2ts` stream → strip the 4-byte BDAV `TP_extra_header` per
   192-byte source packet, deliver clean 188-byte MPEG-TS bytes.
   Three call shapes: the in-place `strip_tp_extra(input, &mut out)`

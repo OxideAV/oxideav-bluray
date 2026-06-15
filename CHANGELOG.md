@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CLPI ProgramInfo `stream_coding_info()` typed attribute accessors
+  (BD-ROM Part 3 §5.5.4.3)** — the per-PID `StreamCodingInfo` block in
+  a `.clpi` ProgramInfo carries the same length-prefixed
+  `stream_coding_info()` structure as an MPLS STN_table stream entry
+  (§5.4.4.4): `stream_coding_type` + the packed attribute nibbles +
+  (for audio / graphics) a 3-byte ISO 639-2/T language tag. The parser
+  previously kept only `stream_coding_type` + the first attribute byte
+  and discarded the rest. It now reads every byte inside the recorded
+  `sc_len` body, surfacing `StreamCodingInfo::aspect_ratio_nibble` and
+  `language_code`, plus typed accessors `coding_type()`,
+  `video_format_kind()` / `frame_rate_kind()` / `aspect_ratio_kind()`
+  (video), `audio_format_kind()` / `sample_rate_kind()` (audio), and
+  `language()` (lowercased, `None` when absent) — reusing the
+  `StreamCodingType` / `VideoFormat` / `FrameRate` / `AspectRatio` /
+  `AudioFormat` / `SampleRate` enums the MPLS surface already exposes.
+  A remuxer can now read a clip's per-stream codec + resolution +
+  channel layout + language from its own ProgramInfo without a matching
+  `.mpls` open. The encode path reconstructs the variable-length body
+  (video aspect-ratio nibble vs audio/graphics language tag) so the
+  extra fields round-trip. 4 new unit tests.
 - **Allocation Extent Descriptor continuation chains (ECMA-167 §14.5 /
   §12 figure 7)** — an allocation descriptor whose §14.14.1.1 extent
   type is 3 ("the extent is the next extent of allocation
