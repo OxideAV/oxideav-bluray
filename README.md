@@ -357,17 +357,16 @@ registry / AACS deps). Run with:
 cargo +nightly fuzz run udf_descriptors
 ```
 
-Round 296 ran ~31M executions crash-free and fixed one reachable
-panic: `AnchorVolumeDescriptorPointer::parse` sliced its two
-fixed-offset `extent_ad` fields without a length check, so a 16-byte
-buffer carrying a checksum-valid AVDP tag panicked; it now reports
-`Malformed` (regression test `avdp_truncated_after_valid_tag_is_rejected`).
+The contract is that any byte slice yields `Ok(_)` or
+`Err(BlurayError)` and never panics, overflows, or indexes out of
+bounds (a regression test `avdp_truncated_after_valid_tag_is_rejected`
+pins the one historically-reachable panic, an `AnchorVolumeDescriptorPointer::parse`
+slice without a length check, as fixed).
 
 ## Clean-room references
 
-Only these documents are consulted; no `libbluray` / `libudf` /
-`udfclient` / VLC bluray-module / makemkv / AnyDVD source has been
-read.
+Only these documents are consulted; no third-party Blu-ray / UDF
+library or disc-ripping tool source has been read.
 
 - `docs/container/bluray/BD-ROM_Part3_V3.2_WhitePaper_180122.pdf`
 - `docs/container/bluray/BD-ROM_Audio_Visual_Application_Format_Specifications.pdf`
