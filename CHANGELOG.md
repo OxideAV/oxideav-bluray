@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-bluray/compare/v0.0.2...v0.0.3) - 2026-06-15
+
+### Other
+
+- typed stream_coding_info() accessors on ProgramInfo StreamCodingInfo
+- add cargo-fuzz harness over descriptor parsers; fix AVDP truncation panic
+- follow Allocation Extent Descriptor continuation chains (ECMA-167 §14.5 / §12)
+- long_ad + ext_ad allocation descriptors in File Entry walks (ECMA-167 §14.14.2/§14.14.3)
+- surface PlayItem playback-control fields via PlayItemFlags
+- typed nibble accessors for video/audio attribute fields
+- drop release-plz.toml — use release-plz defaults across the workspace
+- typed PlayList_playback_type accessor + AppInfoPlayList::playback_kind
+- typed EP_stream_type accessor + HEVC-aware EP_map selector
+- parse ExtendedFileEntry per ECMA-167 §14.17
+- in-place mid-stream angle switching on TitleSource
+- enumerate mid-stream angle-change boundaries from CPI EP_map
+- expose cross-PlayItem STC PTS continuity map (§5.4.4.2 + §5.5.4.2)
+- per-title TrackCatalogue + populate TitleInfo::languages
+- stream chapter bytes through TitleSource instead of buffering
+- fix EP_map body_addr base — skip length u32 + head u16
+- accept 'HDMV' type_indicator (BD-ROM Part 3 §5.5.1.1)
+- implement MultiTitleSource for bluray://
+- Disc::open_title_chapters per-chapter byte-segment iterator
+- ?title=N + ?chapters=A-B|A,B,C query selectors on bluray://
+- add unique_titles() dedup + optional title_meta() from BDMV/META
+- Disc::volume_label() from the UDF Primary Volume Descriptor
+- keep per-stream STN_table detail (PID / codec / language)
+- map KEYDB.cfg DK fields to the spec-compliant DeviceKey
+- switch transport from SG_IO to CDROM_SEND_PACKET
+- Type-4 KCD support + clear diagnostic for unwireable path
+- AACS Drive-Host AKE fallback for the Linux SG_IO Volume ID read
+- env-var override for Vuk / Media Key
+
 ### Added
 
 - **CLPI ProgramInfo `stream_coding_info()` typed attribute accessors
