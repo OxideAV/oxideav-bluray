@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- HDMV navigation-command opcode decode: `NavCommand::decode` /
+  `DecodedCommand` split the 12-byte command word into group
+  (Branch/Compare/Set), sub-group, the named `Operation` (all GOTO /
+  JUMP / PLAY branch ops, the seven Compare ops, the fifteen register
+  Set ops, the eleven SetSystem ops), and the two operand words decoded
+  into immediate values or GPR/PSR register references. Clean-room from
+  `docs/container/bluray/hdmv-navigation-commands.md`; every worked-hex
+  example in the table round-trips.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-bluray/compare/v0.0.2...v0.0.3) - 2026-06-15
 
 ### Other

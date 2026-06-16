@@ -90,6 +90,7 @@ pub use bdmv::{
         SecondaryAudioStream, SecondaryVideoStream, StnTable, StreamCodingType, SubPath,
         TextSubtitleStream, VideoFormat,
     },
+    nav_command::{CommandGroup, DecodedCommand, Operand, Operation, RegisterBank},
 };
 pub use decrypt::{DecryptError, StreamDecryptor};
 pub use disc::{

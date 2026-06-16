@@ -27,5 +27,6 @@ pub mod common;
 pub mod index_bdmv;
 pub mod movie_object;
 pub mod mpls;
+pub mod nav_command;
 
 pub use common::{BdmvHeader, Reader};
