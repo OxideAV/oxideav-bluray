@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Presentation Graphic Stream (PGS) segment parser in
+  `bdmv::pgs`: the shared 13-byte PG segment header (`SegmentHeader`),
+  the five typed segment bodies — `Pcs` (composition objects + cropping
+  + `CompositionState` Epoch-Start / Acquisition-Point / Normal +
+  palette-update flag), `Wds` (window list), `Pds` (YCbCr+alpha CLUT,
+  entry count derived from body length), `Ods` (fragmented RLE bitmap
+  with `FragmentFlag` First / Last / FirstAndLast), and the empty `END`
+  — plus `parse_segments` for a whole PG / `.sup` byte stream and
+  `decode_rle` which expands the ODS byte-oriented per-scanline
+  run-length encoding (the four colour-run branches + end-of-line) into
+  `width × height` paletted indices. Every segment round-trips through
+  `Segment::encode` (which recomputes `segment_size`); malformed inputs
+  (bad magic, truncated body, ragged PDS, RLE width / scanline-count
+  mismatch) are rejected, never panic. Clean-room from
+  `docs/container/bluray/pgs-segment-syntax.md`; re-exported from the
+  crate root.
 - HDMV navigation-command opcode decode: `NavCommand::decode` /
   `DecodedCommand` split the 12-byte command word into group
   (Branch/Compare/Set), sub-group, the named `Operation` (all GOTO /

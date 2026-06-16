@@ -91,6 +91,11 @@ pub use bdmv::{
         TextSubtitleStream, VideoFormat,
     },
     nav_command::{CommandGroup, DecodedCommand, Operand, Operation, RegisterBank},
+    pgs::{
+        decode_rle, parse_segments, CompositionObject, CompositionObjectCrop, CompositionState,
+        DecodedObject, FragmentFlag, Ods, PaletteEntry, Pcs, Pds, Segment, SegmentBody,
+        SegmentHeader, SegmentType, Wds, Window,
+    },
 };
 pub use decrypt::{DecryptError, StreamDecryptor};
 pub use disc::{

@@ -84,6 +84,31 @@ bluray://                          → auto-detect first BD-ROM mount
   timestamps + CCI bits without re-parsing the 4-byte header out of
   band. The TS payload stays opaque; downstream MPEG-TS demuxers own
   ISO/IEC 13818-1 parsing.
+- **Presentation Graphic Stream (PGS) segment parser** (`bdmv::pgs`) —
+  the bitmap-subtitle / graphics wire format carried in each PG
+  elementary stream (and the on-disc-equivalent of a `.sup` file). The
+  shared 13-byte PG segment header (`SegmentHeader`: `"PG"` magic +
+  90 kHz PTS/DTS + `segment_type` + `segment_size`) frames the five
+  typed bodies: `Pcs` (composition objects + optional cropping rect +
+  `CompositionState` Epoch-Start / Acquisition-Point / Normal +
+  palette-update flag), `Wds` (window geometry list), `Pds` (the
+  YCbCr+alpha CLUT, entry count derived from the body length), `Ods`
+  (the fragmented RLE bitmap with `FragmentFlag` First / Last /
+  FirstAndLast and first-fragment-only `width`/`height`), and the empty
+  `END`. `parse_segments` walks a whole PG / `.sup` byte stream into a
+  flat `Vec<Segment>`; `decode_rle` expands the ODS byte-oriented,
+  per-scanline run-length code (single-pixel literals + the four
+  short/long × colour-0/colour-C run branches + the all-zeros
+  end-of-line) into `width × height` palette indices, rejecting runs
+  that overrun the width or a scanline count that misses `height`.
+  Every segment round-trips through `Segment::encode` (which recomputes
+  `segment_size` from the body); malformed inputs (bad magic, truncated
+  body, ragged PDS, non-empty END) surface `BlurayError::Malformed`
+  rather than panicking. Clean-room from
+  `docs/container/bluray/pgs-segment-syntax.md`. Re-exported from the
+  crate root. (A PGS *renderer* — palette application, window
+  compositing, alpha blend onto the video plane — is downstream of this
+  parse layer and stays deferred.)
 - `TitleSource::seek_to(pts_90k)` — keyframe-aligned random access.
   A title-relative 90 kHz PTS is mapped to a PlayItem/clip, converted
   to clip-local time, binary-searched against that clip's CPI EP_map
@@ -316,6 +341,16 @@ Blu-ray discs and references no real titles. Test categories:
   and a truncated EFE rejected as `Malformed`.
 - BDMV parser round-trips (`index.bdmv`, `MovieObject.bdmv`,
   `.mpls`, `.clpi`).
+- PGS segment round-trips (`bdmv::pgs` unit tests): every segment
+  type encodes → parses byte-identically (PCS cropped + uncropped,
+  WDS, PDS with derived entry count, ODS first/continuation fragments,
+  empty END); a full PCS→WDS→PDS→ODS→END Display Set parses via
+  `parse_segments` and re-encodes to the same bytes; the four ODS RLE
+  branches (short/long × colour-0/colour-C) + end-of-line + a
+  no-trailing-EOL final line decode to the expected paletted indices;
+  and malformed inputs (bad magic, truncated body, ragged PDS,
+  non-empty END, RLE width overrun / short scanline / wrong line count
+  / truncated escape) are all rejected.
 - `TP_extra_header` strip (1 packet, 17 packets, alignment panics).
 - AACS-unit-length sanity check (32 × 192 = 6144 = 3 × 2048).
 - `bluray://` URI parser (auto-detect, absolute path, scheme reject).
@@ -383,6 +418,7 @@ library or disc-ripping tool source has been read.
 - `docs/container/bluray/BD-ROM_Audio_Visual_Application_Format_Specifications.pdf`
 - `docs/container/bluray/BD-ROM-AV-WhitePaper_HEVC.pdf`
 - `docs/container/bluray/ECMA-167_3rd_edition_june_1997.pdf`
+- `docs/container/bluray/pgs-segment-syntax.md`
 
 ## Privacy
 
