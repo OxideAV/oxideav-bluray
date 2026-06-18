@@ -92,9 +92,10 @@ pub use bdmv::{
     },
     nav_command::{CommandGroup, DecodedCommand, Operand, Operation, RegisterBank},
     pgs::{
-        decode_rle, parse_segments, CompositionObject, CompositionObjectCrop, CompositionState,
-        DecodedObject, FragmentFlag, Ods, PaletteEntry, Pcs, Pds, Segment, SegmentBody,
-        SegmentHeader, SegmentType, Wds, Window,
+        decode_rle, group_display_sets, parse_display_sets, parse_segments, CompositionObject,
+        CompositionObjectCrop, CompositionState, DecodedObject, DisplaySet, FragmentFlag, Ods,
+        PaletteEntry, Pcs, Pds, ReassembledObject, Segment, SegmentBody, SegmentHeader,
+        SegmentType, Wds, Window,
     },
 };
 pub use decrypt::{DecryptError, StreamDecryptor};

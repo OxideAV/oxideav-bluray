@@ -798,6 +798,288 @@ pub fn decode_rle(data: &[u8], width: u16, height: u16) -> Result<DecodedObject>
     })
 }
 
+/// A **Display Set (DS)** — one screen-composition unit of a PG stream.
+///
+/// The PGS doc ("Stream framing") orders a DS as
+/// `PCS → WDS → PDS … → ODS … → END`: exactly one PCS, an optional WDS
+/// (present in `Epoch Start` / `Acquisition Point` DSs), zero or more
+/// PDS, zero or more ODS (a large bitmap split across several ODS
+/// fragments sharing one `object_id`), and a terminating END.
+///
+/// [`group_display_sets`] slices a flat segment list (from
+/// [`parse_segments`]) into Display Sets on each PCS boundary;
+/// [`DisplaySet::reassemble_objects`] then folds each ODS fragment chain
+/// back into whole RLE objects ready for [`decode_rle`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplaySet {
+    /// The Presentation Composition Segment that opens the DS.
+    pub pcs: Pcs,
+    /// The Window Definition Segment, if present (Epoch Start /
+    /// Acquisition Point DSs carry one; Normal-Case updates may omit it).
+    pub wds: Option<Wds>,
+    /// The Palette Definition Segments, in stream order.
+    pub palettes: Vec<Pds>,
+    /// The Object Definition Segment fragments, in stream order.
+    pub objects: Vec<Ods>,
+    /// The presentation timestamp of the opening PCS (90 kHz units).
+    pub pts: u32,
+}
+
+impl DisplaySet {
+    /// The composition state of this DS (Epoch Start / Acquisition
+    /// Point / Normal Case).
+    pub fn state(&self) -> CompositionState {
+        self.pcs.state()
+    }
+
+    /// Reassemble the ODS fragment chains into whole RLE objects.
+    ///
+    /// Fragments sharing one `object_id` are concatenated in stream
+    /// order: the chain must open with a `First` (or `FirstAndLast`)
+    /// fragment carrying the `width`/`height`, continue through zero or
+    /// more middle fragments, and close with a `Last` (or the same
+    /// `FirstAndLast`). The first fragment's `object_data_length` counts
+    /// the `width` + `height` (4 bytes) plus all RLE bytes across every
+    /// fragment, so the expected RLE byte total is
+    /// `object_data_length − 4` (the PGS doc's wire-observation caveat);
+    /// the concatenated fragment payloads are validated against it.
+    ///
+    /// Returns one [`ReassembledObject`] per `object_id`, in first-seen
+    /// order. Malformed chains (a continuation without an open `First`,
+    /// a second `First` for the same id, a missing dimension, or a
+    /// declared-length mismatch) are rejected.
+    pub fn reassemble_objects(&self) -> Result<Vec<ReassembledObject>> {
+        // (object_id, accumulator) in first-seen order; `open` marks a
+        // chain still awaiting its `Last` fragment.
+        let mut order: Vec<u16> = Vec::new();
+        let mut acc: Vec<ReassembleAcc> = Vec::new();
+
+        for ods in &self.objects {
+            let flag = ods.fragment();
+            let slot = acc.iter_mut().find(|a| a.object_id == ods.object_id);
+
+            if flag.is_first() {
+                if let Some(s) = slot {
+                    if !s.closed {
+                        return Err(BlurayError::malformed(
+                            "PGS ODS second First fragment for an open object_id",
+                        ));
+                    }
+                    // A later DS reusing the id would arrive in a
+                    // different DisplaySet; within one DS a repeated
+                    // First is malformed authoring.
+                    return Err(BlurayError::malformed(
+                        "PGS ODS duplicate object_id within a Display Set",
+                    ));
+                }
+                let width = ods.width.ok_or_else(|| {
+                    BlurayError::malformed("PGS ODS First fragment missing width")
+                })?;
+                let height = ods.height.ok_or_else(|| {
+                    BlurayError::malformed("PGS ODS First fragment missing height")
+                })?;
+                order.push(ods.object_id);
+                acc.push(ReassembleAcc {
+                    object_id: ods.object_id,
+                    version: ods.object_version_number,
+                    width,
+                    height,
+                    declared_len: ods.object_data_length,
+                    data: ods.object_data.clone(),
+                    closed: flag.is_last(),
+                });
+            } else {
+                // Continuation (Last / Other): must extend an open chain.
+                let s = slot.ok_or_else(|| {
+                    BlurayError::malformed("PGS ODS continuation fragment with no open object_id")
+                })?;
+                if s.closed {
+                    return Err(BlurayError::malformed(
+                        "PGS ODS continuation after the chain was already closed",
+                    ));
+                }
+                s.data.extend_from_slice(&ods.object_data);
+                if flag.is_last() {
+                    s.closed = true;
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(order.len());
+        for s in acc {
+            if !s.closed {
+                return Err(BlurayError::malformed(
+                    "PGS ODS object chain never received a Last fragment",
+                ));
+            }
+            // declared_len counts width(2) + height(2) + RLE bytes.
+            if (s.declared_len as usize) < 4 {
+                return Err(BlurayError::malformed(
+                    "PGS ODS object_data_length shorter than the 4 dimension bytes",
+                ));
+            }
+            let expected_rle = s.declared_len as usize - 4;
+            if s.data.len() != expected_rle {
+                return Err(BlurayError::malformed(
+                    "PGS ODS reassembled RLE length disagrees with object_data_length",
+                ));
+            }
+            out.push(ReassembledObject {
+                object_id: s.object_id,
+                object_version_number: s.version,
+                width: s.width,
+                height: s.height,
+                rle_data: s.data,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Per-object accumulator used while reassembling ODS fragment chains.
+struct ReassembleAcc {
+    object_id: u16,
+    version: u8,
+    width: u16,
+    height: u16,
+    declared_len: u32,
+    data: Vec<u8>,
+    closed: bool,
+}
+
+/// A whole Graphics Object reassembled from one or more ODS fragments:
+/// the dimensions plus the concatenated RLE byte stream. Decode the
+/// `rle_data` with [`decode_rle`] (using `width`/`height`) to get the
+/// paletted bitmap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReassembledObject {
+    pub object_id: u16,
+    pub object_version_number: u8,
+    pub width: u16,
+    pub height: u16,
+    /// The concatenated RLE bytes across every fragment of the chain.
+    pub rle_data: Vec<u8>,
+}
+
+impl ReassembledObject {
+    /// Decode this object's reassembled RLE bytes into a paletted
+    /// [`DecodedObject`].
+    pub fn decode(&self) -> Result<DecodedObject> {
+        decode_rle(&self.rle_data, self.width, self.height)
+    }
+}
+
+/// Slice a flat PG segment list (from [`parse_segments`]) into
+/// [`DisplaySet`]s, one per PCS.
+///
+/// A Display Set opens with a PCS and runs through the segments that
+/// follow up to (and including) the next END, per the PGS doc framing
+/// `PCS → WDS → PDS … → ODS … → END`. Within a DS the WDS / PDS / ODS
+/// segments are bucketed by type; the END terminates the set. The first
+/// segment of the stream must be a PCS, more than one PCS or more than
+/// one WDS in a single DS is rejected, and any segment appearing before
+/// the opening PCS is malformed.
+pub fn group_display_sets(segments: &[Segment]) -> Result<Vec<DisplaySet>> {
+    let mut sets = Vec::new();
+    let mut cur: Option<DisplaySetBuilder> = None;
+
+    for seg in segments {
+        match &seg.body {
+            SegmentBody::Pcs(pcs) => {
+                if let Some(b) = cur.take() {
+                    // A new PCS before the previous DS saw its END:
+                    // close the previous set implicitly is unsafe, so
+                    // reject — a well-formed stream ends each DS with END.
+                    let _ = b;
+                    return Err(BlurayError::malformed(
+                        "PGS Display Set opened a second PCS before END",
+                    ));
+                }
+                cur = Some(DisplaySetBuilder {
+                    pcs: pcs.clone(),
+                    pts: seg.header.pts,
+                    wds: None,
+                    palettes: Vec::new(),
+                    objects: Vec::new(),
+                });
+            }
+            SegmentBody::Wds(wds) => {
+                let b = cur
+                    .as_mut()
+                    .ok_or_else(|| BlurayError::malformed("PGS WDS before any PCS"))?;
+                if b.wds.is_some() {
+                    return Err(BlurayError::malformed(
+                        "PGS Display Set with more than one WDS",
+                    ));
+                }
+                b.wds = Some(wds.clone());
+            }
+            SegmentBody::Pds(pds) => {
+                let b = cur
+                    .as_mut()
+                    .ok_or_else(|| BlurayError::malformed("PGS PDS before any PCS"))?;
+                b.palettes.push(pds.clone());
+            }
+            SegmentBody::Ods(ods) => {
+                let b = cur
+                    .as_mut()
+                    .ok_or_else(|| BlurayError::malformed("PGS ODS before any PCS"))?;
+                b.objects.push(ods.clone());
+            }
+            SegmentBody::End => {
+                let b = cur
+                    .take()
+                    .ok_or_else(|| BlurayError::malformed("PGS END before any PCS"))?;
+                sets.push(b.finish());
+            }
+            SegmentBody::Other { .. } => {
+                // Unknown segment types inside a DS are ignored for
+                // grouping (retained at the flat-segment layer); a stray
+                // one before a PCS is still malformed.
+                if cur.is_none() {
+                    return Err(BlurayError::malformed("PGS unknown segment before any PCS"));
+                }
+            }
+        }
+    }
+
+    if cur.is_some() {
+        return Err(BlurayError::malformed(
+            "PGS trailing Display Set without an END segment",
+        ));
+    }
+    Ok(sets)
+}
+
+/// In-progress [`DisplaySet`] used by [`group_display_sets`].
+struct DisplaySetBuilder {
+    pcs: Pcs,
+    pts: u32,
+    wds: Option<Wds>,
+    palettes: Vec<Pds>,
+    objects: Vec<Ods>,
+}
+
+impl DisplaySetBuilder {
+    fn finish(self) -> DisplaySet {
+        DisplaySet {
+            pcs: self.pcs,
+            wds: self.wds,
+            palettes: self.palettes,
+            objects: self.objects,
+            pts: self.pts,
+        }
+    }
+}
+
+/// Parse a whole PG elementary byte stream and group it into Display
+/// Sets in one call — [`parse_segments`] followed by
+/// [`group_display_sets`].
+pub fn parse_display_sets(buf: &[u8]) -> Result<Vec<DisplaySet>> {
+    let segments = parse_segments(buf)?;
+    group_display_sets(&segments)
+}
+
 /// Tiny big-endian reader over a segment body. Mirrors
 /// [`crate::bdmv::common::Reader`] but adds a 3-byte read and stays local
 /// so PGS parsing keeps its own bounds-checking surface.
@@ -1349,5 +1631,299 @@ mod tests {
         buf.extend_from_slice(&100u16.to_be_bytes()); // claims 100-byte body
         buf.extend_from_slice(&[0u8; 4]); // but only 4 present
         assert!(Segment::parse(&buf).is_err());
+    }
+
+    // --- Display Set grouping + ODS fragment reassembly ---
+
+    fn seg(pts: u32, body: SegmentBody) -> Segment {
+        Segment {
+            header: SegmentHeader {
+                pts,
+                dts: 0,
+                segment_type: 0, // recomputed by encode; ignored by grouping
+                segment_size: 0,
+            },
+            body,
+        }
+    }
+
+    fn pcs(state: u8) -> Pcs {
+        Pcs {
+            width: 1920,
+            height: 1080,
+            frame_rate: 0x10,
+            composition_number: 1,
+            composition_state: state,
+            palette_update_flag: 0,
+            palette_id: 0,
+            composition_objects: vec![],
+        }
+    }
+
+    fn ods(
+        object_id: u16,
+        flag: FragmentFlag,
+        len: u32,
+        wh: Option<(u16, u16)>,
+        data: &[u8],
+    ) -> Ods {
+        Ods {
+            object_id,
+            object_version_number: 0,
+            last_in_sequence_flag: flag.as_raw(),
+            object_data_length: len,
+            width: wh.map(|x| x.0),
+            height: wh.map(|x| x.1),
+            object_data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn group_single_display_set() {
+        let segs = vec![
+            seg(100, SegmentBody::Pcs(pcs(0x80))),
+            seg(100, SegmentBody::Wds(Wds { windows: vec![] })),
+            seg(
+                100,
+                SegmentBody::Pds(Pds {
+                    palette_id: 0,
+                    palette_version_number: 0,
+                    entries: vec![],
+                }),
+            ),
+            seg(
+                100,
+                SegmentBody::Ods(ods(
+                    0,
+                    FragmentFlag::FirstAndLast,
+                    4 + 2,
+                    Some((2, 1)),
+                    &[1, 2],
+                )),
+            ),
+            seg(100, SegmentBody::End),
+        ];
+        let sets = group_display_sets(&segs).unwrap();
+        assert_eq!(sets.len(), 1);
+        let ds = &sets[0];
+        assert_eq!(ds.pts, 100);
+        assert!(ds.state().is_epoch_start());
+        assert!(ds.wds.is_some());
+        assert_eq!(ds.palettes.len(), 1);
+        assert_eq!(ds.objects.len(), 1);
+    }
+
+    #[test]
+    fn group_two_display_sets() {
+        let segs = vec![
+            seg(100, SegmentBody::Pcs(pcs(0x80))),
+            seg(100, SegmentBody::End),
+            seg(200, SegmentBody::Pcs(pcs(0x00))),
+            seg(200, SegmentBody::End),
+        ];
+        let sets = group_display_sets(&segs).unwrap();
+        assert_eq!(sets.len(), 2);
+        assert_eq!(sets[0].pts, 100);
+        assert!(sets[0].state().is_epoch_start());
+        assert_eq!(sets[1].pts, 200);
+        assert_eq!(sets[1].state(), CompositionState::Normal);
+    }
+
+    #[test]
+    fn group_rejects_segment_before_pcs() {
+        let segs = vec![seg(0, SegmentBody::Wds(Wds { windows: vec![] }))];
+        assert!(group_display_sets(&segs).is_err());
+    }
+
+    #[test]
+    fn group_rejects_second_pcs_before_end() {
+        let segs = vec![
+            seg(0, SegmentBody::Pcs(pcs(0x80))),
+            seg(0, SegmentBody::Pcs(pcs(0x00))),
+        ];
+        assert!(group_display_sets(&segs).is_err());
+    }
+
+    #[test]
+    fn group_rejects_two_wds() {
+        let segs = vec![
+            seg(0, SegmentBody::Pcs(pcs(0x80))),
+            seg(0, SegmentBody::Wds(Wds { windows: vec![] })),
+            seg(0, SegmentBody::Wds(Wds { windows: vec![] })),
+            seg(0, SegmentBody::End),
+        ];
+        assert!(group_display_sets(&segs).is_err());
+    }
+
+    #[test]
+    fn group_rejects_trailing_set_without_end() {
+        let segs = vec![seg(0, SegmentBody::Pcs(pcs(0x80)))];
+        assert!(group_display_sets(&segs).is_err());
+    }
+
+    #[test]
+    fn reassemble_single_fragment_object() {
+        // FirstAndLast: object_data_length = 4 (w+h) + 3 (RLE).
+        let ds = DisplaySet {
+            pcs: pcs(0x80),
+            wds: None,
+            palettes: vec![],
+            objects: vec![ods(
+                7,
+                FragmentFlag::FirstAndLast,
+                4 + 3,
+                Some((8, 1)),
+                &[0x01, 0x02, 0x03],
+            )],
+            pts: 0,
+        };
+        let objs = ds.reassemble_objects().unwrap();
+        assert_eq!(objs.len(), 1);
+        assert_eq!(objs[0].object_id, 7);
+        assert_eq!(objs[0].width, 8);
+        assert_eq!(objs[0].height, 1);
+        assert_eq!(objs[0].rle_data, vec![0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn reassemble_multi_fragment_chain() {
+        // A 6-byte RLE bitmap split First(3) + middle(2) + Last(1).
+        // declared length on the First fragment = 4 + 6 = 10.
+        let ds = DisplaySet {
+            pcs: pcs(0x80),
+            wds: None,
+            palettes: vec![],
+            objects: vec![
+                ods(
+                    3,
+                    FragmentFlag::First,
+                    4 + 6,
+                    Some((6, 1)),
+                    &[0x11, 0x22, 0x33],
+                ),
+                ods(3, FragmentFlag::Other(0x00), 0, None, &[0x44, 0x55]),
+                ods(3, FragmentFlag::Last, 0, None, &[0x66]),
+            ],
+            pts: 0,
+        };
+        let objs = ds.reassemble_objects().unwrap();
+        assert_eq!(objs.len(), 1);
+        assert_eq!(objs[0].rle_data, vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        assert_eq!(objs[0].width, 6);
+    }
+
+    #[test]
+    fn reassemble_two_objects_first_seen_order() {
+        let ds = DisplaySet {
+            pcs: pcs(0x80),
+            wds: None,
+            palettes: vec![],
+            objects: vec![
+                ods(9, FragmentFlag::FirstAndLast, 4 + 1, Some((1, 1)), &[0xAA]),
+                ods(5, FragmentFlag::FirstAndLast, 4 + 1, Some((1, 1)), &[0xBB]),
+            ],
+            pts: 0,
+        };
+        let objs = ds.reassemble_objects().unwrap();
+        assert_eq!(objs.iter().map(|o| o.object_id).collect::<Vec<_>>(), [9, 5]);
+    }
+
+    #[test]
+    fn reassemble_continuation_without_first_rejected() {
+        let ds = DisplaySet {
+            pcs: pcs(0x80),
+            wds: None,
+            palettes: vec![],
+            objects: vec![ods(1, FragmentFlag::Last, 0, None, &[0xAA])],
+            pts: 0,
+        };
+        assert!(ds.reassemble_objects().is_err());
+    }
+
+    #[test]
+    fn reassemble_never_closed_rejected() {
+        let ds = DisplaySet {
+            pcs: pcs(0x80),
+            wds: None,
+            palettes: vec![],
+            objects: vec![ods(1, FragmentFlag::First, 4 + 3, Some((3, 1)), &[0x01])],
+            pts: 0,
+        };
+        // First fragment present, Last never arrives → length never met
+        // and chain never closed.
+        assert!(ds.reassemble_objects().is_err());
+    }
+
+    #[test]
+    fn reassemble_length_mismatch_rejected() {
+        // declared 4 + 3 = 7 (RLE 3) but only 2 RLE bytes delivered.
+        let ds = DisplaySet {
+            pcs: pcs(0x80),
+            wds: None,
+            palettes: vec![],
+            objects: vec![ods(
+                1,
+                FragmentFlag::FirstAndLast,
+                4 + 3,
+                Some((3, 1)),
+                &[0x01, 0x02],
+            )],
+            pts: 0,
+        };
+        assert!(ds.reassemble_objects().is_err());
+    }
+
+    #[test]
+    fn reassemble_then_decode_end_to_end() {
+        // First fragment carries the full RLE for a 2x1 bitmap:
+        // colours 1, 2, then EOL. declared = 4 + 4.
+        let rle = [0x01u8, 0x02, 0x00, 0x00];
+        let ds = DisplaySet {
+            pcs: pcs(0x80),
+            wds: None,
+            palettes: vec![],
+            objects: vec![ods(
+                0,
+                FragmentFlag::FirstAndLast,
+                4 + rle.len() as u32,
+                Some((2, 1)),
+                &rle,
+            )],
+            pts: 0,
+        };
+        let objs = ds.reassemble_objects().unwrap();
+        let bitmap = objs[0].decode().unwrap();
+        assert_eq!(bitmap.width, 2);
+        assert_eq!(bitmap.pixels, vec![1, 2]);
+    }
+
+    #[test]
+    fn parse_display_sets_end_to_end() {
+        // Build a real byte stream and round-trip it through the
+        // top-level parse_display_sets entry point.
+        let rle = [0x01u8, 0x02, 0x00, 0x00];
+        let segs = vec![
+            seg(100, SegmentBody::Pcs(pcs(0x80))),
+            seg(100, SegmentBody::Wds(Wds { windows: vec![] })),
+            seg(
+                100,
+                SegmentBody::Ods(ods(
+                    0,
+                    FragmentFlag::FirstAndLast,
+                    4 + rle.len() as u32,
+                    Some((2, 1)),
+                    &rle,
+                )),
+            ),
+            seg(100, SegmentBody::End),
+        ];
+        let mut stream = Vec::new();
+        for s in &segs {
+            stream.extend_from_slice(&s.encode());
+        }
+        let sets = parse_display_sets(&stream).unwrap();
+        assert_eq!(sets.len(), 1);
+        let objs = sets[0].reassemble_objects().unwrap();
+        assert_eq!(objs[0].decode().unwrap().pixels, vec![1, 2]);
     }
 }

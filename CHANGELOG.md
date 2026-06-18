@@ -33,6 +33,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into immediate values or GPR/PSR register references. Clean-room from
   `docs/container/bluray/hdmv-navigation-commands.md`; every worked-hex
   example in the table round-trips.
+- PGS Display Set grouping + ODS fragment reassembly in `bdmv::pgs`,
+  the layer above the flat segment list: `group_display_sets` /
+  `parse_display_sets` slice a segment list into `DisplaySet`s on each
+  PCS boundary (`{ pcs, wds, palettes, objects, pts }`, framing
+  `PCS -> WDS -> PDS ... -> ODS ... -> END`), and
+  `DisplaySet::reassemble_objects` folds each ODS fragment chain
+  (fragments sharing one `object_id`, opened by `First`/`FirstAndLast`
+  carrying `width`/`height`, closed by `Last`) into a
+  `ReassembledObject` whose concatenated RLE bytes are validated against
+  the first fragment's `object_data_length - 4` (width+height+RLE
+  wire-observation); `ReassembledObject::decode` runs `decode_rle` for
+  the paletted bitmap. Malformed framing (segment before PCS, second PCS
+  before END, two WDS, trailing DS without END) and malformed chains
+  (continuation with no open chain, duplicate `object_id`, never-closed
+  chain, declared-length mismatch) surface `BlurayError::Malformed`.
+  `DisplaySet` / `ReassembledObject` / `group_display_sets` /
+  `parse_display_sets` re-exported from the crate root. Clean-room from
+  `docs/container/bluray/pgs-segment-syntax.md`. 14 new unit tests.
 
 ## [0.0.3](https://github.com/OxideAV/oxideav-bluray/compare/v0.0.2...v0.0.3) - 2026-06-15
 

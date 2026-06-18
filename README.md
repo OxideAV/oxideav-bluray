@@ -109,6 +109,24 @@ bluray://                          → auto-detect first BD-ROM mount
   crate root. (A PGS *renderer* — palette application, window
   compositing, alpha blend onto the video plane — is downstream of this
   parse layer and stays deferred.)
+- **PGS Display Set grouping + ODS fragment reassembly** (`bdmv::pgs`) —
+  the layer above the flat segment list. `group_display_sets` (and the
+  one-shot `parse_display_sets`) slice a `Vec<Segment>` into
+  `DisplaySet`s on each PCS boundary, bucketing the `PCS -> WDS -> PDS
+  ... -> ODS ... -> END` run into `{ pcs, wds, palettes, objects, pts }`
+  and rejecting malformed framing (a segment before the opening PCS, a
+  second PCS before END, two WDS in one DS, a trailing DS with no END).
+  `DisplaySet::reassemble_objects` then folds each ODS fragment chain
+  (fragments sharing one `object_id`, opened by a `First` /
+  `FirstAndLast` carrying `width`/`height` and closed by a `Last`) back
+  into a `ReassembledObject` whose concatenated `rle_data` is validated
+  against the first fragment's `object_data_length - 4` byte count (the
+  doc's width+height+RLE wire-observation); `ReassembledObject::decode`
+  runs `decode_rle` to yield the paletted bitmap. A continuation with no
+  open chain, a duplicate `object_id`, a never-closed chain, or a length
+  mismatch surfaces `BlurayError::Malformed`. This bridges the parsed
+  segments into renderable display sets for a downstream compositor.
+  14 new unit tests.
 - `TitleSource::seek_to(pts_90k)` — keyframe-aligned random access.
   A title-relative 90 kHz PTS is mapped to a PlayItem/clip, converted
   to clip-local time, binary-searched against that clip's CPI EP_map
