@@ -1127,6 +1127,339 @@ impl<'a> BodyReader<'a> {
     }
 }
 
+// ===========================================================================
+// Renderer: palette resolution + window compositing
+// ===========================================================================
+//
+// The layers above turn a PG / `.sup` byte stream into Display Sets, fold ODS
+// fragments into whole RLE objects, and expand the RLE into `width × height`
+// CLUT *indices* ([`DecodedObject`]). This section completes the decode by
+// applying the PDS palette (YCbCr+alpha → RGBA) and compositing each
+// composition object into the graphics plane at the position the PCS gives
+// it — yielding the actual subtitle bitmap a player would alpha-blend onto
+// the video plane.
+//
+// Colour conversion: PGS palette entries are **BT.709 limited-range** YCbCr
+// (`docs/container/bluray/pgs-segment-syntax.md`, "Palette entry": *"Color is
+// YCbCr + alpha (BT.709 range as used on BD), not RGB"*). The inverse matrix
+// below is the standard BT.709 limited→full-range conversion (Y scaled from
+// the 16–235 studio range, Cb/Cr from 16–240 around the 128 neutral point);
+// the resulting R'G'B' are clamped to 0–255. Alpha passes through unchanged
+// (`0x00` transparent … `0xFF` opaque).
+
+/// A single straight-alpha RGBA pixel (8 bits per channel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rgba8 {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+impl Rgba8 {
+    /// A fully transparent pixel (all channels `0`).
+    pub const TRANSPARENT: Rgba8 = Rgba8 {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 0,
+    };
+
+    /// This pixel's four channels as `[r, g, b, a]`.
+    pub fn to_array(self) -> [u8; 4] {
+        [self.r, self.g, self.b, self.a]
+    }
+}
+
+/// Convert one BT.709 limited-range `(Y, Cb, Cr)` triple to full-range
+/// `(R, G, B)`, clamped to `0..=255`.
+///
+/// Studio range: `Y` in 16–235, `Cb`/`Cr` in 16–240 centred on 128. The
+/// coefficients are the BT.709 inverse matrix; integer math is done in
+/// fixed point (×256) to stay deterministic and `no_std`-friendly.
+fn ycbcr709_to_rgb(y: u8, cb: u8, cr: u8) -> (u8, u8, u8) {
+    // De-bias and scale out of the studio range into full range.
+    let yf = (y as f32 - 16.0) * (255.0 / 219.0);
+    let cbf = cb as f32 - 128.0;
+    let crf = cr as f32 - 128.0;
+
+    // BT.709 limited-range inverse coefficients. Chroma is carried in the
+    // 16–240 (224-wide) studio range, so each chroma term is pre-scaled by
+    // 255/224 folded into the published constants below.
+    let r = yf + 1.5748 * crf * (255.0 / 224.0);
+    let g = yf - 0.1873 * cbf * (255.0 / 224.0) - 0.4681 * crf * (255.0 / 224.0);
+    let b = yf + 1.8556 * cbf * (255.0 / 224.0);
+
+    let clamp = |v: f32| -> u8 {
+        if v <= 0.0 {
+            0
+        } else if v >= 255.0 {
+            255
+        } else {
+            (v + 0.5) as u8
+        }
+    };
+    (clamp(r), clamp(g), clamp(b))
+}
+
+impl PaletteEntry {
+    /// Resolve this CLUT entry to a straight-alpha [`Rgba8`] pixel, applying
+    /// the BT.709 limited-range YCbCr→RGB conversion and passing the alpha
+    /// (`T`) through unchanged.
+    pub fn to_rgba(&self) -> Rgba8 {
+        let (r, g, b) = ycbcr709_to_rgb(self.y, self.cr, self.cb);
+        Rgba8 {
+            r,
+            g,
+            b,
+            a: self.alpha,
+        }
+    }
+}
+
+/// A resolved 256-entry CLUT (Colour Look-Up Table).
+///
+/// Built from one or more [`Pds`] segments. Entries a PDS does not mention
+/// keep their previous value (palettes are incrementally updatable — the
+/// PGS doc's *"Entries not present in a PDS keep their previous value"*); a
+/// freshly-[`Palette::new`]'d table starts fully transparent, matching the
+/// convention that an unwritten index (notably 255) is transparent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Palette {
+    entries: [Rgba8; 256],
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Palette {
+    /// A fully-transparent 256-entry CLUT.
+    pub fn new() -> Self {
+        Self {
+            entries: [Rgba8::TRANSPARENT; 256],
+        }
+    }
+
+    /// Look up the resolved colour for a CLUT index.
+    pub fn get(&self, index: u8) -> Rgba8 {
+        self.entries[index as usize]
+    }
+
+    /// Apply one PDS's entries on top of the current table (incremental
+    /// update): each `palette_entry_id` is overwritten, untouched indices
+    /// keep their prior value.
+    pub fn apply(&mut self, pds: &Pds) {
+        for e in &pds.entries {
+            self.entries[e.palette_entry_id as usize] = e.to_rgba();
+        }
+    }
+
+    /// Build a CLUT from a slice of PDS applied in order (later entries win
+    /// for a repeated index). Convenience for a Display Set's `palettes`.
+    pub fn from_palettes(palettes: &[Pds]) -> Self {
+        let mut p = Self::new();
+        for pds in palettes {
+            p.apply(pds);
+        }
+        p
+    }
+
+    /// Build a CLUT from the single PDS matching `palette_id` within a
+    /// Display Set's palette list (the PCS names which palette to use via
+    /// `palette_id`). Returns a fully-transparent palette if none matches.
+    pub fn from_palettes_with_id(palettes: &[Pds], palette_id: u8) -> Self {
+        let mut p = Self::new();
+        for pds in palettes.iter().filter(|p| p.palette_id == palette_id) {
+            p.apply(pds);
+        }
+        p
+    }
+}
+
+/// A decoded, palette-resolved RGBA bitmap: `width × height` straight-alpha
+/// pixels, row-major (top-left first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RgbaImage {
+    pub width: u16,
+    pub height: u16,
+    /// `width × height` pixels, row-major.
+    pub pixels: Vec<Rgba8>,
+}
+
+impl RgbaImage {
+    /// A fully-transparent image of the given size.
+    pub fn transparent(width: u16, height: u16) -> Self {
+        Self {
+            width,
+            height,
+            pixels: vec![Rgba8::TRANSPARENT; (width as usize) * (height as usize)],
+        }
+    }
+
+    /// The pixel at `(x, y)`, or [`None`] if out of bounds.
+    pub fn pixel(&self, x: u16, y: u16) -> Option<Rgba8> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        Some(self.pixels[(y as usize) * (self.width as usize) + (x as usize)])
+    }
+
+    /// Flatten to a tightly-packed `RGBA8888` byte buffer
+    /// (`width × height × 4` bytes, row-major).
+    pub fn to_rgba_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.pixels.len() * 4);
+        for p in &self.pixels {
+            out.extend_from_slice(&p.to_array());
+        }
+        out
+    }
+}
+
+impl DecodedObject {
+    /// Resolve this paletted bitmap's CLUT indices through `palette` to a
+    /// straight-alpha [`RgbaImage`].
+    pub fn to_rgba(&self, palette: &Palette) -> RgbaImage {
+        let pixels = self.pixels.iter().map(|&idx| palette.get(idx)).collect();
+        RgbaImage {
+            width: self.width,
+            height: self.height,
+            pixels,
+        }
+    }
+}
+
+/// A fully composited Display Set: every composition object decoded,
+/// palette-resolved, and painted into the PCS-declared graphics plane at the
+/// position (and crop) the PCS gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedDisplaySet {
+    /// The graphics-plane bitmap (`pcs.width × pcs.height`).
+    pub plane: RgbaImage,
+    /// Presentation timestamp of the opening PCS (90 kHz units).
+    pub pts: u32,
+}
+
+impl DisplaySet {
+    /// Decode, palette-resolve and composite this Display Set into a single
+    /// graphics-plane [`RgbaImage`].
+    ///
+    /// The plane is sized `pcs.width × pcs.height` and starts fully
+    /// transparent. The PCS's `palette_id` selects the active CLUT from this
+    /// DS's [`palettes`](Self::palettes); each composition object's ODS is
+    /// reassembled, RLE-decoded, palette-resolved, and painted at
+    /// `(object_horizontal_position, object_vertical_position)`. When a
+    /// composition object carries a cropping rectangle (`object_cropped_flag
+    /// == 0x40`) only the cropped sub-rectangle of the object is painted, at
+    /// the same plane position. Pixels that fall outside the plane are
+    /// clipped.
+    ///
+    /// A `palette_update_flag` (palette-only) PCS still composites against
+    /// whatever objects it references; callers tracking an Epoch's object
+    /// buffer across DSs should drive the buffer themselves — this method
+    /// renders strictly from the objects present in *this* DS.
+    ///
+    /// Errors propagate from [`reassemble_objects`](Self::reassemble_objects)
+    /// (malformed fragment chains) and [`decode_rle`] (malformed RLE), plus a
+    /// `Malformed` if a composition object references an `object_id` with no
+    /// matching ODS in this DS.
+    pub fn render(&self) -> Result<RenderedDisplaySet> {
+        let palette = Palette::from_palettes_with_id(&self.palettes, self.pcs.palette_id);
+
+        // Decode every object in this DS once, keyed by object_id.
+        let reassembled = self.reassemble_objects()?;
+        let mut images: Vec<(u16, RgbaImage)> = Vec::with_capacity(reassembled.len());
+        for obj in &reassembled {
+            let decoded = obj.decode()?;
+            images.push((obj.object_id, decoded.to_rgba(&palette)));
+        }
+
+        let mut plane = RgbaImage::transparent(self.pcs.width, self.pcs.height);
+
+        for co in &self.pcs.composition_objects {
+            let img = images
+                .iter()
+                .find(|(id, _)| *id == co.object_id)
+                .map(|(_, img)| img)
+                .ok_or_else(|| {
+                    BlurayError::malformed(
+                        "PGS composition object references an object_id absent from the Display Set",
+                    )
+                })?;
+
+            // Source sub-rectangle: the whole object, or the crop window.
+            let (src_x, src_y, src_w, src_h) = match co.cropping {
+                Some(c) => (
+                    c.horizontal_position,
+                    c.vertical_position,
+                    c.width,
+                    c.height,
+                ),
+                None => (0, 0, img.width, img.height),
+            };
+
+            blit(
+                &mut plane,
+                img,
+                co.object_horizontal_position,
+                co.object_vertical_position,
+                src_x,
+                src_y,
+                src_w,
+                src_h,
+            );
+        }
+
+        Ok(RenderedDisplaySet {
+            plane,
+            pts: self.pts,
+        })
+    }
+}
+
+/// Copy the `src_w × src_h` sub-rectangle of `src` (top-left at
+/// `(src_x, src_y)` in `src`) onto `dst` with its top-left at
+/// `(dst_x, dst_y)`. Pixels falling outside either image are skipped
+/// (clipped); this is a straight copy (overwrite), not an alpha blend — the
+/// graphics plane starts transparent and PGS objects do not overlap within a
+/// single DS in well-formed streams.
+#[allow(clippy::too_many_arguments)]
+fn blit(
+    dst: &mut RgbaImage,
+    src: &RgbaImage,
+    dst_x: u16,
+    dst_y: u16,
+    src_x: u16,
+    src_y: u16,
+    src_w: u16,
+    src_h: u16,
+) {
+    for row in 0..src_h {
+        let sy = match src_y.checked_add(row) {
+            Some(v) if v < src.height => v,
+            _ => continue,
+        };
+        let dy = match dst_y.checked_add(row) {
+            Some(v) if v < dst.height => v,
+            _ => continue,
+        };
+        for col in 0..src_w {
+            let sx = match src_x.checked_add(col) {
+                Some(v) if v < src.width => v,
+                _ => continue,
+            };
+            let dx = match dst_x.checked_add(col) {
+                Some(v) if v < dst.width => v,
+                _ => continue,
+            };
+            let sp = src.pixels[(sy as usize) * (src.width as usize) + (sx as usize)];
+            dst.pixels[(dy as usize) * (dst.width as usize) + (dx as usize)] = sp;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1925,5 +2258,278 @@ mod tests {
         assert_eq!(sets.len(), 1);
         let objs = sets[0].reassemble_objects().unwrap();
         assert_eq!(objs[0].decode().unwrap().pixels, vec![1, 2]);
+    }
+
+    // --- Renderer: palette resolution + compositing ---
+
+    fn palette_entry(id: u8, y: u8, cr: u8, cb: u8, a: u8) -> PaletteEntry {
+        PaletteEntry {
+            palette_entry_id: id,
+            y,
+            cr,
+            cb,
+            alpha: a,
+        }
+    }
+
+    #[test]
+    fn ycbcr_white_black_and_neutral() {
+        // Studio-white Y=235, neutral chroma → ~full white.
+        let (r, g, b) = ycbcr709_to_rgb(235, 128, 128);
+        assert!(r >= 254 && g >= 254 && b >= 254, "white = {r},{g},{b}");
+        // Studio-black Y=16, neutral chroma → black.
+        let (r, g, b) = ycbcr709_to_rgb(16, 128, 128);
+        assert_eq!((r, g, b), (0, 0, 0));
+        // Mid grey stays grey (r≈g≈b).
+        let (r, g, b) = ycbcr709_to_rgb(126, 128, 128);
+        assert!(r == g && g == b, "grey {r},{g},{b}");
+        assert!((120..=135).contains(&r), "mid grey ~128, got {r}");
+    }
+
+    #[test]
+    fn palette_entry_alpha_passthrough_and_transparent_default() {
+        let e = palette_entry(5, 235, 128, 128, 0x80);
+        let px = e.to_rgba();
+        assert_eq!(px.a, 0x80);
+        assert!(px.r >= 254 && px.g >= 254 && px.b >= 254);
+
+        // A fresh palette is fully transparent everywhere (incl. index 255).
+        let p = Palette::new();
+        assert_eq!(p.get(0), Rgba8::TRANSPARENT);
+        assert_eq!(p.get(255), Rgba8::TRANSPARENT);
+    }
+
+    #[test]
+    fn palette_incremental_update_keeps_untouched() {
+        let mut p = Palette::new();
+        p.apply(&Pds {
+            palette_id: 0,
+            palette_version_number: 0,
+            entries: vec![palette_entry(1, 235, 128, 128, 0xFF)],
+        });
+        let one = p.get(1);
+        assert_eq!(one.a, 0xFF);
+        // A second PDS that only writes index 2 must leave index 1 intact.
+        p.apply(&Pds {
+            palette_id: 0,
+            palette_version_number: 1,
+            entries: vec![palette_entry(2, 16, 128, 128, 0xFF)],
+        });
+        assert_eq!(p.get(1), one);
+        assert_eq!(p.get(2).a, 0xFF);
+        // Index 2 is studio-black → RGB (0,0,0) opaque.
+        assert_eq!(
+            p.get(2),
+            Rgba8 {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0xFF
+            }
+        );
+    }
+
+    #[test]
+    fn from_palettes_with_id_selects_matching() {
+        let pals = vec![
+            Pds {
+                palette_id: 0,
+                palette_version_number: 0,
+                entries: vec![palette_entry(1, 235, 128, 128, 0xFF)],
+            },
+            Pds {
+                palette_id: 1,
+                palette_version_number: 0,
+                entries: vec![palette_entry(1, 16, 128, 128, 0xFF)],
+            },
+        ];
+        // palette_id 1 → index 1 is black-opaque, not white.
+        let p = Palette::from_palettes_with_id(&pals, 1);
+        assert_eq!(
+            p.get(1),
+            Rgba8 {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0xFF
+            }
+        );
+        // A palette_id with no matching PDS → all transparent.
+        let none = Palette::from_palettes_with_id(&pals, 7);
+        assert_eq!(none.get(1), Rgba8::TRANSPARENT);
+    }
+
+    #[test]
+    fn decoded_object_to_rgba_and_bytes() {
+        let mut p = Palette::new();
+        p.apply(&Pds {
+            palette_id: 0,
+            palette_version_number: 0,
+            entries: vec![
+                palette_entry(1, 235, 128, 128, 0xFF), // white opaque
+                palette_entry(2, 16, 128, 128, 0xFF),  // black opaque
+            ],
+        });
+        // 2x1 bitmap: index 1 then index 2.
+        let obj = DecodedObject {
+            width: 2,
+            height: 1,
+            pixels: vec![1, 2],
+        };
+        let img = obj.to_rgba(&p);
+        assert_eq!(img.width, 2);
+        assert_eq!(img.height, 1);
+        assert_eq!(img.pixel(0, 0).unwrap().a, 0xFF);
+        assert_eq!(
+            img.pixel(1, 0).unwrap(),
+            Rgba8 {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0xFF
+            }
+        );
+        assert!(img.pixel(2, 0).is_none());
+        // RGBA8888 byte layout: 2 px × 4 = 8 bytes.
+        let bytes = img.to_rgba_bytes();
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(&bytes[4..8], &[0, 0, 0, 0xFF]);
+    }
+
+    /// Build a one-DS PG byte stream with a single 2×2 object placed at
+    /// `(px, py)` on a `pw × ph` plane, using a PDS that maps index 1 to
+    /// opaque white and leaves 0 transparent. Returns the parsed DisplaySet.
+    fn render_fixture(
+        pw: u16,
+        ph: u16,
+        px: u16,
+        py: u16,
+        crop: Option<CompositionObjectCrop>,
+    ) -> DisplaySet {
+        // 2x2 all-index-1 bitmap: each line = [0x00,0x82,0x01] (run of 2 of
+        // colour 1) then EOL [0x00,0x00].
+        let rle = [0x00u8, 0x82, 0x01, 0x00, 0x00, 0x00, 0x82, 0x01, 0x00, 0x00];
+        let pcs = Pcs {
+            width: pw,
+            height: ph,
+            frame_rate: 0x10,
+            composition_number: 1,
+            composition_state: 0x80,
+            palette_update_flag: 0,
+            palette_id: 0,
+            composition_objects: vec![CompositionObject {
+                object_id: 7,
+                window_id: 0,
+                object_cropped_flag: if crop.is_some() { 0x40 } else { 0x00 },
+                object_horizontal_position: px,
+                object_vertical_position: py,
+                cropping: crop,
+            }],
+        };
+        let pds = Pds {
+            palette_id: 0,
+            palette_version_number: 0,
+            entries: vec![palette_entry(1, 235, 128, 128, 0xFF)],
+        };
+        let segs = vec![
+            seg(500, SegmentBody::Pcs(pcs)),
+            seg(500, SegmentBody::Wds(Wds { windows: vec![] })),
+            seg(500, SegmentBody::Pds(pds)),
+            seg(
+                500,
+                SegmentBody::Ods(ods(
+                    7,
+                    FragmentFlag::FirstAndLast,
+                    4 + rle.len() as u32,
+                    Some((2, 2)),
+                    &rle,
+                )),
+            ),
+            seg(500, SegmentBody::End),
+        ];
+        group_display_sets(&segs).unwrap().pop().unwrap()
+    }
+
+    #[test]
+    fn render_places_object_on_plane() {
+        let ds = render_fixture(8, 4, 2, 1, None);
+        let r = ds.render().unwrap();
+        assert_eq!(r.pts, 500);
+        assert_eq!(r.plane.width, 8);
+        assert_eq!(r.plane.height, 4);
+        // Object occupies (2..4, 1..3); white-opaque inside, transparent out.
+        for y in 0..4u16 {
+            for x in 0..8u16 {
+                let px = r.plane.pixel(x, y).unwrap();
+                let inside = (2..4).contains(&x) && (1..3).contains(&y);
+                if inside {
+                    assert_eq!(px.a, 0xFF, "({x},{y}) should be opaque");
+                    assert!(px.r >= 254, "({x},{y}) should be white");
+                } else {
+                    assert_eq!(px, Rgba8::TRANSPARENT, "({x},{y}) should be clear");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_clips_object_overrunning_plane() {
+        // Place the 2x2 object so its right/bottom edge falls off a 3x2 plane.
+        let ds = render_fixture(3, 2, 2, 1, None);
+        let r = ds.render().unwrap();
+        // Only the (2,1) pixel of the object lands on the plane.
+        assert_eq!(r.plane.pixel(2, 1).unwrap().a, 0xFF);
+        assert_eq!(r.plane.pixel(0, 0).unwrap(), Rgba8::TRANSPARENT);
+        assert_eq!(r.plane.pixel(1, 0).unwrap(), Rgba8::TRANSPARENT);
+    }
+
+    #[test]
+    fn render_honours_cropping_rectangle() {
+        // Crop to a 1x1 sub-rect at object-(1,1); placed at plane-(0,0).
+        let crop = CompositionObjectCrop {
+            horizontal_position: 1,
+            vertical_position: 1,
+            width: 1,
+            height: 1,
+        };
+        let ds = render_fixture(4, 4, 0, 0, Some(crop));
+        let r = ds.render().unwrap();
+        // Exactly one opaque pixel at the plane origin.
+        assert_eq!(r.plane.pixel(0, 0).unwrap().a, 0xFF);
+        assert_eq!(r.plane.pixel(1, 0).unwrap(), Rgba8::TRANSPARENT);
+        assert_eq!(r.plane.pixel(0, 1).unwrap(), Rgba8::TRANSPARENT);
+    }
+
+    #[test]
+    fn render_rejects_missing_object() {
+        let mut ds = render_fixture(8, 4, 0, 0, None);
+        // Drop the ODS so the composition object dangles.
+        ds.objects.clear();
+        assert!(ds.render().is_err());
+    }
+
+    #[test]
+    fn render_palette_only_pcs_with_no_objects() {
+        // A composition with zero objects renders an all-transparent plane.
+        let pcs = Pcs {
+            width: 4,
+            height: 2,
+            frame_rate: 0x10,
+            composition_number: 0,
+            composition_state: 0x00,
+            palette_update_flag: Pcs::PALETTE_UPDATE,
+            palette_id: 0,
+            composition_objects: vec![],
+        };
+        let ds = DisplaySet {
+            pcs,
+            wds: None,
+            palettes: vec![],
+            objects: vec![],
+            pts: 9,
+        };
+        let r = ds.render().unwrap();
+        assert!(r.plane.pixels.iter().all(|p| *p == Rgba8::TRANSPARENT));
+        assert_eq!(r.plane.pixels.len(), 8);
     }
 }

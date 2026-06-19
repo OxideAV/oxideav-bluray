@@ -51,6 +51,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DisplaySet` / `ReassembledObject` / `group_display_sets` /
   `parse_display_sets` re-exported from the crate root. Clean-room from
   `docs/container/bluray/pgs-segment-syntax.md`. 14 new unit tests.
+- PGS renderer in `bdmv::pgs` — the layer that turns parsed Display Sets
+  into the actual subtitle bitmap. `PaletteEntry::to_rgba` /
+  `ycbcr709_to_rgb` apply the BT.709 limited-range YCbCr→RGB conversion
+  (alpha passed through); `Palette` is a 256-entry CLUT built from one or
+  more `Pds` with incremental-update semantics (`apply`,
+  `from_palettes`, `from_palettes_with_id` selecting by the PCS's
+  `palette_id`; unwritten indices stay transparent).
+  `DecodedObject::to_rgba` resolves CLUT indices to an `RgbaImage`
+  (straight-alpha pixels, `to_rgba_bytes` for a packed RGBA8888 buffer);
+  `DisplaySet::render` composites every composition object — decoded,
+  palette-resolved, cropped to its `object_cropping_*` sub-rectangle when
+  `object_cropped_flag == 0x40`, and clipped to the plane — into a
+  `RenderedDisplaySet` graphics plane (`pcs.width × pcs.height`) at each
+  object's `(object_horizontal_position, object_vertical_position)`. A
+  composition object referencing an absent `object_id` is rejected.
+  `Rgba8` / `RgbaImage` / `Palette` / `RenderedDisplaySet` re-exported
+  from the crate root. Clean-room from
+  `docs/container/bluray/pgs-segment-syntax.md` (the *"Color is YCbCr +
+  alpha (BT.709 range as used on BD)"* palette-entry note). 10 new unit
+  tests.
 
 ## [0.0.3](https://github.com/OxideAV/oxideav-bluray/compare/v0.0.2...v0.0.3) - 2026-06-15
 

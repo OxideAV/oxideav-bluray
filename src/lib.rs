@@ -94,8 +94,8 @@ pub use bdmv::{
     pgs::{
         decode_rle, group_display_sets, parse_display_sets, parse_segments, CompositionObject,
         CompositionObjectCrop, CompositionState, DecodedObject, DisplaySet, FragmentFlag, Ods,
-        PaletteEntry, Pcs, Pds, ReassembledObject, Segment, SegmentBody, SegmentHeader,
-        SegmentType, Wds, Window,
+        Palette, PaletteEntry, Pcs, Pds, ReassembledObject, RenderedDisplaySet, Rgba8, RgbaImage,
+        Segment, SegmentBody, SegmentHeader, SegmentType, Wds, Window,
     },
 };
 pub use decrypt::{DecryptError, StreamDecryptor};

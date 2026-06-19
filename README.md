@@ -106,9 +106,29 @@ bluray://                          → auto-detect first BD-ROM mount
   body, ragged PDS, non-empty END) surface `BlurayError::Malformed`
   rather than panicking. Clean-room from
   `docs/container/bluray/pgs-segment-syntax.md`. Re-exported from the
-  crate root. (A PGS *renderer* — palette application, window
-  compositing, alpha blend onto the video plane — is downstream of this
-  parse layer and stays deferred.)
+  crate root.
+- **PGS renderer — palette resolution + window compositing**
+  (`bdmv::pgs`) — the layer that turns parsed Display Sets into the
+  actual subtitle bitmap. `PaletteEntry::to_rgba` applies the BT.709
+  limited-range YCbCr→RGB conversion (the doc's *"Color is YCbCr + alpha
+  (BT.709 range as used on BD)"* palette-entry note), passing the alpha
+  through; `Palette` is a 256-entry CLUT built from one or more `Pds`
+  with incremental-update semantics (`apply` / `from_palettes` /
+  `from_palettes_with_id`, the last selecting the CLUT the PCS names via
+  `palette_id`; unwritten indices, including 255, stay transparent).
+  `DecodedObject::to_rgba` resolves the CLUT indices to an `RgbaImage`
+  (straight-alpha `Rgba8` pixels, `to_rgba_bytes` for a packed RGBA8888
+  buffer), and `DisplaySet::render` composites every composition object —
+  decoded, palette-resolved, cropped to its `object_cropping_*`
+  sub-rectangle when `object_cropped_flag == 0x40`, and clipped to the
+  plane — into a `RenderedDisplaySet` graphics plane
+  (`pcs.width × pcs.height`) at each object's
+  `(object_horizontal_position, object_vertical_position)`. A
+  composition object referencing an `object_id` absent from the DS is
+  rejected. `Rgba8` / `RgbaImage` / `Palette` / `RenderedDisplaySet`
+  re-exported from the crate root. (Alpha-blend onto the decoded video
+  plane is the downstream player's job; this yields the straight-alpha
+  overlay it blends.) 10 new unit tests.
 - **PGS Display Set grouping + ODS fragment reassembly** (`bdmv::pgs`) —
   the layer above the flat segment list. `group_display_sets` (and the
   one-shot `parse_display_sets`) slice a `Vec<Segment>` into
