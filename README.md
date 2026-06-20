@@ -55,7 +55,17 @@ bluray://                          → auto-detect first BD-ROM mount
   128 Player Status Registers with their Playback-Status / Player-Setting
   access class, `gpr_convention` the 4096-GPR authoring partition,
   `Operand::resolve_register` joining a register operand to its named
-  `PsrInfo`),
+  `PsrInfo`) **+ a minimal HDMV navigation VM** (`bdmv::vm::HdmvVm`:
+  executes the decoded commands against a 4096-GPR / 128-PSR register
+  file — Move/Swap, the arithmetic group (Add/Sub/Mul wrapping, Div/Mod
+  truncating with ÷0→0), bitwise And/Or/Xor, single-bit Set/Clear, the
+  two shifts, the seven Compare ops as a conditional-skip of the next
+  command, and `GoTo`/`Break`/`Nop` flow control; the playback-leaving
+  branches and `SetSystem` ops halt-and-yield a typed `NavRequest`, and
+  nav writes to read-only/Player-Setting PSRs are dropped) **driven over
+  the whole MOBJ table** by `bdmv::mobj_runner::MobjRunner`, which
+  follows `JumpObject`/`CallObject`/`Resume` with a resume stack and one
+  shared register file,
   `PLAYLIST/*.mpls` PlayList + PlayItem + STN_table
   summary + ClipMark, `CLIPINF/*.clpi` ClipInfo + SequenceInfo +
   ProgramInfo + CPI EP_map (per-stream-PID entry-point map — coarse +
@@ -329,18 +339,24 @@ bluray://                          → auto-detect first BD-ROM mount
   (ExtendedFileEntry §14.17 parsing, long/extended allocation
   descriptors §14.14.2–3, and Allocation Extent Descriptor
   continuation chains §14.5 now landed — listed in Scope above.)
-- HDMV nav-command *execution* — the decode of the 12-byte command
-  word into `DecodedCommand` (group / sub-group / named `Operation` /
-  GPR-PSR operand addressing) now landed (see Scope above), driven by
-  the `docs/container/bluray/hdmv-navigation-commands.md` clean-room
-  table. What stays deferred is the VM that *runs* the commands: the
-  GPR/PSR register file mutation, resume-intention handling, UO-mask
-  interaction, the IG button-state machine, and `Div`/`Mod` rounding +
-  arithmetic overflow — those behavioural rules live in the
-  member-gated BD-ROM Part 3 normative book. The `SetStream` /
-  `SetSecondaryStream` operand-word sub-field packing (which bits pick
-  audio vs PG vs angle, the change/keep flags) is also not yet
-  tabulated in `docs/` and is surfaced only as the raw operand words.
+- HDMV nav-command *execution* now landed (see Scope above): the
+  `bdmv::vm::HdmvVm` interpreter runs the decoded Set / Compare / Branch
+  commands against the GPR/PSR register file, and `bdmv::mobj_runner`
+  drives the whole `MovieObject.bdmv` table across
+  `JumpObject`/`CallObject`/`Resume`, all from the
+  `docs/container/bluray/hdmv-navigation-commands.md` clean-room table.
+  What stays deferred is the *player-side* model the BDMV table alone
+  does not carry: resume-intention handling, the UO mask, and the IG
+  button-state machine — surfaced as a yielded `NavRequest` for the
+  player layer rather than executed. The exact rounding of `Div`/`Mod`
+  on out-of-band operands and the precise arithmetic-overflow rule are
+  not pinned down by the public clean-room material (the VM uses
+  wrapping unsigned arithmetic, truncating division, ÷0→0); those edge
+  cases live in the member-gated BD-ROM Part 3 normative book. The
+  `SetStream` / `SetSecondaryStream` operand-word sub-field packing
+  (which bits pick audio vs PG vs angle, the change/keep flags) is also
+  not yet tabulated in `docs/` and is surfaced only as the raw operand
+  words on the yielded `NavRequest::SetSystem`.
 
 ## Standalone build
 

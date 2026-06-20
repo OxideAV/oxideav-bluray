@@ -17,9 +17,13 @@
 //! - Pluggable `StreamDecryptor` trait (AACS adapter lives elsewhere).
 //!
 //! Out of scope (deferred or indefinite):
-//! - HDMV interactive layer (`MovieObject.bdmv` opcode execution).
 //! - BD-J (Java VM).
 //! - SubPath PiP / secondary-video streams.
+//!
+//! (The HDMV interactive layer's `MovieObject.bdmv` opcode *decode* and a
+//! minimal navigation *VM* — `bdmv::nav_command`, `bdmv::vm`,
+//! `bdmv::mobj_runner` — now land; the player-side IG button-state
+//! machine / UO mask stay deferred.)
 //!
 //! ## Clean-room references
 //!

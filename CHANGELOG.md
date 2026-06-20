@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- End-to-end HDMV navigation pipeline test (`tests/hdmv_vm_pipeline.rs`):
+  hand-assembles a `MovieObject.bdmv` byte image (raw big-endian wire
+  bytes — the 12-byte command words emitted by hand from the clean-room
+  opcode table, not the crate's `encode` helper), parses it with
+  `MovieObjects::parse`, then *executes* the command lists with
+  `MobjRunner` against a shared register file. Covers arithmetic, the
+  Compare conditional-skip, a `JumpTitle` yield, a multi-object
+  `CallObject → JumpObject → return → JumpTitle` chain (asserting the
+  callee's GPR write survives the return), and a player-seeded PSR4
+  (Title) the script branches on.
 - HDMV **Movie Object runner** (`bdmv::mobj_runner`): drives the whole
   `MovieObject.bdmv` table with one shared `HdmvVm` register file,
   following the inter-object Branch semantics the VM yields. `JumpObject`
