@@ -56,6 +56,7 @@
 //! Clean-room source: `docs/container/bluray/hdmv-navigation-commands.md`.
 
 use super::movie_object::NavCommand;
+use super::register_model::{psr_info, PsrInfo};
 
 /// Command group (`grp`, bits 28-27 of the operation word).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -174,6 +175,20 @@ pub enum Operand {
     Register { bank: RegisterBank, index: u16 },
 }
 
+/// A register reference resolved against the HDMV register model: its
+/// bank, index, and (for PSRs) the named [`PsrInfo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedRegister {
+    /// The register bank this operand targets.
+    pub bank: RegisterBank,
+    /// The register index (low 12 bits of the operand word).
+    pub index: u16,
+    /// For [`RegisterBank::Psr`]/[`RegisterBank::PsrSecondary`] with an
+    /// in-range index (0..127), the named PSR; `None` for GPR references
+    /// or an out-of-range PSR index.
+    pub psr: Option<PsrInfo>,
+}
+
 impl Operand {
     /// Decode an operand word given its immediate flag.
     fn decode(word: u32, immediate: bool) -> Self {
@@ -190,6 +205,28 @@ impl Operand {
             Operand::Register {
                 bank,
                 index: (word & 0x0FFF) as u16,
+            }
+        }
+    }
+
+    /// Resolve a register-reference operand against the HDMV register
+    /// model, attaching the named [`PsrInfo`] for PSR references.
+    ///
+    /// Returns `None` for an [`Operand::Immediate`] (immediates have no
+    /// bank). For a GPR reference the `psr` field of the result is
+    /// `None`; for a PSR reference it carries the named register when the
+    /// index is in range (0..127).
+    pub fn resolve_register(&self) -> Option<ResolvedRegister> {
+        match *self {
+            Operand::Immediate(_) => None,
+            Operand::Register { bank, index } => {
+                let psr = match bank {
+                    RegisterBank::Gpr => None,
+                    RegisterBank::Psr | RegisterBank::PsrSecondary => {
+                        u8::try_from(index).ok().and_then(psr_info)
+                    }
+                };
+                Some(ResolvedRegister { bank, index, psr })
             }
         }
     }

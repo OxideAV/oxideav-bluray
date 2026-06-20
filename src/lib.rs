@@ -90,12 +90,17 @@ pub use bdmv::{
         SecondaryAudioStream, SecondaryVideoStream, StnTable, StreamCodingType, SubPath,
         TextSubtitleStream, VideoFormat,
     },
-    nav_command::{CommandGroup, DecodedCommand, Operand, Operation, RegisterBank},
+    nav_command::{
+        CommandGroup, DecodedCommand, Operand, Operation, RegisterBank, ResolvedRegister,
+    },
     pgs::{
         decode_rle, group_display_sets, parse_display_sets, parse_segments, CompositionObject,
         CompositionObjectCrop, CompositionState, DecodedObject, DisplaySet, FragmentFlag, Ods,
         Palette, PaletteEntry, Pcs, Pds, ReassembledObject, RenderedDisplaySet, Rgba8, RgbaImage,
         Segment, SegmentBody, SegmentHeader, SegmentType, Wds, Window,
+    },
+    register_model::{
+        gpr_convention, psr_info, GprConvention, PsrClass, PsrInfo, GPR_COUNT, PSR_COUNT,
     },
 };
 pub use decrypt::{DecryptError, StreamDecryptor};

@@ -50,7 +50,12 @@ bluray://                          → auto-detect first BD-ROM mount
   (Nop, GoTo, JumpTitle, PlayPL, the seven Compare ops, the fifteen
   register Set ops, the eleven SetSystem ops), plus the two operand
   words decoded into immediate values or GPR/PSR register references;
-  all worked-hex examples from the clean-room table round-trip),
+  all worked-hex examples from the clean-room table round-trip) **+ the
+  PSR/GPR register model** (`bdmv::register_model`: `psr_info` names the
+  128 Player Status Registers with their Playback-Status / Player-Setting
+  access class, `gpr_convention` the 4096-GPR authoring partition,
+  `Operand::resolve_register` joining a register operand to its named
+  `PsrInfo`),
   `PLAYLIST/*.mpls` PlayList + PlayItem + STN_table
   summary + ClipMark, `CLIPINF/*.clpi` ClipInfo + SequenceInfo +
   ProgramInfo + CPI EP_map (per-stream-PID entry-point map — coarse +

@@ -33,6 +33,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into immediate values or GPR/PSR register references. Clean-room from
   `docs/container/bluray/hdmv-navigation-commands.md`; every worked-hex
   example in the table round-trips.
+- HDMV register model in `bdmv::register_model` — the PSR / GPR naming
+  layer above the raw `Operand::Register` bank+index. `psr_info(index)`
+  maps a Player Status Register index to a `PsrInfo` (name + `PsrClass`
+  Playback-Status / read-only Playback-Status / Player-Setting /
+  Reserved), covering the named PSR0–20/29–31/36–44 set, the
+  characteristic-text-capability range PSR48–61, and every reserved hole;
+  `PsrClass::is_read_only_to_nav` tells whether a navigation command may
+  mutate it. `gpr_convention(index)` returns the authoring-convention use
+  of a GPR plus a `bd_j_reachable` flag (GPR1000–4005). `GPR_COUNT` (4096)
+  / `PSR_COUNT` (128) constants. `Operand::resolve_register` joins a
+  decoded register-reference operand to its `ResolvedRegister`
+  (bank + index + named `PsrInfo` for PSR refs). Clean-room from the
+  "Register model" section of
+  `docs/container/bluray/hdmv-navigation-commands.md`; re-exported from
+  the crate root. 11 new unit tests.
 - PGS Display Set grouping + ODS fragment reassembly in `bdmv::pgs`,
   the layer above the flat segment list: `group_display_sets` /
   `parse_display_sets` slice a segment list into `DisplaySet`s on each
