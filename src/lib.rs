@@ -102,6 +102,7 @@ pub use bdmv::{
     register_model::{
         gpr_convention, psr_info, GprConvention, PsrClass, PsrInfo, GPR_COUNT, PSR_COUNT,
     },
+    vm::{HdmvVm, NavRequest, Registers, Step, DEFAULT_STEP_BUDGET},
 };
 pub use decrypt::{DecryptError, StreamDecryptor};
 pub use disc::{

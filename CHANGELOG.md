@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- HDMV navigation **virtual machine** (`bdmv::vm`): a minimal command
+  interpreter that *executes* the decoded 12-byte nav-commands against a
+  register file, the milestone above bare decode. `Registers` holds the
+  two banks (4096 GPRs + 128 PSRs, 32-bit); `HdmvVm::step` / `run`
+  evaluate each command. **Set / register ops** mutate the destination
+  in place — Move, Swap, the arithmetic group (Add/Sub/Mul wrapping,
+  Div/Mod truncating with ÷0→0), the bitwise group (And/Or/Xor), single
+  bit Set/Clear, and the two shifts (≥32 → 0). **Compare ops**
+  (BC/EQ/NE/GE/GT/LE/LT) implement the conditional-skip model — a false
+  comparison skips the next command (`Step::Skipped`). **Branch ops**
+  GoTo (PC redirect, out-of-range halts) / Break / Nop run in-VM; the
+  navigation branches that leave the command list (JumpTitle, JumpObject,
+  Call*, Resume, PlayPL*, TerminatePL, LinkPI/MK) and the SetSystem ops
+  halt-and-yield a typed `NavRequest` with resolved operand values, so
+  the surrounding player layer owns the title/IG transition. Navigation
+  writes to read-only / Player-Setting / reserved PSRs are dropped per
+  the register-model class; `Registers::set_psr_player` seeds player
+  state. An infinite `GoTo` loop is bounded by a step budget. Clean-room
+  from `docs/container/bluray/hdmv-navigation-commands.md`; re-exported
+  from the crate root (`HdmvVm`, `Registers`, `NavRequest`, `Step`).
 - End-to-end PGS / HDMV integration test (`tests/pgs_sup_pipeline.rs`):
   assembles a synthetic `.sup`-style PG byte stream by hand (raw
   big-endian wire bytes, not the crate's `encode` helpers) and drives it

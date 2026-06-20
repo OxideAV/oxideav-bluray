@@ -30,5 +30,6 @@ pub mod mpls;
 pub mod nav_command;
 pub mod pgs;
 pub mod register_model;
+pub mod vm;
 
 pub use common::{BdmvHeader, Reader};
