@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- End-to-end PGS / HDMV integration test (`tests/pgs_sup_pipeline.rs`):
+  assembles a synthetic `.sup`-style PG byte stream by hand (raw
+  big-endian wire bytes, not the crate's `encode` helpers) and drives it
+  through `parse_segments` → `group_display_sets` →
+  `DisplaySet::reassemble_objects` / `render` to an RGBA graphics plane,
+  asserting segment ordering, ODS RLE expansion, palette resolution and
+  composite placement; plus a hand-built `MovieObject.bdmv` whose
+  navigation commands are decoded and whose register operands resolve
+  against the PSR/GPR model (`JumpTitle`, `Move GPR1`, `EQ PSR4 (Title)`).
+
 - Presentation Graphic Stream (PGS) segment parser in
   `bdmv::pgs`: the shared 13-byte PG segment header (`SegmentHeader`),
   the five typed segment bodies — `Pcs` (composition objects + cropping
