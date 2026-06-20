@@ -121,7 +121,7 @@ fn parse_then_execute_compare_skip() {
 
 #[test]
 fn parse_then_execute_jump_title_yields() {
-    // First-Playback-style object that jumps to title 1.
+    // A First-Playback entry object that jumps to title 1.
     let image = build_mobj(&[(0, vec![jump_title(1)])]);
     let table = MovieObjects::parse(&image).unwrap();
     let mut runner = MobjRunner::new(&table);
