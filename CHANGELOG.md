@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- HDMV **Movie Object runner** (`bdmv::mobj_runner`): drives the whole
+  `MovieObject.bdmv` table with one shared `HdmvVm` register file,
+  following the inter-object Branch semantics the VM yields. `JumpObject`
+  switches object (PC 0); `CallObject` pushes a `(object, pc)` resume
+  frame then switches; `Resume` (and an object's list running off the end
+  or hitting `Break`) pops the frame and continues the caller after its
+  call — so GPRs a callee sets are visible to the caller, matching the
+  single global register file on a player. Everything needing disc/player
+  state the BDMV table alone does not carry (`JumpTitle`, `CallTitle`,
+  the `PlayPL*` family, `TerminatePL`, `Link*`, `SetSystem`) is yielded
+  as a `RunOutcome::Request(NavRequest)` and the run is resumable with
+  `MobjRunner::resume` once the player services it. Bad object ids and a
+  pathological inter-object Jump/Call cycle are bounded
+  (`RunOutcome::BadObject` / `BudgetExhausted`). Re-exported from the
+  crate root (`MobjRunner`, `RunOutcome`).
 - HDMV navigation **virtual machine** (`bdmv::vm`): a minimal command
   interpreter that *executes* the decoded 12-byte nav-commands against a
   register file, the milestone above bare decode. `Registers` holds the

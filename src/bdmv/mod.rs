@@ -25,6 +25,7 @@
 pub mod clpi;
 pub mod common;
 pub mod index_bdmv;
+pub mod mobj_runner;
 pub mod movie_object;
 pub mod mpls;
 pub mod nav_command;
