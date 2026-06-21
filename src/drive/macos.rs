@@ -77,8 +77,7 @@
 //! - `CoreFoundation.framework/Headers/CFUUID.h`
 //! - `CoreFoundation.framework/Headers/CFPlugInCOM.h`
 //!
-//! No third-party Blu-ray decryption code (libbluray, libaacs,
-//! aacskeys, makemkv, AnyDVD, …) was consulted.
+//! No third-party Blu-ray decryption code was consulted.
 
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
