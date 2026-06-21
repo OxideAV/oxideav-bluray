@@ -84,7 +84,7 @@ pub mod udf;
 
 pub use bdmv::{
     clpi::{ClipInfo, ClipMark, Cpi, EpEntry, EpMap, ProgramInfo, SequenceInfo, StreamCodingInfo},
-    index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType},
+    index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType, TitleEntry},
     mobj_runner::{MobjRunner, RunOutcome, DEFAULT_OBJECT_BUDGET},
     movie_object::{MovieObject, MovieObjects, NavCommand},
     mpls::{

@@ -101,6 +101,46 @@ pub enum IndexObjectType {
     },
 }
 
+impl IndexObjectType {
+    /// The HDMV `movie_object_id_ref` this entry runs, or `None` if the
+    /// entry is a BD-J title (which the HDMV navigation engine cannot
+    /// run — BD-J is the Java VM, out of scope).
+    pub fn hdmv_movie_object_id(&self) -> Option<u16> {
+        match self {
+            IndexObjectType::Hdmv {
+                movie_object_id_ref,
+                ..
+            } => Some(*movie_object_id_ref),
+            IndexObjectType::BdJ { .. } => None,
+        }
+    }
+
+    /// `true` if this entry is an HDMV Movie Object (runnable by the
+    /// navigation VM); `false` for a BD-J title.
+    pub fn is_hdmv(&self) -> bool {
+        matches!(self, IndexObjectType::Hdmv { .. })
+    }
+}
+
+/// A resolved navigation entry point into the disc's title structure.
+///
+/// `index.bdmv` names three classes of entry: the *First Playback* title
+/// (run on disc insert, before the menu), the *Top Menu* title (the disc
+/// menu reachable via the Top-Menu user operation), and the numbered
+/// *playable titles* (`Title 1`…`Title N`). A navigation `JumpTitle` /
+/// `CallTitle` names one of these by number; the player resolves it back
+/// through `index.bdmv` to the Movie Object that implements it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleEntry {
+    /// The First Playback title (`index.bdmv` FirstPlaybackTitle).
+    FirstPlayback,
+    /// The Top Menu title (`index.bdmv` MenuTitle).
+    TopMenu,
+    /// A numbered playable title. `number` is the 1-based on-disc title
+    /// number (`Title 1` … `Title N`).
+    Title { number: u16 },
+}
+
 /// One title entry in `index.bdmv`. The first two entries are special
 /// (FirstPlaybackTitle and MenuTitle); the remainder are the playable
 /// title list addressable as title 1..=N.
@@ -191,6 +231,35 @@ impl IndexBdmv {
                 .map(|object| IndexEntry { object })
                 .collect(),
         })
+    }
+
+    /// Look up the `IndexEntry` for a [`TitleEntry`] selector.
+    ///
+    /// - [`TitleEntry::FirstPlayback`] → [`Self::first_playback_title`].
+    /// - [`TitleEntry::TopMenu`] → [`Self::menu_title`].
+    /// - [`TitleEntry::Title`] with a 1-based `number` → `titles[number-1]`
+    ///   (returns `None` for `number == 0` or out of range).
+    pub fn entry(&self, which: TitleEntry) -> Option<&IndexEntry> {
+        match which {
+            TitleEntry::FirstPlayback => Some(&self.first_playback_title),
+            TitleEntry::TopMenu => Some(&self.menu_title),
+            TitleEntry::Title { number } => {
+                let idx = (number as usize).checked_sub(1)?;
+                self.titles.get(idx)
+            }
+        }
+    }
+
+    /// Resolve a [`TitleEntry`] to the HDMV `movie_object_id_ref` that
+    /// implements it, or `None` if the entry does not exist or is a BD-J
+    /// title (not runnable by the HDMV navigation VM).
+    pub fn resolve_movie_object(&self, which: TitleEntry) -> Option<u16> {
+        self.entry(which)?.object.hdmv_movie_object_id()
+    }
+
+    /// The number of numbered playable titles (`Title 1`…`Title N`).
+    pub fn title_count(&self) -> u16 {
+        self.titles.len() as u16
     }
 
     /// Encode an `IndexBdmv` back to bytes. Only used by tests to
@@ -361,6 +430,33 @@ mod tests {
         let mut bytes = sample_index().encode();
         bytes[0] = b'X';
         assert!(IndexBdmv::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn entry_resolution_by_title_entry() {
+        let idx = sample_index();
+        // FirstPlayback → movie object 0; TopMenu → movie object 1.
+        assert_eq!(idx.resolve_movie_object(TitleEntry::FirstPlayback), Some(0));
+        assert_eq!(idx.resolve_movie_object(TitleEntry::TopMenu), Some(1));
+        // Title 1 → movie object 2 (titles[0]).
+        assert_eq!(
+            idx.resolve_movie_object(TitleEntry::Title { number: 1 }),
+            Some(2)
+        );
+        // Title 2 is BD-J → not runnable by the HDMV VM.
+        assert_eq!(
+            idx.resolve_movie_object(TitleEntry::Title { number: 2 }),
+            None
+        );
+        assert!(!idx
+            .entry(TitleEntry::Title { number: 2 })
+            .unwrap()
+            .object
+            .is_hdmv());
+        // Title 0 (invalid; titles are 1-based) and out-of-range → None.
+        assert!(idx.entry(TitleEntry::Title { number: 0 }).is_none());
+        assert!(idx.entry(TitleEntry::Title { number: 99 }).is_none());
+        assert_eq!(idx.title_count(), 2);
     }
 
     #[test]
