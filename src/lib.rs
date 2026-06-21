@@ -98,6 +98,7 @@ pub use bdmv::{
     nav_command::{
         CommandGroup, DecodedCommand, Operand, Operation, RegisterBank, ResolvedRegister,
     },
+    nav_driver::{DriveOutcome, NavDriver, PlayRequest, DEFAULT_TITLE_BUDGET},
     pgs::{
         decode_rle, group_display_sets, parse_display_sets, parse_segments, CompositionObject,
         CompositionObjectCrop, CompositionState, DecodedObject, DisplaySet, FragmentFlag, Ods,

@@ -29,6 +29,7 @@ pub mod mobj_runner;
 pub mod movie_object;
 pub mod mpls;
 pub mod nav_command;
+pub mod nav_driver;
 pub mod pgs;
 pub mod register_model;
 pub mod vm;

@@ -112,6 +112,20 @@ impl<'a> MobjRunner<'a> {
         self.current
     }
 
+    /// Position the runner at Movie Object `object`, program counter `pc`,
+    /// **without** clearing the resume stack or register file. A subsequent
+    /// [`Self::resume`] continues from there.
+    ///
+    /// This is the re-entry the title-level driver uses to return to a
+    /// calling title after an inter-title `CallTitle` returns: the driver
+    /// owns the *title* call stack, the runner owns the per-table *object*
+    /// call stack, and this lets the driver hand a saved `(object, pc)` back
+    /// to the runner with the shared register file intact.
+    pub fn set_object_pc(&mut self, object: usize, pc: usize) {
+        self.current = object;
+        self.vm.set_pc(pc);
+    }
+
     /// Depth of the resume (Call) stack.
     pub fn call_depth(&self) -> usize {
         self.resume.len()
