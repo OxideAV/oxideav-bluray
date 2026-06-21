@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Title-level HDMV **navigation driver** (`bdmv::nav_driver::NavDriver`):
+  the disc title engine that ties `index.bdmv` to `MovieObject.bdmv`. The
+  `MobjRunner` drives one object table and follows intra-table
+  `JumpObject`/`CallObject`/`Resume`, but `JumpTitle`/`CallTitle` name a
+  *title number* only `index.bdmv` can resolve to a Movie Object. The
+  driver closes that loop: a `TitleEntry` (FirstPlayback / TopMenu /
+  numbered Title N) resolves to its HDMV Movie Object via the index, PSR4
+  (Title) is seeded on entry (`0xFFFF` for the menu), the `MobjRunner` runs
+  with a shared register file, and the inter-title
+  `JumpTitle`/`CallTitle`/title-`Resume` transitions are serviced by the
+  driver itself — its own title-call stack (separate from the runner's
+  object stack) keeps a `CallTitle`'s register writes visible to the caller
+  after the called title returns. `PlayPL*` surfaces as a resolved
+  `DriveOutcome::Play(PlayRequest { playlist, play_item, mark })` and the
+  remaining player ops (`TerminatePL`/`Link*`/`SetSystem`) as
+  `DriveOutcome::Request`; both are resumable with `NavDriver::resume` once
+  serviced. Bad titles (out-of-range / BD-J) and pathological inter-title
+  cycles are bounded (`DriveOutcome::BadTitle`/`BadObject`/`BudgetExhausted`).
+  Adds `IndexBdmv::resolve_movie_object` / `entry` / `title_count` +
+  `TitleEntry` + `IndexObjectType::hdmv_movie_object_id`/`is_hdmv`, and
+  `MobjRunner::set_object_pc` for the driver's mid-table re-entry. Re-exported
+  from the crate root (`NavDriver`, `DriveOutcome`, `PlayRequest`,
+  `TitleEntry`, `DEFAULT_TITLE_BUDGET`).
 - End-to-end HDMV navigation pipeline test (`tests/hdmv_vm_pipeline.rs`):
   hand-assembles a `MovieObject.bdmv` byte image (raw big-endian wire
   bytes — the 12-byte command words emitted by hand from the clean-room

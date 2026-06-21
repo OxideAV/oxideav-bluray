@@ -65,7 +65,18 @@ bluray://                          → auto-detect first BD-ROM mount
   nav writes to read-only/Player-Setting PSRs are dropped) **driven over
   the whole MOBJ table** by `bdmv::mobj_runner::MobjRunner`, which
   follows `JumpObject`/`CallObject`/`Resume` with a resume stack and one
-  shared register file,
+  shared register file, **and the whole disc title structure** by
+  `bdmv::nav_driver::NavDriver`, the title-engine layer that ties
+  `index.bdmv` to `MovieObject.bdmv`: it resolves a `TitleEntry`
+  (FirstPlayback / TopMenu / numbered Title N) to its HDMV Movie Object
+  via the index, seeds PSR4 (Title) on entry, services the inter-title
+  `JumpTitle`/`CallTitle`/title-`Resume` transitions itself (its own
+  title-call stack, separate from the runner's object stack, with the
+  shared register file surviving a `CallTitle` return), and surfaces only
+  `PlayPL*` (as a resolved `DriveOutcome::Play(PlayRequest)`) and the
+  remaining player ops (`TerminatePL`/`Link*`/`SetSystem`, as
+  `DriveOutcome::Request`) — both resumable after the caller services
+  them, with inter-title cycles budget-bounded;
   `PLAYLIST/*.mpls` PlayList + PlayItem + STN_table
   summary + ClipMark, `CLIPINF/*.clpi` ClipInfo + SequenceInfo +
   ProgramInfo + CPI EP_map (per-stream-PID entry-point map — coarse +
