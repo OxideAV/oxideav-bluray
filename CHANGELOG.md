@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CLPI ClipInfo + ProgramInfo demux accessors** (`bdmv::clpi`,
+  BD-ROM Part 3 §5.5.4.1 / §5.5.4.3 + AV §3.1) — the second pure-
+  derivation layer over already-parsed `.clpi` fields. `ClipInfo`
+  grows the byte/SPN index a demuxer needs to turn a CPI EP_map's
+  `spn_ep_start` into a file position: `clip_byte_len()`
+  (`number_of_source_packets × 192`, the fixed BDAV source-packet
+  size), `spn_to_byte(spn)` / `byte_to_spn(byte)` (inverse, range-
+  checked against the packet count), and `transfer_duration_secs()`
+  (multiplex-rate-derived transfer time `clip_byte_len /
+  ts_recording_rate`, `None` on a zero rate). `ProgramInfo` /
+  `ProgramEntry` grow the per-PID lookups a demuxer building a flat PID
+  table wants: `ProgramEntry::{stream_by_pid, video_streams,
+  audio_streams}` and `ProgramInfo::{stream_count, streams (flatten),
+  stream_by_pid (cross-program), program_by_pmt_pid, primary_video_pid}`.
+  All classification reuses the existing `StreamCodingType::is_video` /
+  `is_audio`. 8 new unit tests cover the byte/SPN round trip + range
+  boundaries, transfer-duration incl. the zero-rate guard, per-program
+  and cross-program PID search, PMT-PID program lookup, and
+  first-in-order primary-video-PID selection (incl. the audio-only
+  `None` case).
 - **CLPI SequenceInfo demux accessors** (`bdmv::clpi`, BD-ROM Part 3
   §5.5.4.2) — the SequenceInfo / AtcSequence / StcSequence structs the
   `.clpi` parser already populated carried zero accessor methods; the

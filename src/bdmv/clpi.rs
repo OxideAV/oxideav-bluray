@@ -48,6 +48,53 @@ pub struct ClipInfo {
     pub ts_type_info_block: TsTypeInfoBlock,
 }
 
+impl ClipInfo {
+    /// Total size of the clip's `.m2ts` file in bytes: every source
+    /// packet is the fixed 192-byte BDAV unit
+    /// ([`crate::m2ts::M2TS_PACKET_LEN`]), so the clip body is exactly
+    /// `number_of_source_packets × 192` (BD-ROM AV §3.1).
+    pub fn clip_byte_len(&self) -> u64 {
+        u64::from(self.number_of_source_packets) * crate::m2ts::M2TS_PACKET_LEN as u64
+    }
+
+    /// Byte offset of source-packet number `spn` inside the `.m2ts`
+    /// file (`spn × 192`). A demuxer maps a CPI EP_map's
+    /// [`EpEntry::spn_ep_start`] to a file position this way; the seek
+    /// path then snaps it to the enclosing 6144-byte AACS unit. `None`
+    /// when `spn` is past `number_of_source_packets` (out of range).
+    pub fn spn_to_byte(&self, spn: u32) -> Option<u64> {
+        if spn > self.number_of_source_packets {
+            return None;
+        }
+        Some(u64::from(spn) * crate::m2ts::M2TS_PACKET_LEN as u64)
+    }
+
+    /// Source-packet number containing byte offset `byte` (the inverse
+    /// of [`Self::spn_to_byte`], truncating toward the packet start).
+    /// `None` when `byte` lands at or past the clip's byte length.
+    pub fn byte_to_spn(&self, byte: u64) -> Option<u32> {
+        let spn = byte / crate::m2ts::M2TS_PACKET_LEN as u64;
+        if spn >= u64::from(self.number_of_source_packets) {
+            return None;
+        }
+        Some(spn as u32)
+    }
+
+    /// Wall-clock duration the clip's `ts_recording_rate` implies for
+    /// its body, in seconds: `clip_byte_len / ts_recording_rate`. This
+    /// is the multiplex-rate-derived transfer time (how long the bytes
+    /// take to arrive at the recording bitrate), distinct from the
+    /// presentation span [`SequenceInfo::presentation_span_90k`] gives.
+    /// `None` when the recorded rate is zero (a malformed / homemade
+    /// clip).
+    pub fn transfer_duration_secs(&self) -> Option<f64> {
+        if self.ts_recording_rate == 0 {
+            return None;
+        }
+        Some(self.clip_byte_len() as f64 / f64::from(self.ts_recording_rate))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TsTypeInfoBlock {
     pub validity_flags: u8,
@@ -294,9 +341,65 @@ pub struct ProgramEntry {
     pub streams: Vec<StreamCodingInfo>,
 }
 
+impl ProgramEntry {
+    /// Find this program's elementary stream carried on `pid`. `None`
+    /// when no stream in the program declares that PID.
+    pub fn stream_by_pid(&self, pid: u16) -> Option<&StreamCodingInfo> {
+        self.streams.iter().find(|s| s.pid == pid)
+    }
+
+    /// Iterate over the program's video elementary streams (those whose
+    /// `stream_coding_type` classifies as video — MPEG-2 / AVC / HEVC /
+    /// VC-1).
+    pub fn video_streams(&self) -> impl Iterator<Item = &StreamCodingInfo> {
+        self.streams.iter().filter(|s| s.coding_type().is_video())
+    }
+
+    /// Iterate over the program's audio elementary streams.
+    pub fn audio_streams(&self) -> impl Iterator<Item = &StreamCodingInfo> {
+        self.streams.iter().filter(|s| s.coding_type().is_audio())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramInfo {
     pub programs: Vec<ProgramEntry>,
+}
+
+impl ProgramInfo {
+    /// Total elementary-stream count across every program.
+    pub fn stream_count(&self) -> usize {
+        self.programs.iter().map(|p| p.streams.len()).sum()
+    }
+
+    /// Iterate over every elementary stream in every program, flattened
+    /// in recording order. Convenient for a demuxer building a flat PID
+    /// table from a single clip's ProgramInfo.
+    pub fn streams(&self) -> impl Iterator<Item = &StreamCodingInfo> {
+        self.programs.iter().flat_map(|p| p.streams.iter())
+    }
+
+    /// Find the elementary stream carried on `pid`, searching every
+    /// program. `None` when no program declares that PID.
+    pub fn stream_by_pid(&self, pid: u16) -> Option<&StreamCodingInfo> {
+        self.streams().find(|s| s.pid == pid)
+    }
+
+    /// Find the program whose PMT (`program_map_pid`) equals `pmt_pid`.
+    /// `None` when no program carries that PMT PID.
+    pub fn program_by_pmt_pid(&self, pmt_pid: u16) -> Option<&ProgramEntry> {
+        self.programs.iter().find(|p| p.program_map_pid == pmt_pid)
+    }
+
+    /// The PID of the first video elementary stream across all
+    /// programs, in recording order — the clip's primary video track
+    /// for a demuxer that wants to route the main picture. `None` when
+    /// the clip carries no recognised video stream.
+    pub fn primary_video_pid(&self) -> Option<u16> {
+        self.streams()
+            .find(|s| s.coding_type().is_video())
+            .map(|s| s.pid)
+    }
 }
 
 /// Typed view of the 4-bit `EP_stream_type` field carried in the CPI
@@ -1909,5 +2012,138 @@ mod tests {
         assert!(si.first_stc_sequence().is_none());
         assert!(si.stc_sequence_by_id(0).is_none());
         assert_eq!(si.presentation_span_90k(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // ClipInfo byte/SPN demux accessors
+    // -------------------------------------------------------------------
+
+    fn clip_info(rate: u32, packets: u32) -> ClipInfo {
+        ClipInfo {
+            clip_stream_type: 1,
+            application_type: 1,
+            ts_recording_rate: rate,
+            number_of_source_packets: packets,
+            ts_type_info_block: TsTypeInfoBlock::default(),
+        }
+    }
+
+    #[test]
+    fn clip_info_byte_len_and_spn_byte_conversion() {
+        let ci = clip_info(48_000_000, 1000);
+        assert_eq!(ci.clip_byte_len(), 1000 * 192);
+        // SPN → byte.
+        assert_eq!(ci.spn_to_byte(0), Some(0));
+        assert_eq!(ci.spn_to_byte(1), Some(192));
+        assert_eq!(ci.spn_to_byte(1000), Some(1000 * 192)); // EOF boundary allowed
+        assert_eq!(ci.spn_to_byte(1001), None); // past end
+                                                // byte → SPN (truncating).
+        assert_eq!(ci.byte_to_spn(0), Some(0));
+        assert_eq!(ci.byte_to_spn(191), Some(0));
+        assert_eq!(ci.byte_to_spn(192), Some(1));
+        assert_eq!(ci.byte_to_spn(193), Some(1));
+        // At/past the clip's byte length → None.
+        assert_eq!(ci.byte_to_spn(1000 * 192), None);
+        assert_eq!(ci.byte_to_spn(1000 * 192 + 5), None);
+    }
+
+    #[test]
+    fn clip_info_transfer_duration() {
+        // 192000 bytes at 96000 bytes/s = 2.0 s.
+        let ci = clip_info(96_000, 1000);
+        let secs = ci.transfer_duration_secs().unwrap();
+        assert!((secs - 2.0).abs() < 1e-9, "got {secs}");
+        // Zero rate → None.
+        assert!(clip_info(0, 1000).transfer_duration_secs().is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // ProgramInfo / ProgramEntry PID-lookup demux accessors
+    // -------------------------------------------------------------------
+
+    fn sci(pid: u16, coding: u8) -> StreamCodingInfo {
+        StreamCodingInfo {
+            pid,
+            stream_coding_type: coding,
+            format_info_byte: 0,
+            aspect_ratio_nibble: 0,
+            language_code: [0, 0, 0],
+        }
+    }
+
+    fn two_program_info() -> ProgramInfo {
+        ProgramInfo {
+            programs: vec![
+                ProgramEntry {
+                    spn_program_sequence_start: 0,
+                    program_map_pid: 0x0100,
+                    streams: vec![
+                        sci(0x1011, 0x1B), // AVC video
+                        sci(0x1100, 0x81), // AC-3 audio
+                        sci(0x1200, 0x90), // PGS subtitle
+                    ],
+                },
+                ProgramEntry {
+                    spn_program_sequence_start: 5000,
+                    program_map_pid: 0x0101,
+                    streams: vec![
+                        sci(0x1015, 0x24), // HEVC video
+                        sci(0x1101, 0x86), // DTS-HD MA audio
+                    ],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn program_entry_pid_and_class_lookups() {
+        let pi = two_program_info();
+        let p0 = &pi.programs[0];
+        assert_eq!(p0.stream_by_pid(0x1100).unwrap().pid, 0x1100);
+        assert!(p0.stream_by_pid(0x9999).is_none());
+        let vids: Vec<u16> = p0.video_streams().map(|s| s.pid).collect();
+        assert_eq!(vids, vec![0x1011]);
+        let auds: Vec<u16> = p0.audio_streams().map(|s| s.pid).collect();
+        assert_eq!(auds, vec![0x1100]);
+    }
+
+    #[test]
+    fn program_info_flatten_count_and_pid_search() {
+        let pi = two_program_info();
+        assert_eq!(pi.stream_count(), 5);
+        let pids: Vec<u16> = pi.streams().map(|s| s.pid).collect();
+        assert_eq!(pids, vec![0x1011, 0x1100, 0x1200, 0x1015, 0x1101]);
+        // Cross-program PID search hits the second program too.
+        assert_eq!(pi.stream_by_pid(0x1101).unwrap().pid, 0x1101);
+        assert!(pi.stream_by_pid(0x0001).is_none());
+    }
+
+    #[test]
+    fn program_info_by_pmt_pid() {
+        let pi = two_program_info();
+        assert_eq!(
+            pi.program_by_pmt_pid(0x0101)
+                .unwrap()
+                .spn_program_sequence_start,
+            5000
+        );
+        assert!(pi.program_by_pmt_pid(0x0999).is_none());
+    }
+
+    #[test]
+    fn program_info_primary_video_pid_is_first_in_order() {
+        let pi = two_program_info();
+        // First video stream in recording order is the AVC PID in
+        // program 0, even though program 1 also has video.
+        assert_eq!(pi.primary_video_pid(), Some(0x1011));
+        // A ProgramInfo with only audio yields None.
+        let audio_only = ProgramInfo {
+            programs: vec![ProgramEntry {
+                spn_program_sequence_start: 0,
+                program_map_pid: 0x0100,
+                streams: vec![sci(0x1100, 0x81)],
+            }],
+        };
+        assert!(audio_only.primary_video_pid().is_none());
     }
 }
