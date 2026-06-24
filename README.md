@@ -99,6 +99,27 @@ bluray://                          → auto-detect first BD-ROM mount
   a remuxer reads each clip's per-stream codec + resolution + channel
   layout + language straight off its own ProgramInfo without a matching
   `.mpls` open.
+- **CLPI demux-index accessor layer** — the parsed `.clpi`
+  `SequenceInfo` / `ClipInfo` / `ProgramInfo` / `Cpi` structures now
+  carry the derived helpers a demuxer needs to map between time, source
+  packets and bytes (all pure derivation over already-parsed fields, no
+  new wire layout). `SequenceInfo` (§5.5.4.2): `StcSequence` PTS lifts
+  (`duration_90k` / `start_pts_90k` / `end_pts_90k`),
+  `AtcSequence::{stc_sequence(stc_id) (offset by offset_stc_id),
+  stc_sequence_for_spn(spn) (last STC start at-or-before a packet)}`,
+  and `SequenceInfo::{stc_sequences (flatten), stc_sequence_by_id,
+  first_stc_sequence, presentation_span_90k}` — fulfilling the module's
+  promise to map source-packet numbers onto wall-clock time. `ClipInfo`
+  (§5.5.4.1 + AV §3.1): `clip_byte_len` (`packets × 192`), `spn_to_byte`
+  / `byte_to_spn` (range-checked inverses) and `transfer_duration_secs`.
+  `ProgramInfo` / `ProgramEntry` (§5.5.4.3): `stream_by_pid`
+  (per-program + cross-program), `video_streams` / `audio_streams`,
+  `program_by_pmt_pid`, `primary_video_pid`. `Cpi` / `EpMap` (AV §5.7):
+  `EpMap::{entry_point_at_or_before(pts_90k), seek_spn, first_pts /
+  last_pts / indexed_span_90k}` and `Cpi::seek_spn(pts_90k)` surface the
+  keyframe binary search (largest `pts_ep_start ≤ target`) that
+  `TitleSource::seek_to` runs internally, so a caller holding a parsed
+  `.clpi` resolves a landing source-packet without opening a `Disc`.
 - `.m2ts` stream → strip the 4-byte BDAV `TP_extra_header` per
   192-byte source packet, deliver clean 188-byte MPEG-TS bytes.
   Three call shapes: the in-place `strip_tp_extra(input, &mut out)`
