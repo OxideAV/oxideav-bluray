@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CLPI EP_map / CPI seek-index accessors** (`bdmv::clpi`, BD-ROM AV
+  §5.7) — the keyframe-seek logic (binary-search the EP_map for the
+  largest `pts_ep_start ≤ target`, return its `spn_ep_start`) lived only
+  inside `disc.rs::seek_to`; a caller holding a parsed `.clpi` could not
+  compute a landing packet without a full `Disc` / `TitleSource`. This
+  surfaces it directly on the parsed structures: `EpMap::{
+  entry_point_at_or_before(pts_90k), seek_spn(pts_90k), first_pts,
+  last_pts, indexed_span_90k}` do the backward-safe binary search
+  (clamping to the first entry for a pre-range target, staying on the
+  last for a past-range target — the same policy `seek_to` applies), and
+  `Cpi::seek_spn(pts_90k)` chains the existing `primary_video_ep_map`
+  selection (HEVC main over AVC fallback on UHD-BD, else first known
+  video EP_map, else lowest PID) into a one-shot SPN resolve. PTS is the
+  clip-local 90 kHz axis the parser already folds the coarse+fine rows
+  onto. 4 new unit tests cover the at-or-before snap (exact / between /
+  pre-first / past-last), the span helpers, the empty-EP_map `None`
+  path, the HEVC-over-AVC selection drive, and a 6-point parity check
+  against the `disc.rs::seek_to` largest-at-or-before semantics.
 - **CLPI ClipInfo + ProgramInfo demux accessors** (`bdmv::clpi`,
   BD-ROM Part 3 §5.5.4.1 / §5.5.4.3 + AV §3.1) — the second pure-
   derivation layer over already-parsed `.clpi` fields. `ClipInfo`

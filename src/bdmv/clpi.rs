@@ -570,6 +570,67 @@ impl EpMap {
     pub fn is_video(&self) -> bool {
         self.kind().is_video()
     }
+
+    /// The entry point at or before the clip-local `pts_90k` target —
+    /// the keyframe a seeker lands on for a backward-safe random
+    /// access. EP_map entries are recorded in ascending `pts_ep_start`
+    /// order, so this binary-searches for the largest
+    /// `pts_ep_start ≤ pts_90k`. A target before the first entry
+    /// returns the first entry (clamping into the indexed range, the
+    /// same policy [`crate::TitleSource::seek_to`] applies). Returns
+    /// `None` only when the EP_map is empty.
+    ///
+    /// `pts_90k` is the entry-point PTS axis the parser already folds
+    /// the coarse + fine rows onto (90 kHz, granularity ≈ 5.7 ms — see
+    /// [`EpEntry`]); it is *clip-local*, i.e. relative to the clip's own
+    /// STC origin, not the title timeline.
+    pub fn entry_point_at_or_before(&self, pts_90k: u32) -> Option<&EpEntry> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let idx = match self
+            .entries
+            .binary_search_by(|e| e.pts_ep_start.cmp(&pts_90k))
+        {
+            Ok(i) => i,
+            Err(0) => 0,
+            Err(i) => i - 1,
+        };
+        self.entries.get(idx)
+    }
+
+    /// The source-packet number to seek to for clip-local `pts_90k` —
+    /// the `spn_ep_start` of [`Self::entry_point_at_or_before`].
+    /// Multiply by 192 (or use [`ClipInfo::spn_to_byte`]) for the byte
+    /// offset. `None` when the EP_map is empty.
+    pub fn seek_spn(&self, pts_90k: u32) -> Option<u32> {
+        self.entry_point_at_or_before(pts_90k)
+            .map(|e| e.spn_ep_start)
+    }
+
+    /// The first entry point's `pts_ep_start` (the clip-local PTS of
+    /// the earliest indexed keyframe). `None` when the EP_map is empty.
+    pub fn first_pts(&self) -> Option<u32> {
+        self.entries.first().map(|e| e.pts_ep_start)
+    }
+
+    /// The last entry point's `pts_ep_start`. `None` when the EP_map is
+    /// empty.
+    pub fn last_pts(&self) -> Option<u32> {
+        self.entries.last().map(|e| e.pts_ep_start)
+    }
+
+    /// Span of the indexed keyframe range in 90 kHz ticks
+    /// (`last_pts − first_pts`). This is the portion of the clip the
+    /// EP_map can seek within, not the clip's full presentation span
+    /// (the final keyframe is at or before the clip's last access
+    /// unit). `0` for an empty or single-entry EP_map.
+    pub fn indexed_span_90k(&self) -> u32 {
+        match (self.first_pts(), self.last_pts()) {
+            (Some(f), Some(l)) => l.saturating_sub(f),
+            _ => 0,
+        }
+    }
 }
 
 impl EpEntry {
@@ -634,6 +695,24 @@ impl Cpi {
     /// video tracks" without filtering on the raw byte.
     pub fn video_ep_maps(&self) -> impl Iterator<Item = &EpMap> {
         self.ep_map.iter().filter(|m| m.is_video())
+    }
+
+    /// One-shot keyframe seek: resolve a clip-local `pts_90k` target to
+    /// the source-packet number a seeker should land on, driving off
+    /// the [`Self::primary_video_ep_map`] selection (HEVC main over AVC
+    /// fallback on UHD-BD, else first known video EP_map, else lowest
+    /// PID). Returns the chosen EP_map's
+    /// [`EpMap::entry_point_at_or_before`] SPN. `None` when the CPI
+    /// carries no EP_map at all — the caller then falls back to the
+    /// clip start, the same policy [`crate::TitleSource::seek_to`]
+    /// applies for a clip with no CPI.
+    ///
+    /// This surfaces the per-clip seek the streamer performs internally
+    /// (`disc.rs`) so a caller holding a parsed `.clpi` can compute the
+    /// landing packet without opening a full [`crate::Disc`] /
+    /// [`crate::TitleSource`].
+    pub fn seek_spn(&self, pts_90k: u32) -> Option<u32> {
+        self.primary_video_ep_map()?.seek_spn(pts_90k)
     }
 }
 
@@ -2145,5 +2224,128 @@ mod tests {
             }],
         };
         assert!(audio_only.primary_video_pid().is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // EpMap / Cpi seek-index accessors
+    // -------------------------------------------------------------------
+
+    fn ep_entry(pts: u32, spn: u32) -> EpEntry {
+        EpEntry {
+            is_angle_change_point: false,
+            i_end_position_offset: 0,
+            pts_ep_start: pts,
+            spn_ep_start: spn,
+            ep_stream_type: 5,
+        }
+    }
+
+    fn seekable_ep_map(pid: u16, ep_type: u8) -> EpMap {
+        EpMap {
+            stream_pid: pid,
+            ep_stream_type: ep_type,
+            // Ascending pts_ep_start, as the parser folds them.
+            entries: vec![
+                ep_entry(0, 0),
+                ep_entry(90_000, 500),   // 1 s
+                ep_entry(180_000, 1000), // 2 s
+                ep_entry(270_000, 1500), // 3 s
+            ],
+        }
+    }
+
+    #[test]
+    fn ep_map_entry_point_at_or_before_lands_on_keyframe() {
+        let m = seekable_ep_map(0x1011, 0x5);
+        // Exact hit.
+        assert_eq!(
+            m.entry_point_at_or_before(180_000).unwrap().spn_ep_start,
+            1000
+        );
+        // Between rows → snaps backward.
+        assert_eq!(
+            m.entry_point_at_or_before(179_999).unwrap().spn_ep_start,
+            500
+        );
+        assert_eq!(
+            m.entry_point_at_or_before(90_001).unwrap().spn_ep_start,
+            500
+        );
+        // Before the first entry → clamps to first.
+        assert_eq!(m.entry_point_at_or_before(0).unwrap().spn_ep_start, 0);
+        // Past the last entry → stays on last.
+        assert_eq!(
+            m.entry_point_at_or_before(10_000_000).unwrap().spn_ep_start,
+            1500
+        );
+    }
+
+    #[test]
+    fn ep_map_seek_spn_and_span_helpers() {
+        let m = seekable_ep_map(0x1011, 0x5);
+        assert_eq!(m.seek_spn(180_000), Some(1000));
+        assert_eq!(m.seek_spn(89_999), Some(0));
+        assert_eq!(m.first_pts(), Some(0));
+        assert_eq!(m.last_pts(), Some(270_000));
+        assert_eq!(m.indexed_span_90k(), 270_000);
+    }
+
+    #[test]
+    fn ep_map_empty_seek_helpers_return_none() {
+        let m = EpMap {
+            stream_pid: 0x1011,
+            ep_stream_type: 0x5,
+            entries: Vec::new(),
+        };
+        assert!(m.entry_point_at_or_before(0).is_none());
+        assert!(m.seek_spn(0).is_none());
+        assert!(m.first_pts().is_none());
+        assert!(m.last_pts().is_none());
+        assert_eq!(m.indexed_span_90k(), 0);
+    }
+
+    #[test]
+    fn cpi_seek_spn_drives_primary_video_selection() {
+        // UHD-BD layout: AVC fallback at lower PID + HEVC main at higher
+        // PID, each with its own EP_map. Cpi::seek_spn must drive off
+        // the HEVC main (the primary_video_ep_map selection), so a seek
+        // resolves against the HEVC SPNs, not the AVC ones.
+        let mut avc = seekable_ep_map(0x1011, 0x5);
+        // Give the AVC map distinct SPNs so we can tell which was used.
+        for (i, e) in avc.entries.iter_mut().enumerate() {
+            e.spn_ep_start = 9000 + i as u32;
+        }
+        let hevc = seekable_ep_map(0x1015, 0x8); // SPNs 0/500/1000/1500
+        let cpi = Cpi {
+            ep_map: vec![avc, hevc],
+            ts_type_indicators: Vec::new(),
+        };
+        // 2 s target → HEVC row spn 1000 (not the AVC 9002).
+        assert_eq!(cpi.seek_spn(180_000), Some(1000));
+        // Empty CPI → None (caller falls back to clip start).
+        assert!(Cpi::default().seek_spn(0).is_none());
+    }
+
+    #[test]
+    fn cpi_seek_spn_matches_disc_seek_semantics() {
+        // The on-Ep_map binary search must reproduce the same
+        // largest-pts-at-or-before policy disc.rs::seek_to uses on its
+        // flattened (pts, spn) slice — verify against a hand-walked
+        // expectation for a few targets.
+        let m = seekable_ep_map(0x1015, 0x8);
+        let cpi = Cpi {
+            ep_map: vec![m.clone()],
+            ts_type_indicators: Vec::new(),
+        };
+        for (target, want_spn) in [
+            (0u32, 0u32),
+            (45_000, 0),
+            (90_000, 500),
+            (135_000, 500),
+            (270_000, 1500),
+            (999_999, 1500),
+        ] {
+            assert_eq!(cpi.seek_spn(target), Some(want_spn), "target {target}");
+        }
     }
 }
