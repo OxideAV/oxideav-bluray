@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CLPI SequenceInfo demux accessors** (`bdmv::clpi`, BD-ROM Part 3
+  §5.5.4.2) — the SequenceInfo / AtcSequence / StcSequence structs the
+  `.clpi` parser already populated carried zero accessor methods; the
+  module doc's promise that they let a demuxer "map source-packet
+  numbers to wall-clock times" was unfulfilled. This round wires that
+  up, all pure derivation over already-parsed fields (no new wire
+  layout): `StcSequence::{duration_45k, duration_90k, start_pts_90k,
+  end_pts_90k, contains_spn_start}` lift the recorded 45 kHz
+  presentation times onto the 90 kHz axis the rest of the stack uses;
+  `AtcSequence::{stc_sequence(stc_id), stc_sequence_for_spn(spn)}`
+  resolve a PlayItem's `stc_id_ref` (offset by the ATC's
+  `offset_stc_id`) and the STC sequence owning a given source-packet
+  number (last `spn_stc_start` at or before `spn`); `SequenceInfo::{
+  stc_sequence_count, stc_sequences, stc_sequence_by_id,
+  first_stc_sequence, presentation_span_90k}` flatten across ATC
+  sequences, search a global `stc_id`, and compute the clip's total
+  presentation span (latest end − earliest start, 90 kHz). 11 new unit
+  tests cover the duration/PTS lift, inverted-time saturation,
+  SPN-ownership boundaries (incl. None before the first start), the
+  offset-`stc_id` resolution, cross-ATC flattening / span, and the
+  empty-SequenceInfo case.
 - Title-level HDMV **navigation driver** (`bdmv::nav_driver::NavDriver`):
   the disc title engine that ties `index.bdmv` to `MovieObject.bdmv`. The
   `MobjRunner` drives one object table and follows intra-table

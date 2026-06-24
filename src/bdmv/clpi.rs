@@ -55,12 +55,57 @@ pub struct TsTypeInfoBlock {
 }
 
 /// One STC sequence inside SequenceInfo (§5.5.4.2).
+///
+/// An STC (System Time Clock) sequence is a contiguous run of source
+/// packets sharing one continuous 33-bit MPEG-2 STC. Its
+/// `presentation_start_time` / `presentation_end_time` are the 45 kHz
+/// PTS of its first / last presented access unit, and `spn_stc_start`
+/// is the source-packet number at which the sequence begins. Together
+/// these let a demuxer map a source-packet number onto wall-clock time
+/// without first parsing the TS — the purpose this whole section serves
+/// (see the module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StcSequence {
     pub pcr_pid: u16,
     pub spn_stc_start: u32,
     pub presentation_start_time: u32, // 45 kHz
     pub presentation_end_time: u32,   // 45 kHz
+}
+
+impl StcSequence {
+    /// Presentation span of this STC sequence in 45 kHz ticks
+    /// (`presentation_end_time − presentation_start_time`). Saturates
+    /// at zero if a malformed clip records an end before its start.
+    pub fn duration_45k(&self) -> u32 {
+        self.presentation_end_time
+            .saturating_sub(self.presentation_start_time)
+    }
+
+    /// Presentation span in 90 kHz ticks — the time base the rest of
+    /// the stack (`TitleSource::seek_to`, [`crate::Chapter`]) works on.
+    /// BD timing is recorded uniformly in 45 kHz inside CLPI / MPLS;
+    /// doubling lifts it onto the 90 kHz PTS axis.
+    pub fn duration_90k(&self) -> u64 {
+        u64::from(self.duration_45k()) * 2
+    }
+
+    /// `presentation_start_time` lifted onto the 90 kHz axis.
+    pub fn start_pts_90k(&self) -> u64 {
+        u64::from(self.presentation_start_time) * 2
+    }
+
+    /// `presentation_end_time` lifted onto the 90 kHz axis.
+    pub fn end_pts_90k(&self) -> u64 {
+        u64::from(self.presentation_end_time) * 2
+    }
+
+    /// `true` when `spn` falls at or after this sequence's
+    /// `spn_stc_start`. A demuxer scanning the ATC sequence's STC list
+    /// in order uses this to find the last sequence whose start the
+    /// packet has reached.
+    pub fn contains_spn_start(&self, spn: u32) -> bool {
+        spn >= self.spn_stc_start
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,9 +115,88 @@ pub struct AtcSequence {
     pub offset_stc_id: u8,
 }
 
+impl AtcSequence {
+    /// Resolve a `stc_id` (the `PlayItem::stc_id_ref` an MPLS PlayItem
+    /// records) to the STC sequence it names inside this ATC sequence.
+    ///
+    /// The `stc_id` is a global index into the ATC sequence's STC list
+    /// offset by `offset_stc_id` — i.e. the local position is
+    /// `stc_id − offset_stc_id` (§5.5.4.2). Returns `None` when the id
+    /// is below this ATC's offset or past the end of its STC list.
+    pub fn stc_sequence(&self, stc_id: u8) -> Option<&StcSequence> {
+        let local = (stc_id).checked_sub(self.offset_stc_id)? as usize;
+        self.stc_sequences.get(local)
+    }
+
+    /// The STC sequence whose `spn_stc_start` is the greatest value at
+    /// or before `spn` — i.e. the STC sequence that owns the
+    /// source-packet at `spn`. STC sequences are recorded in ascending
+    /// `spn_stc_start` order, so this is the last sequence the packet's
+    /// SPN has reached. Returns `None` when `spn` precedes the first
+    /// sequence's start (or the ATC has no STC sequences).
+    pub fn stc_sequence_for_spn(&self, spn: u32) -> Option<&StcSequence> {
+        self.stc_sequences
+            .iter()
+            .rfind(|s| s.contains_spn_start(spn))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequenceInfo {
     pub atc_sequences: Vec<AtcSequence>,
+}
+
+impl SequenceInfo {
+    /// Total number of STC sequences across every ATC sequence.
+    pub fn stc_sequence_count(&self) -> usize {
+        self.atc_sequences
+            .iter()
+            .map(|a| a.stc_sequences.len())
+            .sum()
+    }
+
+    /// Iterate over every STC sequence in recording order, flattened
+    /// across the ATC sequences. Convenient for a demuxer that wants a
+    /// single pass over the clip's STC timeline.
+    pub fn stc_sequences(&self) -> impl Iterator<Item = &StcSequence> {
+        self.atc_sequences
+            .iter()
+            .flat_map(|a| a.stc_sequences.iter())
+    }
+
+    /// Resolve a global `stc_id` (an MPLS PlayItem's `stc_id_ref`) to
+    /// its STC sequence, searching every ATC sequence. Each ATC carries
+    /// an `offset_stc_id` base; this picks the ATC whose
+    /// `[offset, offset + len)` window contains the id. Returns `None`
+    /// when no ATC owns the id.
+    pub fn stc_sequence_by_id(&self, stc_id: u8) -> Option<&StcSequence> {
+        self.atc_sequences
+            .iter()
+            .find_map(|a| a.stc_sequence(stc_id))
+    }
+
+    /// First STC sequence in recording order — the one a clip's STC
+    /// origin is taken from when no PlayItem `stc_id_ref` is in play.
+    pub fn first_stc_sequence(&self) -> Option<&StcSequence> {
+        self.stc_sequences().next()
+    }
+
+    /// Total presentation span of the clip in 90 kHz ticks — the
+    /// latest STC-sequence end PTS minus the earliest start PTS across
+    /// every STC sequence. Returns `0` when there are no STC sequences
+    /// or (defensively) the recorded times invert.
+    pub fn presentation_span_90k(&self) -> u64 {
+        let mut start = u64::MAX;
+        let mut end = 0u64;
+        for s in self.stc_sequences() {
+            start = start.min(s.start_pts_90k());
+            end = end.max(s.end_pts_90k());
+        }
+        if start == u64::MAX {
+            return 0;
+        }
+        end.saturating_sub(start)
+    }
 }
 
 /// One elementary stream entry inside ProgramInfo, decoded from the
@@ -1621,5 +1745,169 @@ mod tests {
         };
         let pids: Vec<u16> = cpi.video_ep_maps().map(|m| m.stream_pid).collect();
         assert_eq!(pids, vec![0x1011, 0x1015]);
+    }
+
+    // -------------------------------------------------------------------
+    // SequenceInfo / AtcSequence / StcSequence demux accessors
+    // -------------------------------------------------------------------
+
+    fn stc(spn_start: u32, start_45k: u32, end_45k: u32) -> StcSequence {
+        StcSequence {
+            pcr_pid: 0x1001,
+            spn_stc_start: spn_start,
+            presentation_start_time: start_45k,
+            presentation_end_time: end_45k,
+        }
+    }
+
+    #[test]
+    fn stc_sequence_duration_and_pts_lift() {
+        // 45 kHz: start 1000, end 4000 → span 3000 ticks; ×2 → 90 kHz.
+        let s = stc(0, 1000, 4000);
+        assert_eq!(s.duration_45k(), 3000);
+        assert_eq!(s.duration_90k(), 6000);
+        assert_eq!(s.start_pts_90k(), 2000);
+        assert_eq!(s.end_pts_90k(), 8000);
+    }
+
+    #[test]
+    fn stc_sequence_duration_saturates_on_inverted_times() {
+        // A malformed clip records end before start: the span saturates
+        // at zero rather than wrapping into a huge value.
+        let s = stc(0, 5000, 1000);
+        assert_eq!(s.duration_45k(), 0);
+        assert_eq!(s.duration_90k(), 0);
+    }
+
+    #[test]
+    fn stc_sequence_contains_spn_start() {
+        let s = stc(192, 0, 1000);
+        assert!(!s.contains_spn_start(0));
+        assert!(!s.contains_spn_start(191));
+        assert!(s.contains_spn_start(192));
+        assert!(s.contains_spn_start(10_000));
+    }
+
+    #[test]
+    fn atc_stc_sequence_by_offset_id() {
+        // offset_stc_id = 2: local index 0 is stc_id 2, index 1 is 3.
+        let atc = AtcSequence {
+            spn_atc_start: 0,
+            offset_stc_id: 2,
+            stc_sequences: vec![stc(0, 0, 1000), stc(100, 1000, 2000)],
+        };
+        // ids below the offset don't resolve.
+        assert!(atc.stc_sequence(0).is_none());
+        assert!(atc.stc_sequence(1).is_none());
+        assert_eq!(atc.stc_sequence(2), Some(&stc(0, 0, 1000)));
+        assert_eq!(atc.stc_sequence(3), Some(&stc(100, 1000, 2000)));
+        // past the end of the STC list.
+        assert!(atc.stc_sequence(4).is_none());
+    }
+
+    #[test]
+    fn atc_stc_sequence_for_spn_picks_last_at_or_before() {
+        let atc = AtcSequence {
+            spn_atc_start: 0,
+            offset_stc_id: 0,
+            stc_sequences: vec![stc(0, 0, 1000), stc(500, 1000, 2000), stc(900, 2000, 3000)],
+        };
+        // before the first start → None.
+        // (first start is 0, so any spn resolves; test an explicit gap.)
+        assert_eq!(atc.stc_sequence_for_spn(0).unwrap().spn_stc_start, 0);
+        assert_eq!(atc.stc_sequence_for_spn(499).unwrap().spn_stc_start, 0);
+        assert_eq!(atc.stc_sequence_for_spn(500).unwrap().spn_stc_start, 500);
+        assert_eq!(atc.stc_sequence_for_spn(899).unwrap().spn_stc_start, 500);
+        assert_eq!(atc.stc_sequence_for_spn(1000).unwrap().spn_stc_start, 900);
+    }
+
+    #[test]
+    fn atc_stc_sequence_for_spn_none_before_first_start() {
+        let atc = AtcSequence {
+            spn_atc_start: 0,
+            offset_stc_id: 0,
+            stc_sequences: vec![stc(500, 1000, 2000)],
+        };
+        assert!(atc.stc_sequence_for_spn(0).is_none());
+        assert!(atc.stc_sequence_for_spn(499).is_none());
+        assert_eq!(atc.stc_sequence_for_spn(500).unwrap().spn_stc_start, 500);
+    }
+
+    #[test]
+    fn sequence_info_flatten_and_count() {
+        let si = SequenceInfo {
+            atc_sequences: vec![
+                AtcSequence {
+                    spn_atc_start: 0,
+                    offset_stc_id: 0,
+                    stc_sequences: vec![stc(0, 0, 1000), stc(100, 1000, 2000)],
+                },
+                AtcSequence {
+                    spn_atc_start: 200,
+                    offset_stc_id: 2,
+                    stc_sequences: vec![stc(200, 2000, 3000)],
+                },
+            ],
+        };
+        assert_eq!(si.stc_sequence_count(), 3);
+        let starts: Vec<u32> = si.stc_sequences().map(|s| s.spn_stc_start).collect();
+        assert_eq!(starts, vec![0, 100, 200]);
+        assert_eq!(si.first_stc_sequence().unwrap().spn_stc_start, 0);
+    }
+
+    #[test]
+    fn sequence_info_stc_by_id_searches_every_atc() {
+        let si = SequenceInfo {
+            atc_sequences: vec![
+                AtcSequence {
+                    spn_atc_start: 0,
+                    offset_stc_id: 0,
+                    stc_sequences: vec![stc(0, 0, 1000), stc(100, 1000, 2000)],
+                },
+                AtcSequence {
+                    spn_atc_start: 200,
+                    offset_stc_id: 2,
+                    stc_sequences: vec![stc(200, 2000, 3000)],
+                },
+            ],
+        };
+        // id 0/1 live in the first ATC, id 2 in the second.
+        assert_eq!(si.stc_sequence_by_id(0).unwrap().spn_stc_start, 0);
+        assert_eq!(si.stc_sequence_by_id(1).unwrap().spn_stc_start, 100);
+        assert_eq!(si.stc_sequence_by_id(2).unwrap().spn_stc_start, 200);
+        assert!(si.stc_sequence_by_id(3).is_none());
+    }
+
+    #[test]
+    fn sequence_info_presentation_span_across_atcs() {
+        // Span = latest end (3000 ×2 = 6000 @90k) − earliest start
+        // (0 @90k) = 6000.
+        let si = SequenceInfo {
+            atc_sequences: vec![
+                AtcSequence {
+                    spn_atc_start: 0,
+                    offset_stc_id: 0,
+                    stc_sequences: vec![stc(0, 0, 1000), stc(100, 1000, 2000)],
+                },
+                AtcSequence {
+                    spn_atc_start: 200,
+                    offset_stc_id: 2,
+                    stc_sequences: vec![stc(200, 2000, 3000)],
+                },
+            ],
+        };
+        assert_eq!(si.presentation_span_90k(), 6000);
+    }
+
+    #[test]
+    fn sequence_info_empty_accessors() {
+        let si = SequenceInfo {
+            atc_sequences: Vec::new(),
+        };
+        assert_eq!(si.stc_sequence_count(), 0);
+        assert_eq!(si.stc_sequences().count(), 0);
+        assert!(si.first_stc_sequence().is_none());
+        assert!(si.stc_sequence_by_id(0).is_none());
+        assert_eq!(si.presentation_span_90k(), 0);
     }
 }
