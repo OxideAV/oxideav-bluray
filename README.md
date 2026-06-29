@@ -99,6 +99,27 @@ bluray://                          → auto-detect first BD-ROM mount
   a remuxer reads each clip's per-stream codec + resolution + channel
   layout + language straight off its own ProgramInfo without a matching
   `.mpls` open.
+- **HDMV navigation-command disassembler** (`bdmv::nav_command` /
+  `bdmv::movie_object`) — a BDedit-style textual listing over the decoded
+  command model: `Operation::mnemonic()` / `group()` / `is_branch()` /
+  `is_playback()`, `Operand::disassemble()` (immediate `0x..`, GPR
+  `r<idx>`, named PSR `PSR4(Title)`, secondary PSR with a trailing `'`),
+  `DecodedCommand::disassemble()` + `Display`
+  (`Eq PSR4(Title), 0xFFFF` / `Move r1, 0x1`), and the table-level
+  `NavCommand` / `MovieObject::disassemble(index)` /
+  `MovieObjects::disassemble()` script dump. Forensic / diagnostic only —
+  the listing is not re-assemblable and nothing is executed (the VM stays
+  in `bdmv::vm`).
+- **Chapter presentation spans** — `PlayListMpls::chapters_with_duration()`
+  / `Disc::chapter_spans(title)` widen each entry-mark chapter to a
+  `[start, end)` window (`ChapterSpan { start_pts_90k, end_pts_90k }` +
+  `duration_90k()` / `duration_secs()`): a chapter ends where the next
+  begins, the final chapter ends at the title total. Pure derivation over
+  the already-parsed marks + PlayItem durations.
+- **Stream coding-type labels** — `StreamCodingType::is_graphics()` /
+  `is_secondary()` / `display_name()` complete the class predicates; a
+  `Track::label()` builds a one-line catalogue label
+  (`"DTS-HD Master Audio (eng)"`).
 - **CLPI demux-index accessor layer** — the parsed `.clpi`
   `SequenceInfo` / `ClipInfo` / `ProgramInfo` / `Cpi` structures now
   carry the derived helpers a demuxer needs to map between time, source
@@ -115,8 +136,10 @@ bluray://                          → auto-detect first BD-ROM mount
   `ProgramInfo` / `ProgramEntry` (§5.5.4.3): `stream_by_pid`
   (per-program + cross-program), `video_streams` / `audio_streams`,
   `program_by_pmt_pid`, `primary_video_pid`. `Cpi` / `EpMap` (AV §5.7):
-  `EpMap::{entry_point_at_or_before(pts_90k), seek_spn, first_pts /
-  last_pts / indexed_span_90k}` and `Cpi::seek_spn(pts_90k)` surface the
+  `EpMap::{entry_point_at_or_before(pts_90k), seek_spn, entry_point_after
+  / next_seek_spn (the forward "skip to next I-frame" complement),
+  entry_point_count, first_pts / last_pts / indexed_span_90k}` and
+  `Cpi::seek_spn(pts_90k)` surface the
   keyframe binary search (largest `pts_ep_start ≤ target`) that
   `TitleSource::seek_to` runs internally, so a caller holding a parsed
   `.clpi` resolves a landing source-packet without opening a `Disc`.
