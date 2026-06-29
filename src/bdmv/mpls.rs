@@ -216,6 +216,50 @@ impl StreamCodingType {
                 | Self::DtsHdSecondaryAudio
         )
     }
+
+    /// `true` for the three graphics/menu stream coding types — PGS
+    /// (bitmap subtitle), IGS (menu overlay) and the text-based subtitle
+    /// stream.
+    pub fn is_graphics(self) -> bool {
+        matches!(
+            self,
+            Self::PgsSubtitle | Self::IgsInteractive | Self::TextSubtitle
+        )
+    }
+
+    /// `true` for the two *secondary*-presentation audio coding types
+    /// (`0xA1`/`0xA2`) carried for Picture-in-Picture / commentary
+    /// mixdown. These are still audio ([`Self::is_audio`] is also `true`).
+    pub fn is_secondary(self) -> bool {
+        matches!(self, Self::EAc3SecondaryAudio | Self::DtsHdSecondaryAudio)
+    }
+
+    /// A short human-readable label for this coding type, suitable for a
+    /// track-catalogue UI (`"MPEG-2 Video"`, `"Dolby TrueHD"`,
+    /// `"PGS Subtitle"`, ...). [`Self::Other`] renders as
+    /// `"Unknown(0xNN)"` carrying its raw byte.
+    pub fn display_name(self) -> String {
+        let s = match self {
+            Self::Mpeg2Video => "MPEG-2 Video",
+            Self::AvcVideo => "H.264/AVC Video",
+            Self::HevcVideo => "H.265/HEVC Video",
+            Self::Vc1Video => "VC-1 Video",
+            Self::LpcmAudio => "LPCM Audio",
+            Self::Ac3Audio => "Dolby Digital (AC-3)",
+            Self::DtsAudio => "DTS Audio",
+            Self::TruehdAudio => "Dolby TrueHD",
+            Self::EAc3Audio => "Dolby Digital Plus (E-AC-3)",
+            Self::DtsHdAudio => "DTS-HD High Resolution",
+            Self::DtsHdMaAudio => "DTS-HD Master Audio",
+            Self::EAc3SecondaryAudio => "Dolby Digital Plus (secondary)",
+            Self::DtsHdSecondaryAudio => "DTS-HD (secondary)",
+            Self::PgsSubtitle => "PGS Subtitle",
+            Self::IgsInteractive => "Interactive Graphics",
+            Self::TextSubtitle => "Text Subtitle",
+            Self::Other(v) => return format!("Unknown(0x{v:02X})"),
+        };
+        s.to_string()
+    }
 }
 
 /// Typed view of the 4-bit `video_format` nibble recorded inside the
@@ -2638,6 +2682,37 @@ mod tests {
         assert!(StreamCodingType::DtsHdMaAudio.is_audio());
         assert!(!StreamCodingType::PgsSubtitle.is_video());
         assert!(!StreamCodingType::PgsSubtitle.is_audio());
+    }
+
+    #[test]
+    fn stream_coding_type_graphics_and_secondary_predicates() {
+        assert!(StreamCodingType::PgsSubtitle.is_graphics());
+        assert!(StreamCodingType::IgsInteractive.is_graphics());
+        assert!(StreamCodingType::TextSubtitle.is_graphics());
+        assert!(!StreamCodingType::AvcVideo.is_graphics());
+        assert!(!StreamCodingType::Ac3Audio.is_graphics());
+
+        assert!(StreamCodingType::EAc3SecondaryAudio.is_secondary());
+        assert!(StreamCodingType::DtsHdSecondaryAudio.is_secondary());
+        // Secondary audio is still audio.
+        assert!(StreamCodingType::EAc3SecondaryAudio.is_audio());
+        assert!(!StreamCodingType::EAc3Audio.is_secondary());
+        assert!(!StreamCodingType::PgsSubtitle.is_secondary());
+    }
+
+    #[test]
+    fn stream_coding_type_display_names() {
+        assert_eq!(StreamCodingType::Mpeg2Video.display_name(), "MPEG-2 Video");
+        assert_eq!(StreamCodingType::TruehdAudio.display_name(), "Dolby TrueHD");
+        assert_eq!(
+            StreamCodingType::DtsHdMaAudio.display_name(),
+            "DTS-HD Master Audio"
+        );
+        assert_eq!(StreamCodingType::PgsSubtitle.display_name(), "PGS Subtitle");
+        assert_eq!(
+            StreamCodingType::Other(0x7F).display_name(),
+            "Unknown(0x7F)"
+        );
     }
 
     /// Build a single-PlayItem MPLS whose STN_table carries one video

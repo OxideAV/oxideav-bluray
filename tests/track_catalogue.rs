@@ -201,6 +201,12 @@ fn title_streams_dedups_pids_across_playitems() {
     assert_eq!(fra.kind, TrackKind::PgSubtitle);
     // Disc author wrote `FRA` uppercase; catalogue must lowercase.
     assert_eq!(fra.language.as_deref(), Some("fra"));
+
+    // The UI label combines the coding-type display name with the
+    // language; video carries no language so no parenthetical.
+    assert_eq!(video.label(), "H.264/AVC Video");
+    assert_eq!(eng.label(), "DTS-HD Master Audio (eng)");
+    assert_eq!(fra.label(), "PGS Subtitle (fra)");
 }
 
 #[test]

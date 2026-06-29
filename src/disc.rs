@@ -1816,6 +1816,21 @@ pub struct Track {
     pub playitem_count: u32,
 }
 
+impl Track {
+    /// A one-line UI label for this track: the coding type's
+    /// [`StreamCodingType::display_name`] with the language appended in
+    /// parentheses when known — e.g. `"Dolby TrueHD (eng)"`,
+    /// `"PGS Subtitle (jpn)"`, or just `"H.265/HEVC Video"` for a video
+    /// track (which carries no language). Pure derivation over the
+    /// already-resolved `coding_type` + `language`.
+    pub fn label(&self) -> String {
+        match &self.language {
+            Some(lang) => format!("{} ({lang})", self.coding_type.display_name()),
+            None => self.coding_type.display_name(),
+        }
+    }
+}
+
 /// Aggregated per-track listing for a Blu-ray title — one entry per
 /// distinct (PID, [`TrackKind`]) pair across every PlayItem in the
 /// PlayList.

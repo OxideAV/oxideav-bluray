@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Stream coding-type labels + track UI labels** (`bdmv::mpls`, `Disc`)
+  — `StreamCodingType` gained `is_graphics()` (PGS / IGS / Text),
+  `is_secondary()` (the `0xA1`/`0xA2` PiP-commentary audio) and
+  `display_name()` (a UI string like `"Dolby TrueHD"` / `"PGS Subtitle"`,
+  `"Unknown(0xNN)"` for reserved bytes) — completing the class predicates
+  alongside the existing `is_video` / `is_audio`. `Track::label()` builds
+  a one-line catalogue label from the coding type's display name + the
+  resolved language (`"DTS-HD Master Audio (eng)"`; no parenthetical for
+  language-less video). Pure derivation. 3 new tests.
 - **EP_map forward-seek helpers** (`bdmv::clpi`) — the keyframe index
   could only resolve the entry point *at or before* a target (the
   backward-safe random-access policy). `EpMap::entry_point_after(pts_90k)`
