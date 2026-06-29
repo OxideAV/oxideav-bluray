@@ -145,7 +145,7 @@ impl MovieObjects {
 }
 
 impl NavCommand {
-    /// A single-line BDedit-style disassembly of this command, e.g.
+    /// A single-line disassembly of this command, e.g.
     /// `"JumpTitle 0x1"`. Convenience wrapper over `self.decode()` +
     /// [`super::nav_command::DecodedCommand::disassemble`]. Diagnostic
     /// only — never re-assembled to bytes nor executed.

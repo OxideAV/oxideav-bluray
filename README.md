@@ -100,7 +100,7 @@ bluray://                          → auto-detect first BD-ROM mount
   layout + language straight off its own ProgramInfo without a matching
   `.mpls` open.
 - **HDMV navigation-command disassembler** (`bdmv::nav_command` /
-  `bdmv::movie_object`) — a BDedit-style textual listing over the decoded
+  `bdmv::movie_object`) — a single-line textual listing over the decoded
   command model: `Operation::mnemonic()` / `group()` / `is_branch()` /
   `is_playback()`, `Operand::disassemble()` (immediate `0x..`, GPR
   `r<idx>`, named PSR `PSR4(Title)`, secondary PSR with a trailing `'`),

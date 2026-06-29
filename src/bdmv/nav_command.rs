@@ -424,7 +424,7 @@ fn decode_operation(
 }
 
 // ---------------------------------------------------------------------------
-// Disassembly: a human-readable BDedit-style listing of a decoded command.
+// Disassembly: a human-readable single-line listing of a decoded command.
 //
 // This is pure derivation over the already-decoded [`DecodedCommand`] model
 // plus the named [`PsrInfo`] / [`GprConvention`] register tables — it adds no
@@ -534,7 +534,7 @@ impl Operation {
 }
 
 impl Operand {
-    /// Render this operand in the BDedit-style listing form:
+    /// Render this operand in the single-line listing form:
     ///
     /// - an immediate as `0x..` (hex, the form authoring tools print);
     /// - a GPR reference as `r<index>` (e.g. `r12`);
@@ -565,7 +565,7 @@ impl Operand {
 }
 
 impl DecodedCommand {
-    /// A single-line, BDedit-style disassembly of this command.
+    /// A single-line disassembly of this command.
     ///
     /// The form is `<mnemonic> [operand1[, operand2]]`. A
     /// [`Operation::Unknown`] additionally carries its raw selector, e.g.

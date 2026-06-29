@@ -41,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   durations — no new wire layout. Re-exported from the crate root. 5 new
   tests (3 unit + 1 disc-level extension + the empty-marks guard).
 - **HDMV navigation-command disassembler** (`bdmv::nav_command`,
-  `bdmv::movie_object`) — a BDedit-style, single-line textual listing for
+  `bdmv::movie_object`) — a single-line textual listing for
   decoded HDMV commands, built purely from the already-decoded
   `DecodedCommand` model plus the named PSR register table (no new wire
   knowledge). `Operation::mnemonic()` gives each operation a stable
