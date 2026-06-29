@@ -608,6 +608,33 @@ impl EpMap {
             .map(|e| e.spn_ep_start)
     }
 
+    /// The keyframe strictly *after* a clip-local `pts_90k` — the
+    /// forward complement of [`Self::entry_point_at_or_before`]. Useful
+    /// for "skip to next I-frame" and for bounding a seek window's end
+    /// (the next entry point delimits the current one's coverage). EP_map
+    /// entries are ascending in `pts_ep_start`, so this binary-searches
+    /// for the smallest `pts_ep_start > pts_90k`. Returns `None` when no
+    /// entry lies past the target (the target is at or beyond the last
+    /// keyframe) or the EP_map is empty.
+    pub fn entry_point_after(&self, pts_90k: u32) -> Option<&EpEntry> {
+        // partition_point gives the count of entries with pts <= target;
+        // that index is the first entry with pts > target.
+        let idx = self.entries.partition_point(|e| e.pts_ep_start <= pts_90k);
+        self.entries.get(idx)
+    }
+
+    /// The source-packet number of the next keyframe strictly after
+    /// clip-local `pts_90k` — the `spn_ep_start` of
+    /// [`Self::entry_point_after`]. `None` when no later keyframe exists.
+    pub fn next_seek_spn(&self, pts_90k: u32) -> Option<u32> {
+        self.entry_point_after(pts_90k).map(|e| e.spn_ep_start)
+    }
+
+    /// Number of indexed entry points (keyframes) in this EP_map.
+    pub fn entry_point_count(&self) -> usize {
+        self.entries.len()
+    }
+
     /// The first entry point's `pts_ep_start` (the clip-local PTS of
     /// the earliest indexed keyframe). `None` when the EP_map is empty.
     pub fn first_pts(&self) -> Option<u32> {
@@ -2291,6 +2318,31 @@ mod tests {
     }
 
     #[test]
+    fn ep_map_entry_point_after_lands_on_next_keyframe() {
+        let m = seekable_ep_map(0x1011, 0x5);
+        // Exact hit on a keyframe → next one, strictly after.
+        assert_eq!(m.entry_point_after(180_000).unwrap().spn_ep_start, 1500);
+        // Between rows → snaps forward to the upcoming keyframe.
+        assert_eq!(m.entry_point_after(90_001).unwrap().spn_ep_start, 1000);
+        assert_eq!(m.entry_point_after(179_999).unwrap().spn_ep_start, 1000);
+        // Target == first keyframe pts (0): strictly-after skips it and
+        // lands on the second keyframe.
+        assert_eq!(m.entry_point_after(0).unwrap().spn_ep_start, 500);
+        // At or past the last keyframe → no later one.
+        assert!(m.entry_point_after(270_000).is_none());
+        assert!(m.entry_point_after(10_000_000).is_none());
+    }
+
+    #[test]
+    fn ep_map_next_seek_spn_and_count() {
+        let m = seekable_ep_map(0x1011, 0x5);
+        assert_eq!(m.next_seek_spn(90_000), Some(1000));
+        assert_eq!(m.next_seek_spn(89_999), Some(500));
+        assert_eq!(m.next_seek_spn(270_000), None);
+        assert_eq!(m.entry_point_count(), 4);
+    }
+
+    #[test]
     fn ep_map_empty_seek_helpers_return_none() {
         let m = EpMap {
             stream_pid: 0x1011,
@@ -2299,6 +2351,9 @@ mod tests {
         };
         assert!(m.entry_point_at_or_before(0).is_none());
         assert!(m.seek_spn(0).is_none());
+        assert!(m.entry_point_after(0).is_none());
+        assert!(m.next_seek_spn(0).is_none());
+        assert_eq!(m.entry_point_count(), 0);
         assert!(m.first_pts().is_none());
         assert!(m.last_pts().is_none());
         assert_eq!(m.indexed_span_90k(), 0);

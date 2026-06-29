@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **EP_map forward-seek helpers** (`bdmv::clpi`) — the keyframe index
+  could only resolve the entry point *at or before* a target (the
+  backward-safe random-access policy). `EpMap::entry_point_after(pts_90k)`
+  /  `next_seek_spn(pts_90k)` add the forward complement (binary search
+  for the smallest `pts_ep_start > target`, `None` past the last
+  keyframe) — the "skip to next I-frame" / seek-window-end primitive — and
+  `entry_point_count()` exposes the indexed keyframe count. Pure
+  derivation over the already-parsed EP_map entries. 2 new tests + the
+  empty-map guard extended.
 - **Chapter presentation spans** (`bdmv::mpls`, `Disc`) — the chapter
   list previously surfaced each chapter's title-relative *start* PTS only;
   a player UI / scrubber also needs each chapter's *end* and *duration*.
