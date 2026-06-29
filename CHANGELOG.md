@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **HDMV navigation-command disassembler** (`bdmv::nav_command`,
+  `bdmv::movie_object`) — a BDedit-style, single-line textual listing for
+  decoded HDMV commands, built purely from the already-decoded
+  `DecodedCommand` model plus the named PSR register table (no new wire
+  knowledge). `Operation::mnemonic()` gives each operation a stable
+  uppercase-camel name; `Operation::group()` / `is_branch()` /
+  `is_playback()` classify it without re-reading the wire bits.
+  `Operand::disassemble()` renders an immediate as `0x..`, a GPR as
+  `r<idx>`, and a PSR as `PSR<idx>(<name>)` (with a trailing `'` for a
+  secondary-addressing reference). `DecodedCommand::disassemble()` (and
+  its `Display` impl) emit `<mnemonic> [op1[, op2]]` — e.g.
+  `Eq PSR4(Title), 0xFFFF` / `Move r1, 0x1` / `JumpTitle 0x2`; an
+  `Unknown` command keeps its raw `(sub_grp, selector)`. At the table
+  level `NavCommand::disassemble()`, `MovieObject::disassemble(index)`
+  (a flag header + one indexed line per command) and
+  `MovieObjects::disassemble()` (the whole `MovieObject.bdmv` table) give
+  a forensic dump of an HDMV script. Diagnostic only — the listing is not
+  re-assemblable and nothing is executed (the interpreter stays in
+  `bdmv::vm`). 14 new unit tests.
 - **CLPI EP_map / CPI seek-index accessors** (`bdmv::clpi`, BD-ROM AV
   §5.7) — the keyframe-seek logic (binary-search the EP_map for the
   largest `pts_ep_start ≤ target`, return its `spn_ep_start`) lived only

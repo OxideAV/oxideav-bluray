@@ -423,6 +423,180 @@ fn decode_operation(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Disassembly: a human-readable BDedit-style listing of a decoded command.
+//
+// This is pure derivation over the already-decoded [`DecodedCommand`] model
+// plus the named [`PsrInfo`] / [`GprConvention`] register tables — it adds no
+// new wire knowledge. The output is a diagnostic / forensic listing in the
+// shape an authoring tool prints (e.g. `Move r1, 0x1` / `JumpTitle 1`), not a
+// re-assemblable binary form. It is intended for log lines, dumps and tests,
+// never for execution (the VM lives in `super::vm`).
+// ---------------------------------------------------------------------------
+
+impl Operation {
+    /// A short uppercase-camel mnemonic for this operation, matching the
+    /// variant name (`"Nop"`, `"JumpTitle"`, `"SetButtonPage"`, ...).
+    ///
+    /// [`Operation::Unknown`] renders as `"Unknown"` — its raw
+    /// `(sub_grp, selector)` is surfaced separately by the command-level
+    /// disassembler so the mnemonic stays a stable identifier.
+    pub fn mnemonic(self) -> &'static str {
+        match self {
+            Operation::Nop => "Nop",
+            Operation::GoTo => "GoTo",
+            Operation::Break => "Break",
+            Operation::JumpObject => "JumpObject",
+            Operation::JumpTitle => "JumpTitle",
+            Operation::CallObject => "CallObject",
+            Operation::CallTitle => "CallTitle",
+            Operation::Resume => "Resume",
+            Operation::PlayPL => "PlayPL",
+            Operation::PlayPLatPlayItem => "PlayPLatPlayItem",
+            Operation::PlayPLatMark => "PlayPLatMark",
+            Operation::TerminatePL => "TerminatePL",
+            Operation::LinkPI => "LinkPI",
+            Operation::LinkMK => "LinkMK",
+            Operation::Bc => "Bc",
+            Operation::Eq => "Eq",
+            Operation::Ne => "Ne",
+            Operation::Ge => "Ge",
+            Operation::Gt => "Gt",
+            Operation::Le => "Le",
+            Operation::Lt => "Lt",
+            Operation::Move => "Move",
+            Operation::Swap => "Swap",
+            Operation::Add => "Add",
+            Operation::Sub => "Sub",
+            Operation::Mul => "Mul",
+            Operation::Div => "Div",
+            Operation::Mod => "Mod",
+            Operation::Rnd => "Rnd",
+            Operation::And => "And",
+            Operation::Or => "Or",
+            Operation::Xor => "Xor",
+            Operation::BitSet => "BitSet",
+            Operation::BitClear => "BitClear",
+            Operation::ShiftLeft => "ShiftLeft",
+            Operation::ShiftRight => "ShiftRight",
+            Operation::SetStream => "SetStream",
+            Operation::SetNvTimer => "SetNvTimer",
+            Operation::SetButtonPage => "SetButtonPage",
+            Operation::EnableButton => "EnableButton",
+            Operation::DisableButton => "DisableButton",
+            Operation::SetSecondaryStream => "SetSecondaryStream",
+            Operation::PopUpOff => "PopUpOff",
+            Operation::StillOn => "StillOn",
+            Operation::StillOff => "StillOff",
+            Operation::SetOutputMode => "SetOutputMode",
+            Operation::SetStreamSS => "SetStreamSS",
+            Operation::Unknown { .. } => "Unknown",
+        }
+    }
+
+    /// The group this operation belongs to (`Branch` / `Compare` / `Set`),
+    /// derived from the operation alone. Returns `None` for
+    /// [`Operation::Unknown`] (its group is not implied by the variant).
+    pub fn group(self) -> Option<CommandGroup> {
+        use Operation::*;
+        let g = match self {
+            Nop | GoTo | Break | JumpObject | JumpTitle | CallObject | CallTitle | Resume
+            | PlayPL | PlayPLatPlayItem | PlayPLatMark | TerminatePL | LinkPI | LinkMK => {
+                CommandGroup::Branch
+            }
+            Bc | Eq | Ne | Ge | Gt | Le | Lt => CommandGroup::Compare,
+            Move | Swap | Add | Sub | Mul | Div | Mod | Rnd | And | Or | Xor | BitSet
+            | BitClear | ShiftLeft | ShiftRight | SetStream | SetNvTimer | SetButtonPage
+            | EnableButton | DisableButton | SetSecondaryStream | PopUpOff | StillOn | StillOff
+            | SetOutputMode | SetStreamSS => CommandGroup::Set,
+            Unknown { .. } => return None,
+        };
+        Some(g)
+    }
+
+    /// `true` when this operation, executed, can transfer control away
+    /// from the current command stream (the Branch group) — i.e. it is a
+    /// jump, call, resume, play or link rather than a register/compare op.
+    pub fn is_branch(self) -> bool {
+        matches!(self.group(), Some(CommandGroup::Branch))
+    }
+
+    /// `true` when this operation leaves HDMV command execution to begin
+    /// (or stop) PlayList playback — the PLAY sub-group. A VM yields control
+    /// to the player layer on these.
+    pub fn is_playback(self) -> bool {
+        use Operation::*;
+        matches!(
+            self,
+            PlayPL | PlayPLatPlayItem | PlayPLatMark | TerminatePL | LinkPI | LinkMK
+        )
+    }
+}
+
+impl Operand {
+    /// Render this operand in the BDedit-style listing form:
+    ///
+    /// - an immediate as `0x..` (hex, the form authoring tools print);
+    /// - a GPR reference as `r<index>` (e.g. `r12`);
+    /// - a PSR reference as `PSR<index>` with the named register appended
+    ///   when known (e.g. `PSR4(Title)`); a secondary-addressing PSR
+    ///   reference gains a trailing `'` (e.g. `PSR4087'`).
+    pub fn disassemble(&self) -> String {
+        match *self {
+            Operand::Immediate(v) => format!("0x{v:X}"),
+            Operand::Register { bank, index } => match bank {
+                RegisterBank::Gpr => format!("r{index}"),
+                RegisterBank::Psr | RegisterBank::PsrSecondary => {
+                    let tick = if bank == RegisterBank::PsrSecondary {
+                        "'"
+                    } else {
+                        ""
+                    };
+                    match self.resolve_register().and_then(|r| r.psr) {
+                        Some(p) if p.name != "reserved" => {
+                            format!("PSR{index}{tick}({})", p.name)
+                        }
+                        _ => format!("PSR{index}{tick}"),
+                    }
+                }
+            },
+        }
+    }
+}
+
+impl DecodedCommand {
+    /// A single-line, BDedit-style disassembly of this command.
+    ///
+    /// The form is `<mnemonic> [operand1[, operand2]]`. A
+    /// [`Operation::Unknown`] additionally carries its raw selector, e.g.
+    /// `Unknown(sub_grp=0,sel=0x7)`. Operands are rendered by
+    /// [`Operand::disassemble`]. This is a diagnostic listing only — it is
+    /// not a re-assemblable binary representation.
+    pub fn disassemble(&self) -> String {
+        let mut s = match self.operation {
+            Operation::Unknown { sub_grp, selector } => {
+                format!("Unknown(sub_grp={sub_grp},sel=0x{selector:X})")
+            }
+            op => op.mnemonic().to_string(),
+        };
+        if let Some(op1) = &self.operand1 {
+            s.push(' ');
+            s.push_str(&op1.disassemble());
+            if let Some(op2) = &self.operand2 {
+                s.push_str(", ");
+                s.push_str(&op2.disassemble());
+            }
+        }
+        s
+    }
+}
+
+impl core::fmt::Display for DecodedCommand {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.disassemble())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,6 +893,95 @@ mod tests {
             },
         };
         assert_eq!(nc.decode().operation, Operation::JumpTitle);
+    }
+
+    // --- Disassembly ---
+
+    #[test]
+    fn disasm_nop_no_operands() {
+        let d = cmd(0x0000_0000, 0, 0);
+        assert_eq!(d.disassemble(), "Nop");
+        assert_eq!(d.to_string(), "Nop");
+    }
+
+    #[test]
+    fn disasm_goto_gpr_operand() {
+        // GoTo with a register (GPR) operand 1.
+        let d = cmd(0x2001_0000, 0x0000_000C, 0);
+        assert_eq!(d.disassemble(), "GoTo r12");
+    }
+
+    #[test]
+    fn disasm_jump_title_immediate() {
+        let d = cmd(0x2181_0000, 0x0000_0001, 0);
+        assert_eq!(d.disassemble(), "JumpTitle 0x1");
+    }
+
+    #[test]
+    fn disasm_move_reg_immediate() {
+        // Move GPR1 ← 1.
+        let d = cmd(0x5040_0001, 0x0000_0001, 0x0000_0001);
+        assert_eq!(d.disassemble(), "Move r1, 0x1");
+    }
+
+    #[test]
+    fn disasm_compare_named_psr() {
+        // compare PSR4 (Title) against 0xFFFF.
+        let d = cmd(0x4840_0200, 0x8000_0004, 0x0000_FFFF);
+        assert_eq!(d.disassemble(), "Eq PSR4(Title), 0xFFFF");
+    }
+
+    #[test]
+    fn disasm_secondary_psr_tick() {
+        // SetButtonPage with a primary + secondary-addressing PSR operand.
+        // Indices 0xFF6/0xFF7 are out of the named 0..127 PSR range, so no
+        // (name) suffix; the secondary operand carries the trailing tick.
+        let d = cmd(0x5100_0003, 0x8000_0FF6, 0xC000_0FF7);
+        assert_eq!(d.disassemble(), "SetButtonPage PSR4086, PSR4087'");
+    }
+
+    #[test]
+    fn disasm_unknown_carries_selector() {
+        let d = cmd(0x0007_0000, 0, 0);
+        assert_eq!(d.disassemble(), "Unknown(sub_grp=0,sel=0x7)");
+    }
+
+    #[test]
+    fn operation_group_and_predicates() {
+        assert_eq!(Operation::JumpTitle.group(), Some(CommandGroup::Branch));
+        assert_eq!(Operation::Eq.group(), Some(CommandGroup::Compare));
+        assert_eq!(Operation::Move.group(), Some(CommandGroup::Set));
+        assert_eq!(
+            Operation::Unknown {
+                sub_grp: 0,
+                selector: 0
+            }
+            .group(),
+            None
+        );
+
+        assert!(Operation::JumpTitle.is_branch());
+        assert!(!Operation::Move.is_branch());
+        assert!(Operation::PlayPL.is_playback());
+        assert!(Operation::LinkMK.is_playback());
+        assert!(!Operation::JumpTitle.is_playback());
+        assert!(!Operation::Add.is_playback());
+    }
+
+    #[test]
+    fn mnemonic_matches_decode_group() {
+        // Every decoded operation's `group()` (when Some) must agree with
+        // the `CommandGroup` the decoder assigned, so the disassembler's
+        // group view never contradicts the wire decode.
+        for code in 0x01u8..=0x07 {
+            let word0 = 0x4800_0000 | 0x00C0_0000 | ((code as u32) << 8);
+            let d = cmd(word0, 0, 0);
+            assert_eq!(d.operation.group(), Some(d.group));
+        }
+        for code in 0x01u8..=0x0F {
+            let d = cmd(0x5000_0000 | code as u32, 0, 0);
+            assert_eq!(d.operation.group(), Some(d.group));
+        }
     }
 
     #[test]

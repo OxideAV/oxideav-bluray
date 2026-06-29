@@ -144,6 +144,66 @@ impl MovieObjects {
     }
 }
 
+impl NavCommand {
+    /// A single-line BDedit-style disassembly of this command, e.g.
+    /// `"JumpTitle 0x1"`. Convenience wrapper over `self.decode()` +
+    /// [`super::nav_command::DecodedCommand::disassemble`]. Diagnostic
+    /// only — never re-assembled to bytes nor executed.
+    pub fn disassemble(&self) -> String {
+        self.decode().disassemble()
+    }
+}
+
+impl MovieObject {
+    /// Disassemble this MovieObject's command list into a multi-line
+    /// listing — one `<index>: <command>` line per navigation command,
+    /// prefixed by a header naming the object's playback-control flags.
+    ///
+    /// `index` is the object's position in `MovieObject.bdmv` (used only
+    /// for the header label). The output is a forensic / diagnostic dump
+    /// of the HDMV script; it is not re-assemblable and the commands are
+    /// not executed (see `super::vm` for the interpreter).
+    pub fn disassemble(&self, index: usize) -> String {
+        let mut s = format!(
+            "MovieObject[{index}] (resume={}, menu_mask={}, title_mask={}, {} cmd{})",
+            self.resume_intention_flag,
+            self.menu_call_mask,
+            self.title_search_mask,
+            self.commands.len(),
+            if self.commands.len() == 1 { "" } else { "s" },
+        );
+        for (i, cmd) in self.commands.iter().enumerate() {
+            s.push_str(&format!("\n  {i:>3}: {}", cmd.disassemble()));
+        }
+        s
+    }
+}
+
+impl MovieObjects {
+    /// Disassemble the entire `MovieObject.bdmv` table into a listing —
+    /// every [`MovieObject`] rendered by [`MovieObject::disassemble`],
+    /// separated by blank lines. The leading line records the table
+    /// version. Diagnostic only; the script is never executed here.
+    pub fn disassemble(&self) -> String {
+        let mut s = format!(
+            "MovieObject.bdmv version={} ({} object{})",
+            String::from_utf8_lossy(&self.version),
+            self.movie_objects.len(),
+            if self.movie_objects.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+        );
+        for (i, mo) in self.movie_objects.iter().enumerate() {
+            s.push('\n');
+            s.push('\n');
+            s.push_str(&mo.disassemble(i));
+        }
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +250,80 @@ mod tests {
         let bytes = mo.encode();
         let parsed = MovieObjects::parse(&bytes).unwrap();
         assert_eq!(parsed.movie_objects, mo.movie_objects);
+    }
+
+    /// Build a NavCommand from three big-endian words.
+    fn nav(word0: u32, word1: u32, word2: u32) -> NavCommand {
+        let mut bytes = [0u8; 12];
+        bytes[0..4].copy_from_slice(&word0.to_be_bytes());
+        bytes[4..8].copy_from_slice(&word1.to_be_bytes());
+        bytes[8..12].copy_from_slice(&word2.to_be_bytes());
+        NavCommand { bytes }
+    }
+
+    #[test]
+    fn nav_command_disassemble() {
+        // JumpTitle 1.
+        assert_eq!(nav(0x2181_0000, 1, 0).disassemble(), "JumpTitle 0x1");
+    }
+
+    #[test]
+    fn movie_object_disassemble_listing() {
+        let mo = MovieObject {
+            resume_intention_flag: 1,
+            menu_call_mask: 0,
+            title_search_mask: 1,
+            commands: vec![
+                nav(0x5040_0001, 0x0000_0001, 0x0000_0001), // Move r1, 0x1
+                nav(0x2181_0000, 0x0000_0002, 0),           // JumpTitle 0x2
+            ],
+        };
+        let listing = mo.disassemble(0);
+        // Each command line is `\n` + two-space indent + a 3-wide
+        // right-aligned index + ": " + the disassembly.
+        let expected = "MovieObject[0] (resume=1, menu_mask=0, title_mask=1, 2 cmds)\n    \
+                        0: Move r1, 0x1\n    \
+                        1: JumpTitle 0x2";
+        assert_eq!(listing, expected);
+    }
+
+    #[test]
+    fn movie_object_singular_count_label() {
+        let mo = MovieObject {
+            resume_intention_flag: 0,
+            menu_call_mask: 0,
+            title_search_mask: 0,
+            commands: vec![nav(0x0000_0000, 0, 0)], // Nop
+        };
+        let listing = mo.disassemble(3);
+        assert!(listing.starts_with("MovieObject[3] (resume=0, menu_mask=0, title_mask=0, 1 cmd)"));
+        assert!(listing.contains("\n    0: Nop"));
+    }
+
+    #[test]
+    fn movie_objects_table_disassemble() {
+        let mo = MovieObjects {
+            version: *b"0200",
+            movie_objects: vec![
+                MovieObject {
+                    resume_intention_flag: 0,
+                    menu_call_mask: 0,
+                    title_search_mask: 0,
+                    commands: vec![nav(0x0203_0000, 0, 0)], // TerminatePL
+                },
+                MovieObject {
+                    resume_intention_flag: 0,
+                    menu_call_mask: 0,
+                    title_search_mask: 0,
+                    commands: vec![],
+                },
+            ],
+        };
+        let dump = mo.disassemble();
+        assert!(dump.starts_with("MovieObject.bdmv version=0200 (2 objects)"));
+        assert!(dump.contains("MovieObject[0]"));
+        assert!(dump.contains("0: TerminatePL"));
+        assert!(dump.contains("MovieObject[1] (resume=0, menu_mask=0, title_mask=0, 0 cmds)"));
     }
 
     #[test]
