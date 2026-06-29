@@ -1096,6 +1096,44 @@ pub struct Chapter {
     pub ref_play_item_id: u16,
 }
 
+/// A chapter with its derived presentation span — the title-relative
+/// `[start, end)` window and the duration that follows from it.
+///
+/// Produced by [`PlayListMpls::chapters_with_duration`]. The `start` is the
+/// same value [`Chapter::start_pts_90k`] carries; the `end` is the next
+/// chapter's start in playback order, and the *last* chapter's end is the
+/// title's total presentation length ([`PlayListMpls::duration_90k`]). All
+/// derivation over already-parsed marks + PlayItem durations — no new wire
+/// layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChapterSpan {
+    /// 0-based chapter index in playback order (chapter 1 is index 0).
+    pub index: usize,
+    /// Title-relative start in 90 kHz ticks — identical to
+    /// [`Chapter::start_pts_90k`]. Directly seekable via
+    /// [`crate::TitleSource::seek_to`].
+    pub start_pts_90k: u64,
+    /// Title-relative end in 90 kHz ticks — the next chapter's start, or
+    /// the title total duration for the final chapter. Always
+    /// `>= start_pts_90k`.
+    pub end_pts_90k: u64,
+    /// Index of the PlayItem this chapter's entry-mark references.
+    pub ref_play_item_id: u16,
+}
+
+impl ChapterSpan {
+    /// Duration of this chapter in 90 kHz ticks (`end - start`). Saturates
+    /// at 0 for the degenerate equal-timestamp case.
+    pub fn duration_90k(&self) -> u64 {
+        self.end_pts_90k.saturating_sub(self.start_pts_90k)
+    }
+
+    /// Duration of this chapter in (truncated) whole seconds.
+    pub fn duration_secs(&self) -> u64 {
+        self.duration_90k() / 90_000
+    }
+}
+
 /// Parsed `.mpls` file.
 #[derive(Debug, Clone)]
 pub struct PlayListMpls {
@@ -1271,6 +1309,43 @@ impl PlayListMpls {
                 index: out.len(),
                 start_pts_90k,
                 ref_play_item_id: m.ref_play_item_id,
+            });
+        }
+        out
+    }
+
+    /// Chapter list with each chapter's derived presentation span.
+    ///
+    /// Same chapters as [`Self::chapters`], but each is widened to a
+    /// `[start, end)` window: a chapter ends where the next one begins
+    /// (in playback order), and the final chapter ends at the title's
+    /// total duration ([`Self::duration_90k`]). The returned spans are
+    /// sorted by `start_pts_90k` so the `end = next.start` rule holds even
+    /// when the underlying marks were authored out of order. A chapter
+    /// whose start somehow exceeds the title duration (malformed authoring)
+    /// gets `end == start` (zero duration) rather than an underflow.
+    pub fn chapters_with_duration(&self) -> Vec<ChapterSpan> {
+        let mut chapters = self.chapters();
+        if chapters.is_empty() {
+            return Vec::new();
+        }
+        // Order by start so "end = next start" is meaningful regardless of
+        // authoring order; preserve each chapter's original ref + re-number
+        // the playback-order index.
+        chapters.sort_by_key(|c| c.start_pts_90k);
+        let title_end = self.duration_90k();
+
+        let mut out = Vec::with_capacity(chapters.len());
+        for (i, c) in chapters.iter().enumerate() {
+            let end = match chapters.get(i + 1) {
+                Some(next) => next.start_pts_90k,
+                None => title_end.max(c.start_pts_90k),
+            };
+            out.push(ChapterSpan {
+                index: i,
+                start_pts_90k: c.start_pts_90k,
+                end_pts_90k: end.max(c.start_pts_90k),
+                ref_play_item_id: c.ref_play_item_id,
             });
         }
         out
@@ -2274,6 +2349,94 @@ mod tests {
         assert_eq!(ch[2].ref_play_item_id, 1);
         // title 60s + 5s into item 1 = 65s @ 90kHz.
         assert_eq!(ch[2].start_pts_90k, 65 * 90_000);
+    }
+
+    #[test]
+    fn chapter_spans_carry_end_and_duration() {
+        // Same marks as the lift test: chapters at title 0s, 10s, 65s.
+        // Title spans [0, 105s) (item 0 = 60s, item 1 = 45s).
+        let mut m = sample_mpls();
+        m.marks = vec![
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 0,
+                mark_time_ticks: 0,
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 0,
+                mark_time_ticks: 45_000 * 10,
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 1,
+                mark_time_ticks: 45_000 * 35, // 5s past IN(30s) → title 65s
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+        ];
+
+        let spans = m.chapters_with_duration();
+        assert_eq!(spans.len(), 3);
+
+        // [0, 10s)
+        assert_eq!(spans[0].index, 0);
+        assert_eq!(spans[0].start_pts_90k, 0);
+        assert_eq!(spans[0].end_pts_90k, 10 * 90_000);
+        assert_eq!(spans[0].duration_90k(), 10 * 90_000);
+        assert_eq!(spans[0].duration_secs(), 10);
+
+        // [10s, 65s)
+        assert_eq!(spans[1].start_pts_90k, 10 * 90_000);
+        assert_eq!(spans[1].end_pts_90k, 65 * 90_000);
+        assert_eq!(spans[1].duration_secs(), 55);
+
+        // [65s, 105s) — final chapter ends at the title total duration.
+        assert_eq!(spans[2].start_pts_90k, 65 * 90_000);
+        assert_eq!(spans[2].end_pts_90k, m.duration_90k());
+        assert_eq!(spans[2].end_pts_90k, 105 * 90_000);
+        assert_eq!(spans[2].duration_secs(), 40);
+        assert_eq!(spans[2].ref_play_item_id, 1);
+    }
+
+    #[test]
+    fn chapter_spans_empty_when_no_marks() {
+        let mut m = sample_mpls();
+        m.marks.clear();
+        assert!(m.chapters_with_duration().is_empty());
+    }
+
+    #[test]
+    fn chapter_spans_sorted_and_contiguous() {
+        // Author the marks out of order; spans must still be contiguous
+        // start-ascending with end = next start.
+        let mut m = sample_mpls();
+        m.marks = vec![
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 0,
+                mark_time_ticks: 45_000 * 20, // title 20s
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+            PlayListMark {
+                mark_type: 1,
+                ref_play_item_id: 0,
+                mark_time_ticks: 45_000 * 5, // title 5s
+                entry_es_pid: 0x1011,
+                duration_ticks: 0,
+            },
+        ];
+        let spans = m.chapters_with_duration();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].start_pts_90k, 5 * 90_000);
+        assert_eq!(spans[0].end_pts_90k, spans[1].start_pts_90k);
+        assert_eq!(spans[1].start_pts_90k, 20 * 90_000);
+        assert_eq!(spans[1].end_pts_90k, m.duration_90k());
     }
 
     #[test]

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Chapter presentation spans** (`bdmv::mpls`, `Disc`) — the chapter
+  list previously surfaced each chapter's title-relative *start* PTS only;
+  a player UI / scrubber also needs each chapter's *end* and *duration*.
+  `PlayListMpls::chapters_with_duration()` widens every entry-mark chapter
+  to a `[start, end)` window: a chapter ends where the next begins (in
+  playback order, after sorting by start so out-of-order authoring is
+  tolerated) and the final chapter ends at the title total
+  (`duration_90k`). The new `ChapterSpan { index, start_pts_90k,
+  end_pts_90k, ref_play_item_id }` adds `duration_90k()` /
+  `duration_secs()`. `Disc::chapter_spans(title)` is the file-less peer of
+  `Disc::chapters`. Pure derivation over already-parsed marks + PlayItem
+  durations — no new wire layout. Re-exported from the crate root. 5 new
+  tests (3 unit + 1 disc-level extension + the empty-marks guard).
 - **HDMV navigation-command disassembler** (`bdmv::nav_command`,
   `bdmv::movie_object`) — a BDedit-style, single-line textual listing for
   decoded HDMV commands, built purely from the already-decoded

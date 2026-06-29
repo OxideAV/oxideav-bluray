@@ -559,6 +559,19 @@ fn disc_chapters_map_to_seekable_keyframes() {
     assert_eq!(chapters[1].ref_play_item_id, 1);
     assert_eq!(chapters[1].start_pts_90k, 12 * 90_000, "title 12 s");
 
+    // The span view widens each chapter to [start, end): chapter 1 ends
+    // where chapter 2 begins, and chapter 2 ends at the title duration.
+    let spans = disc.chapter_spans(&title);
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0].start_pts_90k, 0);
+    assert_eq!(spans[0].end_pts_90k, 12 * 90_000);
+    assert_eq!(spans[0].duration_90k(), 12 * 90_000);
+    assert_eq!(spans[1].start_pts_90k, 12 * 90_000);
+    assert!(
+        spans[1].end_pts_90k >= spans[1].start_pts_90k,
+        "final chapter ends at-or-after its start (title duration)"
+    );
+
     // Each chapter's PTS is directly seekable to the right keyframe.
     let mut src = disc.open_title(&title, None).expect("open title");
     let clip_a_out = n_a as u64 * TS_PACKET_LEN as u64;

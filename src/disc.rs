@@ -26,7 +26,9 @@ use std::path::{Path, PathBuf};
 
 use crate::bdmv::clpi::ClipInformation;
 use crate::bdmv::index_bdmv::{IndexBdmv, IndexEntry, IndexObjectType};
-use crate::bdmv::mpls::{Chapter, ConnectionCondition, PlayItem, PlayListMpls, StreamCodingType};
+use crate::bdmv::mpls::{
+    Chapter, ChapterSpan, ConnectionCondition, PlayItem, PlayListMpls, StreamCodingType,
+};
 use crate::decrypt::{StreamDecryptor, AACS_UNIT_LEN};
 use crate::error::{BlurayError, Result};
 use crate::m2ts::{strip_tp_extra, M2TS_PACKET_LEN, TS_PACKET_LEN};
@@ -438,6 +440,25 @@ impl Disc {
             return Vec::new();
         };
         pl.chapters()
+    }
+
+    /// Chapter list for `title` with each chapter's derived `[start, end)`
+    /// presentation span and duration.
+    ///
+    /// Same chapters as [`Self::chapters`] but widened via
+    /// [`PlayListMpls::chapters_with_duration`]: each chapter ends where
+    /// the next begins, and the final chapter ends at the title's total
+    /// duration. Returns an empty list on read / parse failure (matches
+    /// [`Self::chapters`]).
+    pub fn chapter_spans(&self, title: &TitleInfo) -> Vec<ChapterSpan> {
+        let bdmv = self.root.join("BDMV");
+        let Ok(pl_bytes) = read_file(&playlist_path(&bdmv, title.playlist_id)) else {
+            return Vec::new();
+        };
+        let Ok(pl) = PlayListMpls::parse(&pl_bytes) else {
+            return Vec::new();
+        };
+        pl.chapters_with_duration()
     }
 
     /// Per-track catalogue lifted out of the title's playlist STN_table

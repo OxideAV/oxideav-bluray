@@ -88,7 +88,7 @@ pub use bdmv::{
     mobj_runner::{MobjRunner, RunOutcome, DEFAULT_OBJECT_BUDGET},
     movie_object::{MovieObject, MovieObjects, NavCommand},
     mpls::{
-        AngleClip, AngleClipRef, AppInfoPlayList, AspectRatio, AudioFormat, Chapter,
+        AngleClip, AngleClipRef, AppInfoPlayList, AspectRatio, AudioFormat, Chapter, ChapterSpan,
         ConnectionCondition, FrameRate, IgsInteractiveStream, MarkType, PgsSubtitleStream,
         PipPgStream, PlayItem, PlayItemFlags, PlayList, PlayListMark, PlayListMpls,
         PlayListPlaybackType, PrimaryAudioStream, PrimaryVideoStream, SampleRate,
