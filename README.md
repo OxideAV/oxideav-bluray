@@ -1,5 +1,7 @@
 # oxideav-bluray
 
+[![CI](https://github.com/OxideAV/oxideav-bluray/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-bluray/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-bluray.svg)](https://crates.io/crates/oxideav-bluray) [![docs.rs](https://docs.rs/oxideav-bluray/badge.svg)](https://docs.rs/oxideav-bluray) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Read-only Blu-ray Disc (BD-ROM) source plug-in: UDF 2.50 mount +
 BDMV directory walk + playlist (`.mpls`) / clip-info (`.clpi`)
 parsing + `.m2ts` streaming. Pure-Rust, clean-room per the
