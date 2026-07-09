@@ -61,6 +61,7 @@ fn synthetic_bdmv_mount_and_stream() {
             random_access_flag: 1,
             audio_mix_app_flag: 0,
             lossless_may_bypass_mixer_flag: 0,
+            uo_mask: 0,
         },
         play_list: PlayList {
             play_items: vec![PlayItem {

@@ -213,6 +213,7 @@ fn three_playitems_emit_three_continuity_segments_with_correct_byte_pts_bounds()
             random_access_flag: 1,
             audio_mix_app_flag: 0,
             lossless_may_bypass_mixer_flag: 0,
+            uo_mask: 0,
         },
         play_list: PlayList {
             play_items,
@@ -312,6 +313,7 @@ fn first_playitem_connection_condition_normalised_to_nonseamless() {
             random_access_flag: 1,
             audio_mix_app_flag: 0,
             lossless_may_bypass_mixer_flag: 0,
+            uo_mask: 0,
         },
         play_list: PlayList {
             play_items: vec![PlayItem {
@@ -368,6 +370,7 @@ fn missing_sequence_info_falls_back_to_zero_stc_origin() {
             random_access_flag: 1,
             audio_mix_app_flag: 0,
             lossless_may_bypass_mixer_flag: 0,
+            uo_mask: 0,
         },
         play_list: PlayList {
             play_items: vec![PlayItem {
@@ -446,6 +449,7 @@ fn map_clip_pts_to_title_pts_walks_across_playitem_seams() {
             random_access_flag: 1,
             audio_mix_app_flag: 0,
             lossless_may_bypass_mixer_flag: 0,
+            uo_mask: 0,
         },
         play_list: PlayList {
             play_items: vec![
@@ -557,6 +561,7 @@ fn segment_for_playitem_after_in_offset_advances_clip_axis_correctly() {
             random_access_flag: 1,
             audio_mix_app_flag: 0,
             lossless_may_bypass_mixer_flag: 0,
+            uo_mask: 0,
         },
         play_list: PlayList {
             play_items: vec![PlayItem {

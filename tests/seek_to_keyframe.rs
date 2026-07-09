@@ -125,6 +125,7 @@ fn seek_to_lands_on_keyframe_packet() {
             random_access_flag: 1,
             audio_mix_app_flag: 0,
             lossless_may_bypass_mixer_flag: 0,
+            uo_mask: 0,
         },
         play_list: PlayList {
             play_items: vec![
@@ -306,6 +307,7 @@ fn seek_to_without_cpi_falls_back_to_clip_start() {
             random_access_flag: 1,
             audio_mix_app_flag: 0,
             lossless_may_bypass_mixer_flag: 0,
+            uo_mask: 0,
         },
         play_list: PlayList {
             play_items: vec![PlayItem {
@@ -410,6 +412,7 @@ fn disc_chapters_map_to_seekable_keyframes() {
             random_access_flag: 1,
             audio_mix_app_flag: 0,
             lossless_may_bypass_mixer_flag: 0,
+            uo_mask: 0,
         },
         play_list: PlayList {
             play_items: vec![

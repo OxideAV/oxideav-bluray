@@ -926,6 +926,14 @@ pub struct PlayItemFlags {
     /// for single-angle PlayItems. Surfaced verbatim — its individual
     /// bit assignments are not pinned by the consulted references.
     pub angle_flags: u8,
+    /// `UO_mask_table` (§5.4.4.1) — the PlayItem-scoped 64-bit
+    /// User-Operation prohibition table, big-endian, preserved verbatim
+    /// (same wire field as [`AppInfoPlayList::uo_mask`] but applied to
+    /// this PlayItem only). Surfaced raw; individual bit assignments are
+    /// not pinned by the consulted references. Kept so an encode →
+    /// parse round trip does not silently drop the disc's per-PlayItem
+    /// UO prohibitions.
+    pub uo_mask: u64,
 }
 
 /// One PlayItem (§5.4.4.1).
@@ -1086,6 +1094,15 @@ pub struct AppInfoPlayList {
     pub random_access_flag: u8,
     pub audio_mix_app_flag: u8,
     pub lossless_may_bypass_mixer_flag: u8,
+    /// `UO_mask_table` (§5.4.3) — the 64-bit User-Operation prohibition
+    /// table, big-endian, preserved verbatim. Each bit, when set,
+    /// prohibits one remote-control user operation for the whole
+    /// PlayList; the individual bit → operation assignments are not
+    /// tabulated in the consulted references, so the raw word is
+    /// surfaced rather than decoded. Preserving it lets an
+    /// [`PlayListMpls::encode`] → [`PlayListMpls::parse`] round trip
+    /// keep the disc's UO prohibitions instead of dropping them to zero.
+    pub uo_mask: u64,
 }
 
 impl AppInfoPlayList {
@@ -1220,7 +1237,7 @@ impl PlayListMpls {
         r.skip(1)?; // reserved
         let playback_type = r.read_u8()?;
         let playback_count = r.read_u16()?;
-        r.skip(8)?; // UO_mask_table
+        let uo_mask = r.read_u64()?; // UO_mask_table (§5.4.3)
         let flag_bits = r.read_u8()?;
         let _padding = r.read_u8()?; // 13 bits reserved actually split across bytes — top of next byte stays 0
         let random_access_flag = (flag_bits >> 7) & 1;
@@ -1232,6 +1249,7 @@ impl PlayListMpls {
             random_access_flag,
             audio_mix_app_flag,
             lossless_may_bypass_mixer_flag,
+            uo_mask,
         };
         // Skip remainder of AppInfo
         r.seek(app_start + app_len)?;
@@ -1414,7 +1432,7 @@ impl PlayListMpls {
         out.push(0); // reserved
         out.push(self.app_info.playback_type);
         out.extend_from_slice(&self.app_info.playback_count.to_be_bytes());
-        out.extend_from_slice(&[0u8; 8]); // UO_mask_table
+        out.extend_from_slice(&self.app_info.uo_mask.to_be_bytes()); // UO_mask_table
         let fb = ((self.app_info.random_access_flag & 1) << 7)
             | ((self.app_info.audio_mix_app_flag & 1) << 6)
             | ((self.app_info.lossless_may_bypass_mixer_flag & 1) << 5);
@@ -1480,8 +1498,8 @@ fn parse_play_item(r: &mut Reader<'_>) -> Result<PlayItem> {
     let stc_id_ref = r.read_u8()?;
     let in_time_ticks = r.read_u32()?;
     let out_time_ticks = r.read_u32()?;
-    // UO_mask_table 8 bytes
-    r.skip(8)?;
+    // UO_mask_table (§5.4.4.1) — 64-bit UO prohibition table, preserved.
+    let uo_mask = r.read_u64()?;
     // random_access_flag 1 bit (top) + reserved 7 bits
     let random_access_byte = r.read_u8()?;
     let random_access_flag = (random_access_byte & 0x80) != 0;
@@ -1600,6 +1618,7 @@ fn parse_play_item(r: &mut Reader<'_>) -> Result<PlayItem> {
             still_mode,
             still_time,
             angle_flags,
+            uo_mask,
         },
     })
 }
@@ -1629,7 +1648,7 @@ fn encode_play_item(out: &mut Vec<u8>, pi: &PlayItem) {
     out.push(pi.stc_id_ref);
     out.extend_from_slice(&pi.in_time_ticks.to_be_bytes());
     out.extend_from_slice(&pi.out_time_ticks.to_be_bytes());
-    out.extend_from_slice(&[0u8; 8]); // UO_mask_table
+    out.extend_from_slice(&pi.flags.uo_mask.to_be_bytes()); // UO_mask_table
     out.push(if pi.flags.random_access_flag { 0x80 } else { 0 }); // random_access_flag (top bit) + reserved
     out.push(pi.flags.still_mode); // still_mode
     out.extend_from_slice(&pi.flags.still_time.to_be_bytes()); // still_time
@@ -2027,6 +2046,7 @@ mod tests {
                 random_access_flag: 1,
                 audio_mix_app_flag: 0,
                 lossless_may_bypass_mixer_flag: 0,
+                uo_mask: 0,
             },
             play_list: PlayList {
                 play_items: vec![
@@ -2155,6 +2175,9 @@ mod tests {
             // single-angle PlayItem: angle_flags is not on the wire, so
             // it round-trips back to 0 regardless of what we set here.
             angle_flags: 0,
+            // Non-trivial per-PlayItem UO_mask_table: all 8 bytes must
+            // survive the 8-byte wire field verbatim.
+            uo_mask: 0xDEAD_BEEF_0123_4567,
         };
         let bytes = m.encode();
         let parsed = PlayListMpls::parse(&bytes).unwrap();
@@ -2162,10 +2185,34 @@ mod tests {
         assert!(f.random_access_flag);
         assert_eq!(f.still_mode, 0x02);
         assert_eq!(f.still_time, 7);
+        assert_eq!(f.uo_mask, 0xDEAD_BEEF_0123_4567);
         // The second PlayItem left its flags at default → still clear.
         assert_eq!(
             parsed.play_list.play_items[1].flags,
             PlayItemFlags::default()
+        );
+    }
+
+    #[test]
+    fn uo_mask_tables_survive_round_trip() {
+        // Both the PlayList-scoped (AppInfoPlayList §5.4.3) and the
+        // PlayItem-scoped (§5.4.4.1) UO_mask_table are 8-byte wire fields
+        // the parser used to discard (encode wrote zeros). Confirm every
+        // one of the 64 bits round-trips through encode → parse.
+        let mut m = sample_mpls();
+        m.app_info.uo_mask = 0x0102_0408_1020_4080;
+        m.play_list.play_items[0].flags.uo_mask = 0xFFFF_0000_FFFF_0000;
+        m.play_list.play_items[1].flags.uo_mask = 0x0000_FFFF_0000_FFFF;
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        assert_eq!(parsed.app_info.uo_mask, 0x0102_0408_1020_4080);
+        assert_eq!(
+            parsed.play_list.play_items[0].flags.uo_mask,
+            0xFFFF_0000_FFFF_0000
+        );
+        assert_eq!(
+            parsed.play_list.play_items[1].flags.uo_mask,
+            0x0000_FFFF_0000_FFFF
         );
     }
 
@@ -2295,6 +2342,7 @@ mod tests {
                 random_access_flag: 0,
                 audio_mix_app_flag: 0,
                 lossless_may_bypass_mixer_flag: 0,
+                uo_mask: 0,
             };
             assert_eq!(app.playback_kind(), want);
             // Round-trip via the typed view should preserve the raw byte.
@@ -2542,6 +2590,7 @@ mod tests {
                 random_access_flag: 1,
                 audio_mix_app_flag: 0,
                 lossless_may_bypass_mixer_flag: 0,
+                uo_mask: 0,
             },
             play_list: PlayList {
                 play_items: vec![PlayItem {
@@ -2728,6 +2777,7 @@ mod tests {
                 random_access_flag: 1,
                 audio_mix_app_flag: 0,
                 lossless_may_bypass_mixer_flag: 0,
+                uo_mask: 0,
             },
             play_list: PlayList {
                 play_items: vec![PlayItem {
