@@ -1020,6 +1020,12 @@ pub struct AngleClipRef<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubPath {
     pub sub_path_type: u8,
+    /// `is_repeat_SubPath` (§5.4.4) — the low bit of the 16-bit field
+    /// after `SubPath_type` (15 reserved bits + this flag). When set, the
+    /// player loops this SubPath (e.g. a background slideshow / audio
+    /// loop) for the duration of the associated main-path presentation.
+    /// Preserved so an encode → parse round trip keeps the repeat intent.
+    pub is_repeat_subpath: bool,
     pub num_sub_play_items: u16,
 }
 
@@ -2009,13 +2015,15 @@ fn parse_sub_path(r: &mut Reader<'_>) -> Result<SubPath> {
     let body_end = body_start + len;
     r.skip(1)?; // reserved
     let sub_path_type = r.read_u8()?;
-    // 15 reserved bits + is_repeat_SubPath
-    r.skip(2)?;
+    // 15 reserved bits + is_repeat_SubPath (low bit of the 16-bit field)
+    let repeat_field = r.read_u16()?;
+    let is_repeat_subpath = (repeat_field & 1) != 0;
     r.skip(1)?; // reserved
     let num_sub_play_items = r.read_u8()? as u16;
     r.seek(body_end)?;
     Ok(SubPath {
         sub_path_type,
+        is_repeat_subpath,
         num_sub_play_items,
     })
 }
@@ -2026,7 +2034,8 @@ fn encode_sub_path(out: &mut Vec<u8>, sp: &SubPath) {
     let body_start = out.len();
     out.push(0); // reserved
     out.push(sp.sub_path_type);
-    out.extend_from_slice(&[0u8; 2]); // 15 reserved + is_repeat
+    // 15 reserved bits + is_repeat_SubPath (low bit)
+    out.extend_from_slice(&(sp.is_repeat_subpath as u16).to_be_bytes());
     out.push(0); // reserved
     out.push(sp.num_sub_play_items as u8);
     let body_len = (out.len() - body_start) as u32;
@@ -2123,6 +2132,7 @@ mod tests {
                 ],
                 sub_paths: vec![SubPath {
                     sub_path_type: 5,
+                    is_repeat_subpath: false,
                     num_sub_play_items: 1,
                 }],
             },
@@ -2214,6 +2224,19 @@ mod tests {
             parsed.play_list.play_items[1].flags.uo_mask,
             0x0000_FFFF_0000_FFFF
         );
+    }
+
+    #[test]
+    fn sub_path_repeat_flag_survives_round_trip() {
+        // is_repeat_SubPath is the low bit of the 16-bit field after
+        // SubPath_type; it was discarded (encode wrote a fixed zero word).
+        let mut m = sample_mpls();
+        assert!(!m.play_list.sub_paths[0].is_repeat_subpath);
+        m.play_list.sub_paths[0].is_repeat_subpath = true;
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        assert!(parsed.play_list.sub_paths[0].is_repeat_subpath);
+        assert_eq!(parsed.play_list.sub_paths[0].sub_path_type, 5);
     }
 
     #[test]
