@@ -40,3 +40,14 @@ name = "udf_descriptors"
 path = "fuzz_targets/udf_descriptors.rs"
 test = false
 doc = false
+
+# Coverage-guided harness over the BDMV metadata / navigation parsers in
+# `oxideav_bluray::bdmv` (index.bdmv, MovieObject.bdmv, .mpls, .clpi, and
+# the PG elementary-stream segment / display-set / RLE decoders). Same
+# contract as `udf_descriptors`: any `&[u8]` yields `Ok(_)` or
+# `Err(BlurayError)`, never a panic / debug overflow / out-of-bounds.
+[[bin]]
+name = "bdmv_parsers"
+path = "fuzz_targets/bdmv_parsers.rs"
+test = false
+doc = false
