@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **BDMV parser fuzz harness + hostile-input hardening** — a second
+  cargo-fuzz target, `bdmv_parsers`, multiplexes the whole BDMV parsing
+  surface (`index.bdmv` / `MovieObject.bdmv` / `.mpls` / `.clpi` + the PG
+  segment / display-set / RLE decoders) behind a one-byte selector, with
+  each `Ok(_)` parse driven through its derived accessors. Two in-CI
+  companion suites pin the Ok/Err-never-panic contract without a nightly
+  run: `bdmv_hostile_input` (size-lie length/offset fields incl.
+  `u32::MAX`, full truncation sweeps, uniform-fill sectors up to 64 KiB,
+  ~80k deterministic-PRNG buffers) and `bdmv_structured_mutation` (valid
+  encoded `.mpls`/`index.bdmv`/`MovieObject.bdmv` seeds perturbed by every
+  single-byte flip, a 32-bit size-lie at each aligned window, and every
+  truncation — so corruption lands inside real count-driven bodies). No
+  panic found across 5.4M fuzz runs + the full mutation matrix.
+- **UO_mask_table + is_repeat_SubPath preservation** (`bdmv::mpls`) — the
+  8-byte `UO_mask_table` in `AppInfoPlayList` (§5.4.3) and every
+  `PlayItem` (§5.4.4.1) and the `is_repeat_SubPath` flag (§5.4.4) were
+  parsed-then-discarded and re-encoded as zeros, so a parse → encode →
+  parse cycle silently dropped the disc's User-Operation prohibitions and
+  SubPath loop intent. Now surfaced verbatim as `AppInfoPlayList::uo_mask`
+  / `PlayItemFlags::uo_mask` (big-endian `u64`, raw — the bit → operation
+  assignments are not tabulated in the consulted references) and
+  `SubPath::is_repeat_subpath` (`bool`), and round-tripped through both
+  parse and encode. 3 new round-trip tests.
 - **Stream coding-type labels + track UI labels** (`bdmv::mpls`, `Disc`)
   — `StreamCodingType` gained `is_graphics()` (PGS / IGS / Text),
   `is_secondary()` (the `0xA1`/`0xA2` PiP-commentary audio) and

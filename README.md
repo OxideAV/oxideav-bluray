@@ -329,6 +329,22 @@ bluray://                          → auto-detect first BD-ROM mount
   and `encode` paths read/write these fields instead of fixed zeros, so
   a PlayItem's random-access intent + still-frame dwell survive an
   encode → parse round trip. Re-exported from the crate root.
+- **Preserved wire fields the parser used to drop** — the 8-byte
+  `UO_mask_table` (User-Operation prohibition table) in `AppInfoPlayList`
+  (§5.4.3) and every `PlayItem` (§5.4.4.1), and the `is_repeat_SubPath`
+  flag (§5.4.4), were parsed-then-discarded and re-encoded as zeros, so a
+  parse → encode → parse cycle silently lost them. Now surfaced verbatim
+  as `AppInfoPlayList::uo_mask` / `PlayItemFlags::uo_mask` (big-endian
+  `u64`, raw — the individual bit → operation assignments are not
+  tabulated in the consulted references) and `SubPath::is_repeat_subpath`
+  (`bool`), and round-tripped through both parse and encode.
+- **BDMV parser fuzz + hostile-input hardening** — a `bdmv_parsers`
+  cargo-fuzz target multiplexes every BDMV parser (index / MOBJ / mpls /
+  clpi / PGS) behind a one-byte selector, and two in-CI suites
+  (`bdmv_hostile_input` size-lie / truncation / uniform-fill / ~80k
+  random buffers, and `bdmv_structured_mutation` valid-seed byte-flip /
+  size-lie / truncation matrices) pin the Ok/Err-never-panic contract.
+  No panic across 5.4M fuzz runs + the full mutation matrix.
 - **STN_table video / audio attribute typed accessors** — five new
   enums (`VideoFormat`, `FrameRate`, `AspectRatio`, `AudioFormat`,
   `SampleRate`) cover the 4-bit nibbles BD-ROM Part 3 §5.4.4.4 packs
