@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Marked the internal `bdmv::common` byte-cursor plumbing (`Reader`,
+  `BdmvHeader`, `clpi_path`, `m2ts_path`) `#[doc(hidden)]` so
+  cargo-semver-checks stops tracking it as stable public API; the
+  documented BDMV/UDF/playlist/nav surface is unchanged.
+
 ### Added
 
 - **BDMV parser fuzz harness + hostile-input hardening** — a second

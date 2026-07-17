@@ -23,6 +23,8 @@
 //! `version_number`.
 
 pub mod clpi;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod common;
 pub mod index_bdmv;
 pub mod mobj_runner;
@@ -34,4 +36,6 @@ pub mod pgs;
 pub mod register_model;
 pub mod vm;
 
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use common::{BdmvHeader, Reader};
