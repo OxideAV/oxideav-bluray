@@ -73,6 +73,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-check points, reserved-bit rejection + detection, prohibit /
   permit inverses, per-op single-bit round-trips, Display) + an
   end-to-end MPLS encode → parse → typed-read test.
+- **SubPath title-timeline derivation + Disc-level enumeration** —
+  `PlayListMpls::sub_play_item_sync_window(sub_path_index, item_index)`
+  lifts a synchronous SubPlayItem's `sync_PlayItem_id` +
+  `sync_start_PTS_of_PlayItem` anchor onto the 90 kHz title axis (the
+  staged table's note that these fields time-lock a synchronous
+  SubPath to the MainPath), using the same PlayItem-duration-prefix
+  walk as `chapters`: the returned `SubPlayItemWindow` carries
+  `title_start_pts_90k` / `title_end_pts_90k` (start + the
+  SubPlayItem's own IN→OUT duration) + `duration_90k()` /
+  `duration_secs()`, directly consumable by `TitleSource::seek_to`.
+  `None` for out-of-range indices, the asynchronous PiP SubPath type
+  (sync fields documented ignored), a `sync_PlayItem_id` past the
+  MainPath, or an anchor before the referenced PlayItem's IN point
+  (mirrors the chapter-mark policy). `Disc::title_sub_paths(title)`
+  returns the title's parsed SubPath list file-lessly with the usual
+  swallow-error policy. `SubPlayItemWindow` re-exported from the crate
+  root. 2 new unit tests + a disc-level integration test (synthetic
+  text-subtitle SubPath: enumeration, kind, window lift, missing-
+  playlist empty list).
 - The `bdmv_parsers` fuzz target and both in-CI hardening suites
   (`bdmv_hostile_input`, `bdmv_structured_mutation`) now drive the new
   accessors (`SubPath::kind`, per-SubPlayItem helpers,

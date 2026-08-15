@@ -1260,6 +1260,41 @@ impl SubPath {
     }
 }
 
+/// Title-timeline presentation window of one synchronous
+/// [`SubPlayItem`], derived by
+/// [`PlayListMpls::sub_play_item_sync_window`]. The window lies on the
+/// same 90 kHz title axis as [`Chapter::start_pts_90k`] and
+/// `TitleSource::seek_to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubPlayItemWindow {
+    /// Index of the owning SubPath in `play_list.sub_paths`.
+    pub sub_path_index: usize,
+    /// Index of the SubPlayItem within the SubPath.
+    pub sub_play_item_index: usize,
+    /// The MainPath PlayItem the window is anchored to
+    /// (`sync_PlayItem_id`).
+    pub sync_play_item_id: u16,
+    /// Title-relative 90 kHz PTS at which the SubPlayItem starts
+    /// presenting.
+    pub title_start_pts_90k: u64,
+    /// Title-relative 90 kHz PTS at which the SubPlayItem's OUT time is
+    /// reached (`start + duration`).
+    pub title_end_pts_90k: u64,
+}
+
+impl SubPlayItemWindow {
+    /// Window length in 90 kHz ticks.
+    pub fn duration_90k(&self) -> u64 {
+        self.title_end_pts_90k
+            .saturating_sub(self.title_start_pts_90k)
+    }
+
+    /// Window length in seconds.
+    pub fn duration_secs(&self) -> f64 {
+        self.duration_90k() as f64 / 90_000.0
+    }
+}
+
 /// Typed view of the `PlayList_playback_type` byte recorded in
 /// [`AppInfoPlayList`] (BD-ROM Part 3 §5.4 AppInfoPlayList). Mirrors the
 /// raw-byte enumeration the wire layout records — `1` = sequential
@@ -1655,6 +1690,60 @@ impl PlayListMpls {
             });
         }
         out
+    }
+
+    /// Title-timeline presentation window of one synchronous
+    /// SubPlayItem.
+    ///
+    /// A synchronous SubPath's SubPlayItem is time-locked to the
+    /// MainPath through its `sync_PlayItem_id` +
+    /// `sync_start_PTS_of_PlayItem` anchor (§5.4.4.2 — per the staged
+    /// SubPlayItem syntax table's note that these two fields are how a
+    /// synchronous SubPath is time-locked to the MainPath). This lifts
+    /// that anchor onto the title timeline exactly like
+    /// [`Self::chapters`] lifts marks: the window starts at the
+    /// referenced PlayItem's title-relative start plus the anchor's
+    /// offset past that PlayItem's IN point, and runs for the
+    /// SubPlayItem's own IN→OUT duration.
+    ///
+    /// Returns `None` when:
+    /// - either index is out of range,
+    /// - the SubPath is the *asynchronous* PiP type
+    ///   ([`SubPathType::OutOfMuxAsyncPip`]) — the staged table marks
+    ///   the sync fields absent / ignored there, so no meaningful
+    ///   window exists,
+    /// - `sync_PlayItem_id` names a PlayItem the MainPath doesn't have,
+    /// - the anchor lies before the referenced PlayItem's IN point
+    ///   (malformed authoring; skipping mirrors the chapter-mark
+    ///   policy).
+    pub fn sub_play_item_sync_window(
+        &self,
+        sub_path_index: usize,
+        item_index: usize,
+    ) -> Option<SubPlayItemWindow> {
+        let sp = self.play_list.sub_paths.get(sub_path_index)?;
+        if sp.kind().is_synchronous() == Some(false) {
+            return None;
+        }
+        let spi = sp.sub_play_items.get(item_index)?;
+        let items = &self.play_list.play_items;
+        let ref_id = spi.sync_play_item_id as usize;
+        let pi = items.get(ref_id)?;
+        // Title-relative start (90 kHz) of the referenced PlayItem.
+        let item_start_90k: u64 = items[..ref_id].iter().map(|p| p.duration_90k()).sum();
+        let anchor_90k = u64::from(spi.sync_start_pts_ticks) * 2;
+        let in_90k = u64::from(pi.in_time_ticks) * 2;
+        if anchor_90k < in_90k {
+            return None;
+        }
+        let title_start_pts_90k = item_start_90k + (anchor_90k - in_90k);
+        Some(SubPlayItemWindow {
+            sub_path_index,
+            sub_play_item_index: item_index,
+            sync_play_item_id: spi.sync_play_item_id,
+            title_start_pts_90k,
+            title_end_pts_90k: title_start_pts_90k + spi.duration_90k(),
+        })
     }
 
     /// Test-only encoder. Produces a minimally-conformant `.mpls`
@@ -2859,6 +2948,68 @@ mod tests {
         let pi_mask = parsed.play_list.play_items[0].flags.uo_mask_table();
         assert!(pi_mask.is_prohibited(UserOperation::Stop));
         assert!(pi_mask.permits(UserOperation::MenuCall));
+    }
+
+    #[test]
+    fn sub_play_item_sync_window_lifts_anchor_onto_title_axis() {
+        // Pin PlayItem 0 to a 10 s presentation and give PlayItem 1 a
+        // non-zero IN point; anchor a synchronous SubPlayItem to
+        // PlayItem 1 at 45_000 ticks past its IN → the window starts
+        // 1 s into PlayItem 1's presentation, i.e. title 90 kHz
+        // PTS = 10 s·90k + 1 s·90k.
+        let mut m = sample_mpls();
+        m.play_list.play_items[0].in_time_ticks = 0;
+        m.play_list.play_items[0].out_time_ticks = 450_000; // 10 s
+        m.play_list.play_items[1].in_time_ticks = 45_000;
+        m.play_list.play_items[1].out_time_ticks = 45_000 + 225_000;
+        m.play_list.sub_paths[0].sub_play_items[0] = SubPlayItem {
+            clip_information_file_name: "00030".into(),
+            clip_codec_identifier: *b"M2TS",
+            connection_condition: ConnectionCondition::NonSeamless,
+            stc_id_ref: 0,
+            in_time_ticks: 900,
+            out_time_ticks: 900 + 45_000 * 3, // 3 s duration
+            sync_play_item_id: 1,
+            sync_start_pts_ticks: 90_000, // 45_000 past PI1's IN
+            multi_clips: Vec::new(),
+        };
+        let w = m.sub_play_item_sync_window(0, 0).expect("window");
+        let pi0_dur_90k = 450_000u64 * 2; // 10 s
+        assert_eq!(w.title_start_pts_90k, pi0_dur_90k + 45_000 * 2);
+        assert_eq!(w.title_end_pts_90k, w.title_start_pts_90k + 45_000 * 3 * 2);
+        assert_eq!(w.duration_90k(), 45_000 * 3 * 2);
+        assert!((w.duration_secs() - 3.0).abs() < 1e-9);
+        assert_eq!(w.sync_play_item_id, 1);
+        assert_eq!(w.sub_path_index, 0);
+        assert_eq!(w.sub_play_item_index, 0);
+    }
+
+    #[test]
+    fn sub_play_item_sync_window_rejects_async_and_bad_refs() {
+        let mut m = sample_mpls();
+        // Baseline: the type-5 (out-of-mux synchronous) sample SubPath
+        // with an anchor at PlayItem 0 / PTS 0 yields a window at 0.
+        assert_eq!(
+            m.sub_play_item_sync_window(0, 0)
+                .map(|w| w.title_start_pts_90k),
+            Some(0)
+        );
+        // Out-of-range SubPath / SubPlayItem indices.
+        assert!(m.sub_play_item_sync_window(1, 0).is_none());
+        assert!(m.sub_play_item_sync_window(0, 5).is_none());
+        // Asynchronous PiP type: sync fields are ignored per the staged
+        // table → no window.
+        m.play_list.sub_paths[0].sub_path_type = 0x06;
+        assert!(m.sub_play_item_sync_window(0, 0).is_none());
+        m.play_list.sub_paths[0].sub_path_type = 0x05;
+        // sync_PlayItem_id past the MainPath.
+        m.play_list.sub_paths[0].sub_play_items[0].sync_play_item_id = 7;
+        assert!(m.sub_play_item_sync_window(0, 0).is_none());
+        m.play_list.sub_paths[0].sub_play_items[0].sync_play_item_id = 1;
+        // Anchor before the referenced PlayItem's IN point.
+        m.play_list.play_items[1].in_time_ticks = 45_000;
+        m.play_list.sub_paths[0].sub_play_items[0].sync_start_pts_ticks = 44_999;
+        assert!(m.sub_play_item_sync_window(0, 0).is_none());
     }
 
     #[test]

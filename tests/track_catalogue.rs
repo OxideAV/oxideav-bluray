@@ -18,9 +18,10 @@ use std::path::Path;
 use oxideav_bluray::bdmv::index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType};
 use oxideav_bluray::bdmv::mpls::{
     AppInfoPlayList, ConnectionCondition, PgsSubtitleStream, PlayItem, PlayItemFlags, PlayList,
-    PlayListMpls, PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
+    PlayListMpls, PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType, SubPath,
+    SubPlayItem,
 };
-use oxideav_bluray::{Disc, TrackKind, M2TS_PACKET_LEN, TS_PACKET_LEN};
+use oxideav_bluray::{Disc, SubPathType, TrackKind, M2TS_PACKET_LEN, TS_PACKET_LEN};
 
 fn write_file(path: &Path, bytes: &[u8]) {
     if let Some(p) = path.parent() {
@@ -114,7 +115,25 @@ fn synth_disc(root: &Path) {
                     flags: PlayItemFlags::default(),
                 },
             ],
-            sub_paths: vec![],
+            // One out-of-mux synchronous SubPath (a text-subtitle-style
+            // auxiliary clip) anchored 1 s into PlayItem 1, so
+            // `Disc::title_sub_paths` + the sync-window lift have a
+            // non-trivial fixture to chew on.
+            sub_paths: vec![SubPath {
+                sub_path_type: 0x04,
+                is_repeat_subpath: false,
+                sub_play_items: vec![SubPlayItem {
+                    clip_information_file_name: "00003".into(),
+                    clip_codec_identifier: *b"M2TS",
+                    connection_condition: ConnectionCondition::NonSeamless,
+                    stc_id_ref: 0,
+                    in_time_ticks: 0,
+                    out_time_ticks: 45_000 * 2,
+                    sync_play_item_id: 1,
+                    sync_start_pts_ticks: 45_000,
+                    multi_clips: Vec::new(),
+                }],
+            }],
         },
         marks: vec![],
     };
@@ -352,6 +371,42 @@ impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+#[test]
+fn title_sub_paths_enumerates_and_sync_window_lifts() {
+    let tmp = tempdir_for_test();
+    synth_disc(tmp.path());
+    let disc = Disc::mount(tmp.path()).expect("mount synthetic disc");
+    let title = &disc.titles()[0];
+
+    // The synthetic playlist carries one text-subtitle SubPath with one
+    // synchronous SubPlayItem (see synth_disc).
+    let sub_paths = disc.title_sub_paths(title);
+    assert_eq!(sub_paths.len(), 1);
+    let sp = &sub_paths[0];
+    assert_eq!(sp.kind(), SubPathType::TextSubtitle);
+    assert!(!sp.is_repeat_subpath);
+    assert_eq!(sp.num_sub_play_items(), 1);
+    let spi = &sp.sub_play_items[0];
+    assert_eq!(spi.clip_information_file_name, "00003");
+    assert_eq!(spi.sync_play_item_id, 1);
+
+    // The sync anchor lifts onto the title timeline: PlayItem 0 runs
+    // 5 s, the anchor sits 1 s past PlayItem 1's IN (0) → window starts
+    // at 6 s and runs the SubPlayItem's 2 s duration.
+    let pl_bytes =
+        fs::read(tmp.path().join("BDMV/PLAYLIST/00000.mpls")).expect("read playlist back");
+    let pl = PlayListMpls::parse(&pl_bytes).expect("parse playlist");
+    let w = pl.sub_play_item_sync_window(0, 0).expect("sync window");
+    assert_eq!(w.title_start_pts_90k, 6 * 90_000);
+    assert_eq!(w.title_end_pts_90k, 8 * 90_000);
+    assert_eq!(w.duration_90k(), 2 * 90_000);
+
+    // Swallow-error policy: an unknown playlist id yields an empty list.
+    let mut ghost = title.clone();
+    ghost.playlist_id = 9_999;
+    assert!(disc.title_sub_paths(&ghost).is_empty());
 }
 
 // Monotonic per-process counter so concurrent tests can't collide on

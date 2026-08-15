@@ -98,7 +98,8 @@ pub use bdmv::{
         PipPgStream, PlayItem, PlayItemFlags, PlayList, PlayListMark, PlayListMpls,
         PlayListPlaybackType, PrimaryAudioStream, PrimaryVideoStream, SampleRate,
         SecondaryAudioStream, SecondaryVideoStream, StnTable, StreamCodingType, SubPath,
-        SubPathType, SubPlayItem, SubPlayItemClip, TextSubtitleStream, VideoFormat,
+        SubPathType, SubPlayItem, SubPlayItemClip, SubPlayItemWindow, TextSubtitleStream,
+        VideoFormat,
     },
     nav_command::{
         CommandGroup, DecodedCommand, Operand, Operation, RegisterBank, ResolvedRegister,

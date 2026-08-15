@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use crate::bdmv::clpi::ClipInformation;
 use crate::bdmv::index_bdmv::{IndexBdmv, IndexEntry, IndexObjectType};
 use crate::bdmv::mpls::{
-    Chapter, ChapterSpan, ConnectionCondition, PlayItem, PlayListMpls, StreamCodingType,
+    Chapter, ChapterSpan, ConnectionCondition, PlayItem, PlayListMpls, StreamCodingType, SubPath,
 };
 use crate::decrypt::{StreamDecryptor, AACS_UNIT_LEN};
 use crate::error::{BlurayError, Result};
@@ -459,6 +459,28 @@ impl Disc {
             return Vec::new();
         };
         pl.chapters_with_duration()
+    }
+
+    /// The title's parsed SubPath list (§5.4.4) — the auxiliary
+    /// presentation paths (PiP video, out-of-mux audio, text
+    /// subtitles, menus) recorded beside the MainPath, each with its
+    /// full [`SubPlayItem`](crate::SubPlayItem) list and typed
+    /// [`kind()`](crate::SubPath::kind). `TitleSource` streams the
+    /// MainPath only; this surface lets a player enumerate what else
+    /// the title carries (and resolve each SubPlayItem's clip stem to
+    /// its own `.m2ts` / `.clpi` pair).
+    ///
+    /// Returns an empty list on read / parse failure (matches
+    /// [`Self::chapters`] / [`Self::title_streams`]).
+    pub fn title_sub_paths(&self, title: &TitleInfo) -> Vec<SubPath> {
+        let bdmv = self.root.join("BDMV");
+        let Ok(pl_bytes) = read_file(&playlist_path(&bdmv, title.playlist_id)) else {
+            return Vec::new();
+        };
+        let Ok(pl) = PlayListMpls::parse(&pl_bytes) else {
+            return Vec::new();
+        };
+        pl.play_list.sub_paths
     }
 
     /// Per-track catalogue lifted out of the title's playlist STN_table

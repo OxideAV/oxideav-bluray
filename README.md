@@ -327,7 +327,16 @@ bluray://                          → auto-detect first BD-ROM mount
   (Browsable-slideshow audio `0x02` … Dolby Vision Enhancement Layer
   `0x0A`) with `is_pip()` / `is_stereoscopic()` / `is_out_of_mux()` /
   `is_synchronous()` / `display_name()`, surfaced via
-  `SubPath::kind()`.
+  `SubPath::kind()`. `Disc::title_sub_paths(title)` enumerates a
+  title's parsed SubPaths file-lessly (swallow-error policy matching
+  `chapters` / `title_streams`), and
+  `PlayListMpls::sub_play_item_sync_window(sub_path, item)` lifts a
+  synchronous SubPlayItem's `sync_PlayItem_id` +
+  `sync_start_PTS_of_PlayItem` anchor onto the 90 kHz title timeline
+  (`SubPlayItemWindow { title_start_pts_90k, title_end_pts_90k }` —
+  the same axis `TitleSource::seek_to` consumes; `None` for the
+  asynchronous PiP type, out-of-range refs, or an anchor before the
+  referenced PlayItem's IN point).
 - **Typed `UO_mask_table` decode** (`bdmv::uo_mask`, §5.4.3 /
   §5.4.4.1) — the two 64-bit User-Operation prohibition words the
   parser preserves raw (`AppInfoPlayList::uo_mask` /
