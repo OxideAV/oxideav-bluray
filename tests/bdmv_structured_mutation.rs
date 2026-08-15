@@ -21,6 +21,7 @@ use oxideav_bluray::bdmv::movie_object::{MovieObject, MovieObjects, NavCommand};
 use oxideav_bluray::bdmv::mpls::{
     AppInfoPlayList, ConnectionCondition, PlayItem, PlayItemFlags, PlayList, PlayListMark,
     PlayListMpls, PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType, SubPath,
+    SubPlayItem, SubPlayItemClip,
 };
 use oxideav_bluray::bdmv::{clpi, index_bdmv, movie_object, mpls, pgs};
 
@@ -30,8 +31,17 @@ fn drive_all(buf: &[u8]) {
     if let Ok(pl) = mpls::PlayListMpls::parse(buf) {
         let _ = pl.duration_90k();
         let _ = pl.chapters_with_duration();
+        let _ = pl.app_info.uo_mask_table().prohibited_ops();
         for pi in &pl.play_list.play_items {
             let _ = pi.duration_90k();
+            let _ = pi.flags.uo_mask_table().reserved_bits();
+        }
+        for sp in &pl.play_list.sub_paths {
+            let _ = sp.kind().display_name();
+            for spi in &sp.sub_play_items {
+                let _ = spi.duration_90k();
+                let _ = spi.num_clips();
+            }
         }
     }
     if let Ok(clip) = clpi::ClipInformation::parse(buf) {
@@ -140,7 +150,24 @@ fn valid_mpls() -> Vec<u8> {
             sub_paths: vec![SubPath {
                 sub_path_type: 5,
                 is_repeat_subpath: true,
-                num_sub_play_items: 1,
+                // A real SubPlayItem (multi-clip, so the mutation matrix
+                // reaches the multi-clip entry walk too) — corruption
+                // lands inside genuine count-driven SubPath bodies.
+                sub_play_items: vec![SubPlayItem {
+                    clip_information_file_name: "00007".into(),
+                    clip_codec_identifier: *b"M2TS",
+                    connection_condition: ConnectionCondition::SeamlessNewStc,
+                    stc_id_ref: 1,
+                    in_time_ticks: 90,
+                    out_time_ticks: 45_000 * 3,
+                    sync_play_item_id: 1,
+                    sync_start_pts_ticks: 1234,
+                    multi_clips: vec![SubPlayItemClip {
+                        clip_information_file_name: "00008".into(),
+                        clip_codec_identifier: *b"M2TS",
+                        stc_id_ref: 2,
+                    }],
+                }],
             }],
         },
         marks: vec![PlayListMark {

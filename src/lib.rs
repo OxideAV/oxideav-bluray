@@ -18,18 +18,23 @@
 //!
 //! Out of scope (deferred or indefinite):
 //! - BD-J (Java VM).
-//! - SubPath PiP / secondary-video streams.
+//! - SubPath secondary-stream *playback* (PiP compositing / out-of-mux
+//!   audio mixing) — the SubPath / SubPlayItem structures and the typed
+//!   `SubPathType` now parse (`bdmv::mpls`); `TitleSource` still
+//!   streams the MainPath only.
 //!
 //! (The HDMV interactive layer's `MovieObject.bdmv` opcode *decode* and a
 //! minimal navigation *VM* — `bdmv::nav_command`, `bdmv::vm`,
-//! `bdmv::mobj_runner` — now land; the player-side IG button-state
-//! machine / UO mask stay deferred.)
+//! `bdmv::mobj_runner` — now land, and the 64-bit `UO_mask_table` decodes
+//! through `bdmv::uo_mask`; the player-side IG button-state machine stays
+//! deferred.)
 //!
 //! ## Clean-room references
 //!
 //! - `docs/container/bluray/BD-ROM_Part3_V3.2_WhitePaper_180122.pdf`
 //! - `docs/container/bluray/BD-ROM_Audio_Visual_Application_Format_Specifications.pdf`
 //! - `docs/container/bluray/ECMA-167_3rd_edition_june_1997.pdf`
+//! - `docs/container/bluray/mpls-subpath-uo-mask.md`
 //!
 //! ## Quick start
 //!
@@ -93,7 +98,7 @@ pub use bdmv::{
         PipPgStream, PlayItem, PlayItemFlags, PlayList, PlayListMark, PlayListMpls,
         PlayListPlaybackType, PrimaryAudioStream, PrimaryVideoStream, SampleRate,
         SecondaryAudioStream, SecondaryVideoStream, StnTable, StreamCodingType, SubPath,
-        TextSubtitleStream, VideoFormat,
+        SubPathType, SubPlayItem, SubPlayItemClip, TextSubtitleStream, VideoFormat,
     },
     nav_command::{
         CommandGroup, DecodedCommand, Operand, Operation, RegisterBank, ResolvedRegister,
@@ -108,6 +113,7 @@ pub use bdmv::{
     register_model::{
         gpr_convention, psr_info, GprConvention, PsrClass, PsrInfo, GPR_COUNT, PSR_COUNT,
     },
+    uo_mask::{UoMask, UserOperation},
     vm::{HdmvVm, NavRequest, Registers, Step, DEFAULT_STEP_BUDGET},
 };
 pub use decrypt::{DecryptError, StreamDecryptor};

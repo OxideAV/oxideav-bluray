@@ -37,11 +37,20 @@ fuzz_target!(|data: &[u8]| {
                 let _ = pl.chapters_with_duration();
                 for pi in &pl.play_list.play_items {
                     let _ = pi.duration_90k();
+                    let _ = pi.flags.uo_mask_table().reserved_bits();
                 }
                 for m in &pl.marks {
                     let _ = m.kind();
                 }
                 let _ = pl.app_info.playback_kind();
+                let _ = pl.app_info.uo_mask_table().prohibited_ops();
+                for sp in &pl.play_list.sub_paths {
+                    let _ = sp.kind().display_name();
+                    for spi in &sp.sub_play_items {
+                        let _ = spi.duration_90k();
+                        let _ = spi.num_clips();
+                    }
+                }
             }
         }
         1 => {

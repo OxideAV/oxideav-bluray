@@ -45,6 +45,15 @@
 //! fully parse in Phase 1. We surface only the canonical fields a
 //! demuxer needs to wire up streaming: clip filename + codec id +
 //! IN/OUT times + STC reference.
+//!
+//! Each `SubPath` likewise carries a 32-bit length, its `SubPath_type`
+//! (typed as [`SubPathType`]) and its `SubPlayItem()` list — parsed per
+//! the staged clean-room table
+//! `docs/container/bluray/mpls-subpath-uo-mask.md` ("SubPlayItem —
+//! syntax"). The two 64-bit `UO_mask_table` words (PlayList-scoped in
+//! `AppInfoPlayList()`, PlayItem-scoped in each `PlayItem()`) decode
+//! through [`super::uo_mask::UoMask`] via the same staged table's
+//! bit → operation map.
 
 use crate::bdmv::common::{BdmvHeader, Reader};
 use crate::error::{BlurayError, Result};
@@ -69,6 +78,17 @@ impl ConnectionCondition {
             0x05 => Self::SeamlessContinuation,
             0x06 => Self::SeamlessNewStc,
             other => Self::Other(other),
+        }
+    }
+
+    /// Encode back to the 4-bit wire value. Round-trips with
+    /// [`Self::from_raw`].
+    pub fn as_raw(self) -> u8 {
+        match self {
+            Self::NonSeamless => 0x01,
+            Self::SeamlessContinuation => 0x05,
+            Self::SeamlessNewStc => 0x06,
+            Self::Other(v) => v,
         }
     }
 }
@@ -929,11 +949,19 @@ pub struct PlayItemFlags {
     /// `UO_mask_table` (§5.4.4.1) — the PlayItem-scoped 64-bit
     /// User-Operation prohibition table, big-endian, preserved verbatim
     /// (same wire field as [`AppInfoPlayList::uo_mask`] but applied to
-    /// this PlayItem only). Surfaced raw; individual bit assignments are
-    /// not pinned by the consulted references. Kept so an encode →
-    /// parse round trip does not silently drop the disc's per-PlayItem
-    /// UO prohibitions.
+    /// this PlayItem only). See [`Self::uo_mask_table`] for the typed
+    /// bit → operation view. Kept so an encode → parse round trip does
+    /// not silently drop the disc's per-PlayItem UO prohibitions.
     pub uo_mask: u64,
+}
+
+impl PlayItemFlags {
+    /// Typed view of [`Self::uo_mask`] — the PlayItem-scoped
+    /// User-Operation prohibition table decoded per the staged
+    /// `UO_mask_table` bit map (a set bit prohibits its operation).
+    pub fn uo_mask_table(&self) -> super::uo_mask::UoMask {
+        super::uo_mask::UoMask::from_raw(self.uo_mask)
+    }
 }
 
 /// One PlayItem (§5.4.4.1).
@@ -1015,10 +1043,200 @@ pub struct AngleClipRef<'a> {
     pub stc_id_ref: u8,
 }
 
-/// A SubPath placeholder — we count them and preserve their type but
-/// do not parse the inner PlayItems in Phase 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Typed view of the `SubPath_type` byte (§5.4.4) — what kind of
+/// auxiliary presentation path a PlayList SubPath carries. Code values
+/// per the staged clean-room table
+/// `docs/container/bluray/mpls-subpath-uo-mask.md` ("SubPath_type —
+/// PlayList SubPath type codes").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubPathType {
+    /// `0x02` — primary-audio presentation path of the Browsable
+    /// slideshow.
+    BrowsableSlideshowAudio,
+    /// `0x03` — Interactive Graphics presentation menu.
+    InteractiveGraphicsMenu,
+    /// `0x04` — Text-subtitle presentation path.
+    TextSubtitle,
+    /// `0x05` — out-of-mux *synchronous* elementary-stream path(s):
+    /// secondary audio / PG carried in a separate clip, time-locked to
+    /// the MainPath.
+    OutOfMuxSynchronous,
+    /// `0x06` — out-of-mux *asynchronous* Picture-in-Picture
+    /// presentation path (the PiP clip is separate and free-running).
+    OutOfMuxAsyncPip,
+    /// `0x07` — in-mux *synchronous* Picture-in-Picture presentation
+    /// path (the PiP stream is multiplexed into the MainPath clip).
+    InMuxSyncPip,
+    /// `0x08` — stereoscopic-video presentation path (3D dependent /
+    /// right-view).
+    StereoscopicVideo,
+    /// `0x09` — stereoscopic Interactive Graphics menu.
+    StereoscopicIgMenu,
+    /// `0x0A` — Dolby Vision Enhancement Layer (UHD BD dual-layer).
+    DolbyVisionEnhancementLayer,
+    /// `0x00`, `0x01`, `0x0B..` — reserved / unknown, preserved raw.
+    Other(u8),
+}
+
+impl SubPathType {
+    /// Decode the wire byte. Unknown / reserved values round through
+    /// [`Self::Other`] rather than failing.
+    pub fn from_raw(v: u8) -> Self {
+        match v {
+            0x02 => Self::BrowsableSlideshowAudio,
+            0x03 => Self::InteractiveGraphicsMenu,
+            0x04 => Self::TextSubtitle,
+            0x05 => Self::OutOfMuxSynchronous,
+            0x06 => Self::OutOfMuxAsyncPip,
+            0x07 => Self::InMuxSyncPip,
+            0x08 => Self::StereoscopicVideo,
+            0x09 => Self::StereoscopicIgMenu,
+            0x0A => Self::DolbyVisionEnhancementLayer,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Encode back to the wire byte. Round-trips with
+    /// [`Self::from_raw`].
+    pub fn as_raw(self) -> u8 {
+        match self {
+            Self::BrowsableSlideshowAudio => 0x02,
+            Self::InteractiveGraphicsMenu => 0x03,
+            Self::TextSubtitle => 0x04,
+            Self::OutOfMuxSynchronous => 0x05,
+            Self::OutOfMuxAsyncPip => 0x06,
+            Self::InMuxSyncPip => 0x07,
+            Self::StereoscopicVideo => 0x08,
+            Self::StereoscopicIgMenu => 0x09,
+            Self::DolbyVisionEnhancementLayer => 0x0A,
+            Self::Other(v) => v,
+        }
+    }
+
+    /// True for the two Picture-in-Picture path types (`0x06` / `0x07`).
+    pub fn is_pip(self) -> bool {
+        matches!(self, Self::OutOfMuxAsyncPip | Self::InMuxSyncPip)
+    }
+
+    /// True for the two stereoscopic (3D) path types (`0x08` / `0x09`).
+    pub fn is_stereoscopic(self) -> bool {
+        matches!(self, Self::StereoscopicVideo | Self::StereoscopicIgMenu)
+    }
+
+    /// Whether this path's stream(s) live in a clip *separate from* the
+    /// MainPath clip (`Some(true)`, out-of-mux — types `0x05`/`0x06`)
+    /// or multiplexed *into* it (`Some(false)`, in-mux — type `0x07`).
+    /// `None` for types where the staged table does not state the mux
+    /// placement.
+    pub fn is_out_of_mux(self) -> Option<bool> {
+        match self {
+            Self::OutOfMuxSynchronous | Self::OutOfMuxAsyncPip => Some(true),
+            Self::InMuxSyncPip => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Whether this path is time-locked to the MainPath (`Some(true)`,
+    /// synchronous — types `0x05`/`0x07`) or free-running
+    /// (`Some(false)`, asynchronous — type `0x06`). `None` for types
+    /// where the staged table does not state the sync model.
+    pub fn is_synchronous(self) -> Option<bool> {
+        match self {
+            Self::OutOfMuxSynchronous | Self::InMuxSyncPip => Some(true),
+            Self::OutOfMuxAsyncPip => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Short human-readable label (`"Unknown(0xNN)"` for reserved
+    /// bytes), matching the [`StreamCodingType::display_name`] style.
+    pub fn display_name(self) -> String {
+        match self {
+            Self::BrowsableSlideshowAudio => "Browsable Slideshow Audio".into(),
+            Self::InteractiveGraphicsMenu => "Interactive Graphics Menu".into(),
+            Self::TextSubtitle => "Text Subtitle".into(),
+            Self::OutOfMuxSynchronous => "Out-of-mux Synchronous".into(),
+            Self::OutOfMuxAsyncPip => "Out-of-mux Asynchronous PiP".into(),
+            Self::InMuxSyncPip => "In-mux Synchronous PiP".into(),
+            Self::StereoscopicVideo => "Stereoscopic Video".into(),
+            Self::StereoscopicIgMenu => "Stereoscopic IG Menu".into(),
+            Self::DolbyVisionEnhancementLayer => "Dolby Vision Enhancement Layer".into(),
+            Self::Other(v) => format!("Unknown(0x{v:02X})"),
+        }
+    }
+}
+
+/// One additional clip reference inside a multi-clip
+/// [`SubPlayItem`] (`is_multi_clip_entries == 1`). Entry id 0 is the
+/// SubPlayItem's own header clip; these are entries `1..n`. Field
+/// layout per the staged clean-room table's multi-clip list (5-byte
+/// clip name + 4-byte codec id + 1-byte `ref_to_STC_id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubPlayItemClip {
+    pub clip_information_file_name: String,
+    pub clip_codec_identifier: [u8; 4],
+    pub stc_id_ref: u8,
+}
+
+/// One `SubPlayItem()` (§5.4.4.2) — a timed reference to an auxiliary
+/// clip inside a [`SubPath`]. Field widths per the staged clean-room
+/// table `docs/container/bluray/mpls-subpath-uo-mask.md`
+/// ("SubPlayItem — syntax").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubPlayItem {
+    /// 5-digit CLPI / m2ts stem of the referenced clip (entry id 0 of
+    /// the multi-clip list when [`Self::multi_clips`] is non-empty).
+    pub clip_information_file_name: String,
+    /// 4-byte ASCII codec identifier, `b"M2TS"` for BDAV clips.
+    pub clip_codec_identifier: [u8; 4],
+    /// 4-bit `connection_condition` — same value space as the MainPath
+    /// PlayItem field (§5.4.4.2): `0x1` / `0x5` / `0x6`.
+    pub connection_condition: ConnectionCondition,
+    /// `ref_to_STC_id` — STC sequence id in the referenced clip's CLPI
+    /// SequenceInfo.
+    pub stc_id_ref: u8,
+    /// `SubPlayItem_IN_time`, 45 kHz ticks.
+    pub in_time_ticks: u32,
+    /// `SubPlayItem_OUT_time`, 45 kHz ticks.
+    pub out_time_ticks: u32,
+    /// `sync_PlayItem_id` — the MainPath PlayItem this SubPlayItem is
+    /// time-locked to (synchronous SubPath types; ignored for the
+    /// asynchronous PiP type `0x06`).
+    pub sync_play_item_id: u16,
+    /// `sync_start_PTS_of_PlayItem` — 45 kHz anchor on the referenced
+    /// MainPath PlayItem's clip time axis at which this SubPlayItem's
+    /// IN time starts presenting.
+    pub sync_start_pts_ticks: u32,
+    /// Additional clip entries (ids `1..n`) when the wire sets
+    /// `is_multi_clip_entries`; empty for the single-clip case.
+    pub multi_clips: Vec<SubPlayItemClip>,
+}
+
+impl SubPlayItem {
+    /// Presentation span in 90 kHz ticks (the MPLS wire records 45 kHz;
+    /// doubling lifts it onto the PTS scale the rest of the stack uses).
+    pub fn duration_90k(&self) -> u64 {
+        (self.out_time_ticks.saturating_sub(self.in_time_ticks)) as u64 * 2
+    }
+
+    /// `sync_start_PTS_of_PlayItem` lifted onto the 90 kHz axis.
+    pub fn sync_start_pts_90k(&self) -> u64 {
+        self.sync_start_pts_ticks as u64 * 2
+    }
+
+    /// Total clip-entry count including the header clip (entry id 0):
+    /// `1 + multi_clips.len()`.
+    pub fn num_clips(&self) -> usize {
+        1 + self.multi_clips.len()
+    }
+}
+
+/// One `SubPath()` (§5.4.4) — an auxiliary presentation path beside
+/// the MainPath, carrying [`SubPlayItem`]s that reference secondary
+/// clips (PiP video, out-of-mux audio, text subtitles, menus, …).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubPath {
+    /// Raw `SubPath_type` byte — see [`Self::kind`] for the typed view.
     pub sub_path_type: u8,
     /// `is_repeat_SubPath` (§5.4.4) — the low bit of the 16-bit field
     /// after `SubPath_type` (15 reserved bits + this flag). When set, the
@@ -1026,7 +1244,20 @@ pub struct SubPath {
     /// loop) for the duration of the associated main-path presentation.
     /// Preserved so an encode → parse round trip keeps the repeat intent.
     pub is_repeat_subpath: bool,
-    pub num_sub_play_items: u16,
+    /// The parsed `SubPlayItem()` list (§5.4.4.2).
+    pub sub_play_items: Vec<SubPlayItem>,
+}
+
+impl SubPath {
+    /// Typed view of [`Self::sub_path_type`].
+    pub fn kind(&self) -> SubPathType {
+        SubPathType::from_raw(self.sub_path_type)
+    }
+
+    /// Number of SubPlayItems (the wire's `number_of_SubPlayItems`).
+    pub fn num_sub_play_items(&self) -> usize {
+        self.sub_play_items.len()
+    }
 }
 
 /// Typed view of the `PlayList_playback_type` byte recorded in
@@ -1103,9 +1334,9 @@ pub struct AppInfoPlayList {
     /// `UO_mask_table` (§5.4.3) — the 64-bit User-Operation prohibition
     /// table, big-endian, preserved verbatim. Each bit, when set,
     /// prohibits one remote-control user operation for the whole
-    /// PlayList; the individual bit → operation assignments are not
-    /// tabulated in the consulted references, so the raw word is
-    /// surfaced rather than decoded. Preserving it lets an
+    /// PlayList. See [`Self::uo_mask_table`] for the typed
+    /// bit → operation view ([`super::uo_mask::UoMask`], per the staged
+    /// `UO_mask_table` bit map). Preserving the raw word lets an
     /// [`PlayListMpls::encode`] → [`PlayListMpls::parse`] round trip
     /// keep the disc's UO prohibitions instead of dropping them to zero.
     pub uo_mask: u64,
@@ -1116,6 +1347,13 @@ impl AppInfoPlayList {
     /// [`PlayListPlaybackType`] for the variant set.
     pub fn playback_kind(&self) -> PlayListPlaybackType {
         PlayListPlaybackType::from_raw(self.playback_type)
+    }
+
+    /// Typed view of [`Self::uo_mask`] — the PlayList-wide
+    /// User-Operation prohibition table decoded per the staged
+    /// `UO_mask_table` bit map (a set bit prohibits its operation).
+    pub fn uo_mask_table(&self) -> super::uo_mask::UoMask {
+        super::uo_mask::UoMask::from_raw(self.uo_mask)
     }
 }
 
@@ -1642,12 +1880,7 @@ fn encode_play_item(out: &mut Vec<u8>, pi: &PlayItem) {
     out.extend_from_slice(&clip_name);
     out.extend_from_slice(&pi.clip_codec_identifier);
 
-    let cc_raw = match pi.connection_condition {
-        ConnectionCondition::NonSeamless => 0x01,
-        ConnectionCondition::SeamlessContinuation => 0x05,
-        ConnectionCondition::SeamlessNewStc => 0x06,
-        ConnectionCondition::Other(v) => v,
-    } as u16;
+    let cc_raw = pi.connection_condition.as_raw() as u16;
     // 11 reserved + multi-angle bit + 4-bit cc
     let pack: u16 = ((if pi.multi_clip_count > 1 { 1 } else { 0 }) << 4) | (cc_raw & 0xF);
     out.extend_from_slice(&pack.to_be_bytes());
@@ -2019,12 +2252,86 @@ fn parse_sub_path(r: &mut Reader<'_>) -> Result<SubPath> {
     let repeat_field = r.read_u16()?;
     let is_repeat_subpath = (repeat_field & 1) != 0;
     r.skip(1)?; // reserved
-    let num_sub_play_items = r.read_u8()? as u16;
+    let num_sub_play_items = r.read_u8()? as usize;
+    let mut sub_play_items = Vec::with_capacity(num_sub_play_items.min(64));
+    for _ in 0..num_sub_play_items {
+        sub_play_items.push(parse_sub_play_item(r)?);
+    }
+    // `len` covers everything after the length field; skip any tail
+    // (extension data) the SubPlayItem walk did not consume.
     r.seek(body_end)?;
     Ok(SubPath {
         sub_path_type,
         is_repeat_subpath,
-        num_sub_play_items,
+        sub_play_items,
+    })
+}
+
+/// Parse one `SubPlayItem()` (§5.4.4.2). Field widths per the staged
+/// clean-room table ("SubPlayItem — syntax"): 16-bit length, 5-byte
+/// clip name, 4-byte codec id, a 32-bit word packing 27 reserved bits
+/// with the 4-bit `connection_condition` and the 1-bit
+/// `is_multi_clip_entries`, then `ref_to_STC_id`, the 45 kHz IN/OUT
+/// times, `sync_PlayItem_id`, `sync_start_PTS_of_PlayItem`, and the
+/// optional multi-clip list.
+fn parse_sub_play_item(r: &mut Reader<'_>) -> Result<SubPlayItem> {
+    let len = r.read_u16()? as usize;
+    let body_start = r.pos;
+    let body_end = body_start + len;
+    let stem_bytes = r.slice(5)?;
+    let clip_information_file_name = std::str::from_utf8(stem_bytes)
+        .map_err(|_| BlurayError::malformed("SubPlayItem clip name not ASCII"))?
+        .to_string();
+    let codec_bytes = r.slice(4)?;
+    let mut clip_codec_identifier = [0u8; 4];
+    clip_codec_identifier.copy_from_slice(codec_bytes);
+    // 27 reserved + connection_condition (4) + is_multi_clip_entries (1)
+    let pack = r.read_u32()?;
+    let cc = ((pack >> 1) & 0xF) as u8;
+    let is_multi_clip_entries = (pack & 1) != 0;
+    let stc_id_ref = r.read_u8()?;
+    let in_time_ticks = r.read_u32()?;
+    let out_time_ticks = r.read_u32()?;
+    let sync_play_item_id = r.read_u16()?;
+    let sync_start_pts_ticks = r.read_u32()?;
+    let multi_clips = if is_multi_clip_entries {
+        let num_entries = r.read_u8()?;
+        r.skip(1)?; // reserved
+                    // Entry id 0 is the header clip above; ids 1..n follow as
+                    // 10-byte records (5-byte name + 4-byte codec + 1-byte STC id).
+        let extra = num_entries.saturating_sub(1) as usize;
+        let mut clips = Vec::with_capacity(extra.min(64));
+        for _ in 0..extra {
+            let stem_bytes = r.slice(5)?;
+            let clip_information_file_name = std::str::from_utf8(stem_bytes)
+                .map_err(|_| BlurayError::malformed("SubPlayItem multi-clip name not ASCII"))?
+                .to_string();
+            let codec_bytes = r.slice(4)?;
+            let mut clip_codec_identifier = [0u8; 4];
+            clip_codec_identifier.copy_from_slice(codec_bytes);
+            let stc_id_ref = r.read_u8()?;
+            clips.push(SubPlayItemClip {
+                clip_information_file_name,
+                clip_codec_identifier,
+                stc_id_ref,
+            });
+        }
+        clips
+    } else {
+        Vec::new()
+    };
+    // `len` covers everything after the length field — skip any tail.
+    r.seek(body_end)?;
+    Ok(SubPlayItem {
+        clip_information_file_name,
+        clip_codec_identifier,
+        connection_condition: ConnectionCondition::from_raw(cc),
+        stc_id_ref,
+        in_time_ticks,
+        out_time_ticks,
+        sync_play_item_id,
+        sync_start_pts_ticks,
+        multi_clips,
     })
 }
 
@@ -2037,9 +2344,54 @@ fn encode_sub_path(out: &mut Vec<u8>, sp: &SubPath) {
     // 15 reserved bits + is_repeat_SubPath (low bit)
     out.extend_from_slice(&(sp.is_repeat_subpath as u16).to_be_bytes());
     out.push(0); // reserved
-    out.push(sp.num_sub_play_items as u8);
+    out.push(sp.sub_play_items.len() as u8);
+    for spi in &sp.sub_play_items {
+        encode_sub_play_item(out, spi);
+    }
     let body_len = (out.len() - body_start) as u32;
     out[len_off..len_off + 4].copy_from_slice(&body_len.to_be_bytes());
+}
+
+fn encode_sub_play_item(out: &mut Vec<u8>, spi: &SubPlayItem) {
+    let len_off = out.len();
+    out.extend_from_slice(&[0u8; 2]);
+    let body_start = out.len();
+
+    let mut clip_name = [b'0'; 5];
+    let bytes = spi.clip_information_file_name.as_bytes();
+    let take = bytes.len().min(5);
+    clip_name[..take].copy_from_slice(&bytes[..take]);
+    out.extend_from_slice(&clip_name);
+    out.extend_from_slice(&spi.clip_codec_identifier);
+
+    let cc_raw = spi.connection_condition.as_raw() as u32;
+    let is_multi = !spi.multi_clips.is_empty();
+    // 27 reserved + connection_condition (4) + is_multi_clip_entries (1)
+    let pack: u32 = ((cc_raw & 0xF) << 1) | (is_multi as u32);
+    out.extend_from_slice(&pack.to_be_bytes());
+    out.push(spi.stc_id_ref);
+    out.extend_from_slice(&spi.in_time_ticks.to_be_bytes());
+    out.extend_from_slice(&spi.out_time_ticks.to_be_bytes());
+    out.extend_from_slice(&spi.sync_play_item_id.to_be_bytes());
+    out.extend_from_slice(&spi.sync_start_pts_ticks.to_be_bytes());
+
+    if is_multi {
+        // Entry count includes the header clip (id 0).
+        out.push((spi.multi_clips.len() + 1) as u8);
+        out.push(0); // reserved
+        for clip in &spi.multi_clips {
+            let mut name = [b'0'; 5];
+            let bytes = clip.clip_information_file_name.as_bytes();
+            let take = bytes.len().min(5);
+            name[..take].copy_from_slice(&bytes[..take]);
+            out.extend_from_slice(&name);
+            out.extend_from_slice(&clip.clip_codec_identifier);
+            out.push(clip.stc_id_ref);
+        }
+    }
+
+    let body_len = (out.len() - body_start) as u16;
+    out[len_off..len_off + 2].copy_from_slice(&body_len.to_be_bytes());
 }
 
 #[cfg(test)]
@@ -2133,7 +2485,17 @@ mod tests {
                 sub_paths: vec![SubPath {
                     sub_path_type: 5,
                     is_repeat_subpath: false,
-                    num_sub_play_items: 1,
+                    sub_play_items: vec![SubPlayItem {
+                        clip_information_file_name: "00009".into(),
+                        clip_codec_identifier: *b"M2TS",
+                        connection_condition: ConnectionCondition::NonSeamless,
+                        stc_id_ref: 0,
+                        in_time_ticks: 0,
+                        out_time_ticks: 45_000 * 5,
+                        sync_play_item_id: 0,
+                        sync_start_pts_ticks: 0,
+                        multi_clips: Vec::new(),
+                    }],
                 }],
             },
             marks: vec![PlayListMark {
@@ -2237,6 +2599,266 @@ mod tests {
         let parsed = PlayListMpls::parse(&bytes).unwrap();
         assert!(parsed.play_list.sub_paths[0].is_repeat_subpath);
         assert_eq!(parsed.play_list.sub_paths[0].sub_path_type, 5);
+    }
+
+    #[test]
+    fn sub_play_item_full_round_trip() {
+        // Every SubPlayItem field non-trivial (§5.4.4.2 widths per the
+        // staged SubPlayItem syntax table), surviving encode → parse
+        // through the whole-file wire layout.
+        let mut m = sample_mpls();
+        m.play_list.sub_paths[0].sub_play_items = vec![SubPlayItem {
+            clip_information_file_name: "00042".into(),
+            clip_codec_identifier: *b"M2TS",
+            connection_condition: ConnectionCondition::SeamlessContinuation,
+            stc_id_ref: 3,
+            in_time_ticks: 45_000,
+            out_time_ticks: 45_000 * 7,
+            sync_play_item_id: 1,
+            sync_start_pts_ticks: 45_000 * 2,
+            multi_clips: Vec::new(),
+        }];
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        let spi = &parsed.play_list.sub_paths[0].sub_play_items[0];
+        assert_eq!(spi, &m.play_list.sub_paths[0].sub_play_items[0]);
+        // Derived helpers: 45 kHz → 90 kHz lifts.
+        assert_eq!(spi.duration_90k(), 45_000 * 6 * 2);
+        assert_eq!(spi.sync_start_pts_90k(), 45_000 * 2 * 2);
+        assert_eq!(spi.num_clips(), 1);
+        assert_eq!(parsed.play_list.sub_paths[0].num_sub_play_items(), 1);
+    }
+
+    #[test]
+    fn sub_play_item_multi_clip_round_trip() {
+        // is_multi_clip_entries: the header clip is entry id 0; two
+        // additional 10-byte entries (ids 1..2) follow the count +
+        // reserved pair, per the staged multi-clip list table.
+        let mut m = sample_mpls();
+        m.play_list.sub_paths[0].sub_play_items = vec![SubPlayItem {
+            clip_information_file_name: "00050".into(),
+            clip_codec_identifier: *b"M2TS",
+            connection_condition: ConnectionCondition::SeamlessNewStc,
+            stc_id_ref: 0,
+            in_time_ticks: 0,
+            out_time_ticks: 45_000,
+            sync_play_item_id: 0,
+            sync_start_pts_ticks: 0,
+            multi_clips: vec![
+                SubPlayItemClip {
+                    clip_information_file_name: "00051".into(),
+                    clip_codec_identifier: *b"M2TS",
+                    stc_id_ref: 1,
+                },
+                SubPlayItemClip {
+                    clip_information_file_name: "00052".into(),
+                    clip_codec_identifier: *b"M2TS",
+                    stc_id_ref: 2,
+                },
+            ],
+        }];
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        let spi = &parsed.play_list.sub_paths[0].sub_play_items[0];
+        assert_eq!(spi, &m.play_list.sub_paths[0].sub_play_items[0]);
+        assert_eq!(spi.num_clips(), 3);
+        assert_eq!(spi.multi_clips[1].clip_information_file_name, "00052");
+    }
+
+    #[test]
+    fn multiple_sub_paths_of_distinct_kinds_round_trip() {
+        // Two SubPaths (a PiP path + a text-subtitle path) with one
+        // SubPlayItem each; both survive and classify through kind().
+        let mut m = sample_mpls();
+        let spi = SubPlayItem {
+            clip_information_file_name: "00060".into(),
+            clip_codec_identifier: *b"M2TS",
+            connection_condition: ConnectionCondition::NonSeamless,
+            stc_id_ref: 0,
+            in_time_ticks: 0,
+            out_time_ticks: 45_000,
+            sync_play_item_id: 0,
+            sync_start_pts_ticks: 0,
+            multi_clips: Vec::new(),
+        };
+        m.play_list.sub_paths = vec![
+            SubPath {
+                sub_path_type: 0x06,
+                is_repeat_subpath: false,
+                sub_play_items: vec![spi.clone()],
+            },
+            SubPath {
+                sub_path_type: 0x04,
+                is_repeat_subpath: true,
+                sub_play_items: vec![spi],
+            },
+        ];
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        assert_eq!(parsed.play_list.sub_paths, m.play_list.sub_paths);
+        assert_eq!(
+            parsed.play_list.sub_paths[0].kind(),
+            SubPathType::OutOfMuxAsyncPip
+        );
+        assert!(parsed.play_list.sub_paths[0].kind().is_pip());
+        assert_eq!(
+            parsed.play_list.sub_paths[1].kind(),
+            SubPathType::TextSubtitle
+        );
+    }
+
+    #[test]
+    fn sub_path_type_round_trips_and_classifies() {
+        // Named variants round-trip through the wire byte; reserved
+        // bytes preserve through Other.
+        for raw in 0x02..=0x0Au8 {
+            let k = SubPathType::from_raw(raw);
+            assert_eq!(k.as_raw(), raw);
+            assert!(!matches!(k, SubPathType::Other(_)));
+        }
+        for raw in [0x00u8, 0x01, 0x0B, 0x7F, 0xFF] {
+            assert_eq!(SubPathType::from_raw(raw), SubPathType::Other(raw));
+            assert_eq!(SubPathType::from_raw(raw).as_raw(), raw);
+        }
+        // PiP / stereoscopic classes.
+        assert!(SubPathType::OutOfMuxAsyncPip.is_pip());
+        assert!(SubPathType::InMuxSyncPip.is_pip());
+        assert!(!SubPathType::TextSubtitle.is_pip());
+        assert!(SubPathType::StereoscopicVideo.is_stereoscopic());
+        assert!(SubPathType::StereoscopicIgMenu.is_stereoscopic());
+        assert!(!SubPathType::OutOfMuxSynchronous.is_stereoscopic());
+        // Mux placement / sync model per the staged table's notes.
+        assert_eq!(SubPathType::OutOfMuxSynchronous.is_out_of_mux(), Some(true));
+        assert_eq!(SubPathType::OutOfMuxAsyncPip.is_out_of_mux(), Some(true));
+        assert_eq!(SubPathType::InMuxSyncPip.is_out_of_mux(), Some(false));
+        assert_eq!(SubPathType::TextSubtitle.is_out_of_mux(), None);
+        assert_eq!(
+            SubPathType::OutOfMuxSynchronous.is_synchronous(),
+            Some(true)
+        );
+        assert_eq!(SubPathType::InMuxSyncPip.is_synchronous(), Some(true));
+        assert_eq!(SubPathType::OutOfMuxAsyncPip.is_synchronous(), Some(false));
+        assert_eq!(SubPathType::StereoscopicVideo.is_synchronous(), None);
+        // Labels.
+        assert_eq!(
+            SubPathType::DolbyVisionEnhancementLayer.display_name(),
+            "Dolby Vision Enhancement Layer"
+        );
+        assert_eq!(SubPathType::Other(0x0B).display_name(), "Unknown(0x0B)");
+    }
+
+    #[test]
+    fn sub_path_count_exceeding_body_is_rejected() {
+        // A SubPath whose number_of_SubPlayItems claims more items than
+        // its body holds must surface Malformed, never panic. The count
+        // byte sits at offset 9 (4 length + 1 reserved + 1 type +
+        // 2 repeat-field + 1 reserved).
+        let mut buf = Vec::new();
+        encode_sub_path(
+            &mut buf,
+            &SubPath {
+                sub_path_type: 5,
+                is_repeat_subpath: false,
+                sub_play_items: vec![SubPlayItem {
+                    clip_information_file_name: "00001".into(),
+                    clip_codec_identifier: *b"M2TS",
+                    connection_condition: ConnectionCondition::NonSeamless,
+                    stc_id_ref: 0,
+                    in_time_ticks: 0,
+                    out_time_ticks: 45_000,
+                    sync_play_item_id: 0,
+                    sync_start_pts_ticks: 0,
+                    multi_clips: Vec::new(),
+                }],
+            },
+        );
+        buf[9] = 5; // lie: five SubPlayItems, only one recorded
+        let mut r = Reader::new(&buf);
+        assert!(parse_sub_path(&mut r).is_err());
+    }
+
+    #[test]
+    fn sub_play_item_truncated_is_rejected() {
+        // Every truncation of a lone SubPlayItem record errors cleanly.
+        let mut buf = Vec::new();
+        encode_sub_play_item(
+            &mut buf,
+            &SubPlayItem {
+                clip_information_file_name: "00001".into(),
+                clip_codec_identifier: *b"M2TS",
+                connection_condition: ConnectionCondition::NonSeamless,
+                stc_id_ref: 0,
+                in_time_ticks: 0,
+                out_time_ticks: 45_000,
+                sync_play_item_id: 1,
+                sync_start_pts_ticks: 90,
+                multi_clips: vec![SubPlayItemClip {
+                    clip_information_file_name: "00002".into(),
+                    clip_codec_identifier: *b"M2TS",
+                    stc_id_ref: 1,
+                }],
+            },
+        );
+        for len in 0..buf.len() {
+            let mut r = Reader::new(&buf[..len]);
+            assert!(parse_sub_play_item(&mut r).is_err(), "len {len}");
+        }
+        // The untruncated record parses.
+        let mut r = Reader::new(&buf);
+        assert!(parse_sub_play_item(&mut r).is_ok());
+    }
+
+    #[test]
+    fn sub_play_item_trailing_extension_bytes_are_skipped() {
+        // `length` covers everything after the length field; a future
+        // extension tail inside the envelope must be skipped, not
+        // misparsed. Append four bytes and bump the length accordingly.
+        let spi = SubPlayItem {
+            clip_information_file_name: "00003".into(),
+            clip_codec_identifier: *b"M2TS",
+            connection_condition: ConnectionCondition::NonSeamless,
+            stc_id_ref: 2,
+            in_time_ticks: 45,
+            out_time_ticks: 45_000,
+            sync_play_item_id: 0,
+            sync_start_pts_ticks: 0,
+            multi_clips: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        encode_sub_play_item(&mut buf, &spi);
+        buf.extend_from_slice(&[0xAA; 4]);
+        let len = u16::from_be_bytes([buf[0], buf[1]]) + 4;
+        buf[0..2].copy_from_slice(&len.to_be_bytes());
+        let mut r = Reader::new(&buf);
+        let parsed = parse_sub_play_item(&mut r).unwrap();
+        assert_eq!(parsed, spi);
+        assert_eq!(r.remaining(), 0, "cursor lands on the envelope end");
+    }
+
+    #[test]
+    fn uo_mask_typed_accessors_read_the_wire_word() {
+        use super::super::uo_mask::UserOperation;
+        // Wire bit 0 (menu_call) is the MSB of the big-endian u64;
+        // angle_number_change is wire bit 23 (per the staged
+        // UO_mask_table bit map). Prohibit both at PlayList scope and
+        // one at PlayItem scope, then read back through the typed view
+        // after a full encode → parse cycle.
+        let mut m = sample_mpls();
+        m.app_info.uo_mask = (1u64 << 63) | (1u64 << (63 - 23));
+        m.play_list.play_items[0].flags.uo_mask = 1u64 << (63 - 7); // stop
+        let bytes = m.encode();
+        let parsed = PlayListMpls::parse(&bytes).unwrap();
+        let pl_mask = parsed.app_info.uo_mask_table();
+        assert!(pl_mask.is_prohibited(UserOperation::MenuCall));
+        assert!(pl_mask.is_prohibited(UserOperation::AngleNumberChange));
+        assert!(pl_mask.permits(UserOperation::Stop));
+        assert_eq!(
+            pl_mask.prohibited_ops(),
+            vec![UserOperation::MenuCall, UserOperation::AngleNumberChange]
+        );
+        let pi_mask = parsed.play_list.play_items[0].flags.uo_mask_table();
+        assert!(pi_mask.is_prohibited(UserOperation::Stop));
+        assert!(pi_mask.permits(UserOperation::MenuCall));
     }
 
     #[test]

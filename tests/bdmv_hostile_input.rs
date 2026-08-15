@@ -47,11 +47,21 @@ fn drive_all(buf: &[u8]) {
         let _ = pl.chapters();
         let _ = pl.chapters_with_duration();
         let _ = pl.app_info.playback_kind();
+        let _ = pl.app_info.uo_mask_table().prohibited_ops();
         for pi in &pl.play_list.play_items {
             let _ = pi.duration_90k();
+            let _ = pi.flags.uo_mask_table().reserved_bits();
         }
         for m in &pl.marks {
             let _ = m.kind();
+        }
+        for sp in &pl.play_list.sub_paths {
+            let _ = sp.kind().display_name();
+            for spi in &sp.sub_play_items {
+                let _ = spi.duration_90k();
+                let _ = spi.sync_start_pts_90k();
+                let _ = spi.num_clips();
+            }
         }
     }
     if let Ok(clip) = clpi::ClipInformation::parse(buf) {

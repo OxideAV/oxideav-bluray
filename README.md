@@ -310,6 +310,38 @@ bluray://                          → auto-detect first BD-ROM mount
   emission. `TitleInfo::languages` is now populated at mount time from
   every audio + subtitle entry's 3-byte ISO 639-2/T tag (sorted,
   deduplicated, lowercased — disc authors ship a mix of `ENG` / `eng`).
+- **SubPath / SubPlayItem parsing + typed `SubPathType`** (§5.4.4 /
+  §5.4.4.2) — the SubPath placeholder (type byte + repeat flag only,
+  SubPlayItems skipped) is now a full parse: each `SubPath` carries its
+  `sub_play_items: Vec<SubPlayItem>` with every §5.4.4.2 field decoded
+  per the staged `mpls-subpath-uo-mask.md` syntax table — 5-char clip
+  stem + codec id, the packed `connection_condition` /
+  `is_multi_clip_entries` word, `ref_to_STC_id`, 45 kHz IN/OUT times,
+  and the `sync_PlayItem_id` + `sync_start_PTS_of_PlayItem` MainPath
+  anchor that time-locks a synchronous SubPath — plus the multi-clip
+  entry list (entry id 0 = the header clip; ids 1..n as 10-byte
+  records). Derived helpers lift onto the 90 kHz axis
+  (`duration_90k` / `sync_start_pts_90k`); everything round-trips
+  through `encode`, and a `length`-envelope extension tail is skipped
+  not misparsed. `SubPathType` types the `SubPath_type` byte
+  (Browsable-slideshow audio `0x02` … Dolby Vision Enhancement Layer
+  `0x0A`) with `is_pip()` / `is_stereoscopic()` / `is_out_of_mux()` /
+  `is_synchronous()` / `display_name()`, surfaced via
+  `SubPath::kind()`.
+- **Typed `UO_mask_table` decode** (`bdmv::uo_mask`, §5.4.3 /
+  §5.4.4.1) — the two 64-bit User-Operation prohibition words the
+  parser preserves raw (`AppInfoPlayList::uo_mask` /
+  `PlayItemFlags::uo_mask`) now decode through `UoMask`: the 30
+  assigned wire bits (bit 0 = MSB = `menu_call` through bit 33 =
+  `secondary_PG_stream_number_change`, reserved holes at 6/9/22/32)
+  map to a `UserOperation` enum with `wire_bit()` / `name()` /
+  `is_menu_navigation()` / `is_stream_selection()`;
+  `UoMask::is_prohibited` / `permits` / `prohibited_ops` /
+  `reserved_bits` + builder ops + a `Display` listing
+  (`prohibit: menu_call, angle_number_change`). Accessors
+  `AppInfoPlayList::uo_mask_table()` / `PlayItemFlags::uo_mask_table()`
+  join the raw words to the typed view. Bit → operation map per the
+  staged `mpls-subpath-uo-mask.md` table.
 - **PlayList `playback_type` typed accessor** —
   `AppInfoPlayList::playback_kind()` returns a `PlayListPlaybackType`
   (the typed view of the `PlayList_playback_type` byte recorded in
@@ -335,8 +367,8 @@ bluray://                          → auto-detect first BD-ROM mount
   flag (§5.4.4), were parsed-then-discarded and re-encoded as zeros, so a
   parse → encode → parse cycle silently lost them. Now surfaced verbatim
   as `AppInfoPlayList::uo_mask` / `PlayItemFlags::uo_mask` (big-endian
-  `u64`, raw — the individual bit → operation assignments are not
-  tabulated in the consulted references) and `SubPath::is_repeat_subpath`
+  `u64`, raw — decoded bit-by-bit via the typed `bdmv::uo_mask` layer
+  above) and `SubPath::is_repeat_subpath`
   (`bool`), and round-tripped through both parse and encode.
 - **BDMV parser fuzz + hostile-input hardening** — a `bdmv_parsers`
   cargo-fuzz target multiplexes every BDMV parser (index / MOBJ / mpls /
@@ -400,7 +432,11 @@ bluray://                          → auto-detect first BD-ROM mount
 
 - HDMV interactive layer (`MovieObject.bdmv` opcode execution).
 - BD-J (Java ME).
-- SubPath PiP / secondary-video streams.
+- SubPath secondary-stream *playback* (PiP compositing, out-of-mux
+  audio mixing, text-subtitle presentation). The SubPath / SubPlayItem
+  structures, the typed `SubPathType`, and the multi-clip lists now
+  parse (see Scope); `TitleSource` still streams the MainPath clips
+  only — a SubPlayItem's out-of-mux clip is not opened or interleaved.
 - Raw-block-device mount (`bluray:///dev/sr0`) — UDF mounter exists,
   high-level routing in `Disc::mount_image` is Phase 2.
 - Cross-PlayItem STC PTS continuity is exposed as a
@@ -419,9 +455,11 @@ bluray://                          → auto-detect first BD-ROM mount
   `JumpObject`/`CallObject`/`Resume`, all from the
   `docs/container/bluray/hdmv-navigation-commands.md` clean-room table.
   What stays deferred is the *player-side* model the BDMV table alone
-  does not carry: resume-intention handling, the UO mask, and the IG
-  button-state machine — surfaced as a yielded `NavRequest` for the
-  player layer rather than executed. The exact rounding of `Div`/`Mod`
+  does not carry: resume-intention handling, UO-mask *enforcement*
+  (the mask itself now decodes — see the `bdmv::uo_mask` Scope bullet —
+  but neither the VM nor the drivers consult it when servicing a
+  `NavRequest`), and the IG button-state machine — surfaced as a
+  yielded `NavRequest` for the player layer rather than executed. The exact rounding of `Div`/`Mod`
   on out-of-band operands and the precise arithmetic-overflow rule are
   not pinned down by the public clean-room material (the VM uses
   wrapping unsigned arithmetic, truncating division, ÷0→0); those edge
@@ -551,6 +589,7 @@ library or disc-ripping tool source has been read.
 - `docs/container/bluray/BD-ROM-AV-WhitePaper_HEVC.pdf`
 - `docs/container/bluray/ECMA-167_3rd_edition_june_1997.pdf`
 - `docs/container/bluray/pgs-segment-syntax.md`
+- `docs/container/bluray/mpls-subpath-uo-mask.md`
 
 ## Privacy
 

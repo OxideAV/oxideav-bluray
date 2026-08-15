@@ -9,12 +9,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`SubPath` is no longer a placeholder** — it drops the stub
+  `num_sub_play_items: u16` field (and, holding a `Vec`, the `Copy`
+  impl) in favour of the parsed `sub_play_items: Vec<SubPlayItem>`
+  list; the count is now `SubPath::num_sub_play_items()` (always
+  consistent with what `encode` writes). `ConnectionCondition` gained
+  the `as_raw()` inverse of `from_raw()` (the PlayItem encoder now
+  uses it too).
 - Marked the internal `bdmv::common` byte-cursor plumbing (`Reader`,
   `BdmvHeader`, `clpi_path`, `m2ts_path`) `#[doc(hidden)]` so
   cargo-semver-checks stops tracking it as stable public API; the
   documented BDMV/UDF/playlist/nav surface is unchanged.
 
 ### Added
+
+- **SubPath / SubPlayItem parsing + typed `SubPathType`**
+  (`bdmv::mpls`, §5.4.4 / §5.4.4.2) — the `.mpls` parser previously
+  read a SubPath's type byte + repeat flag and skipped everything else;
+  it now decodes the full `SubPlayItem()` list per the staged
+  clean-room syntax table
+  (`docs/container/bluray/mpls-subpath-uo-mask.md`): 5-char clip stem +
+  codec id, the 32-bit word packing `connection_condition` +
+  `is_multi_clip_entries`, `ref_to_STC_id`, the 45 kHz IN/OUT times,
+  the `sync_PlayItem_id` + `sync_start_PTS_of_PlayItem` MainPath anchor,
+  and the multi-clip entry list (entry id 0 = the header clip, ids
+  1..n as 10-byte name/codec/STC records). Derived helpers
+  `duration_90k()` / `sync_start_pts_90k()` / `num_clips()` lift onto
+  the 90 kHz axis; `encode` writes the same layout back so the whole
+  structure round-trips, and a `length`-envelope extension tail is
+  skipped, not misparsed. The new `SubPathType` enum types the
+  `SubPath_type` byte (`0x02` Browsable-slideshow audio, `0x03` IG
+  menu, `0x04` Text subtitle, `0x05` out-of-mux synchronous, `0x06` /
+  `0x07` the two PiP flavours, `0x08`/`0x09` stereoscopic, `0x0A`
+  Dolby Vision Enhancement Layer, `Other` catch-all) with
+  `from_raw` / `as_raw` round-trips and `is_pip()` /
+  `is_stereoscopic()` / `is_out_of_mux()` / `is_synchronous()` /
+  `display_name()` predicates, surfaced as `SubPath::kind()`.
+  `SubPath` / `SubPlayItem` / `SubPlayItemClip` / `SubPathType`
+  re-exported from the crate root. 8 new unit tests (full-field +
+  multi-clip + two-SubPath round-trips, typed-enum classification,
+  count-lie rejection, per-length truncation sweep, extension-tail
+  skip) + the structured-mutation seed now carries a multi-clip
+  SubPlayItem so the byte-flip / size-lie / truncation matrices land
+  inside the new walk.
+- **Typed `UO_mask_table` decode** (`bdmv::uo_mask`, §5.4.3 /
+  §5.4.4.1) — the 64-bit User-Operation prohibition words the parser
+  preserves raw now have a semantic view, transcribed from the staged
+  table's wire bit → operation map (bit 0 = MSB = first-transmitted;
+  reserved holes at wire bits 6/9/22/32 and 34–63; a set bit
+  *prohibits* the operation). `UserOperation` names all 30 assigned
+  operations (`menu_call` … `secondary_PG_stream_number_change`) with
+  `wire_bit()` / `raw_mask()` / `from_wire_bit()` / `name()` and the
+  `is_menu_navigation()` / `is_stream_selection()` class predicates;
+  `UoMask` wraps the raw word with `is_prohibited` / `permits` /
+  `prohibited_ops` / `permits_all` / `reserved_bits` (forensics for
+  unassigned bits a disc set anyway), `with_prohibited` /
+  `with_permitted` builders, and a `Display` that lists the prohibited
+  names. `AppInfoPlayList::uo_mask_table()` /
+  `PlayItemFlags::uo_mask_table()` join the preserved raw words to the
+  typed view (the raw `u64` fields stay public and unchanged on the
+  wire). Re-exported from the crate root (`UoMask`, `UserOperation`).
+  8 new unit tests (wire-bit anchors incl. the staged table's two
+  cross-check points, reserved-bit rejection + detection, prohibit /
+  permit inverses, per-op single-bit round-trips, Display) + an
+  end-to-end MPLS encode → parse → typed-read test.
+- The `bdmv_parsers` fuzz target and both in-CI hardening suites
+  (`bdmv_hostile_input`, `bdmv_structured_mutation`) now drive the new
+  accessors (`SubPath::kind`, per-SubPlayItem helpers,
+  `uo_mask_table().prohibited_ops()` / `reserved_bits()`) over every
+  successfully-parsed playlist; 10.4M-run bounded fuzz session on the
+  extended target found no panic.
 
 - **BDMV parser fuzz harness + hostile-input hardening** — a second
   cargo-fuzz target, `bdmv_parsers`, multiplexes the whole BDMV parsing

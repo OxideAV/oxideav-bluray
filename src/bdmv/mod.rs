@@ -34,6 +34,7 @@ pub mod nav_command;
 pub mod nav_driver;
 pub mod pgs;
 pub mod register_model;
+pub mod uo_mask;
 pub mod vm;
 
 // internal — exposed for tests/fuzz; not part of the stable API
