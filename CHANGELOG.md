@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-bluray/compare/v0.0.3...v0.0.4) - 2026-08-15
+
+### Other
+
+- SubPlayItem title-timeline sync windows + Disc::title_sub_paths
+- parse SubPath/SubPlayItem + typed SubPathType; typed UO_mask_table decode
+- mark internal bdmv::common plumbing #[doc(hidden)]
+- CHANGELOG + README — UO_mask/is_repeat_SubPath preservation + BDMV fuzz/hardening
+- structured-mutation hardening test for BDMV parsers
+- preserve is_repeat_SubPath flag through .mpls round trip
+- preserve UO_mask_table through .mpls parse/encode round trip
+- in-CI hostile-input regression suite for BDMV parsers
+- fuzz harness over BDMV metadata/nav parsers (index/MOBJ/mpls/clpi/PGS)
+- add CI / crates.io / docs.rs / MIT-license badges
+- scrub decorative 'BDedit-style' tool-attribution from disassembler doc-comments → neutral 'single-line listing'
+- document r380 derivation surface
+- stream coding-type labels + Track UI label
+- EP_map forward-seek helpers (next keyframe / count)
+- chapter presentation spans (start/end/duration)
+- HDMV navigation-command disassembler (BDedit-style listing)
+- document CLPI demux-index accessor layer
+- EP_map / CPI keyframe seek-index accessors (BD-ROM AV §5.7)
+- ClipInfo byte/SPN index + ProgramInfo PID lookups (§5.5.4.1/.3)
+- SequenceInfo / AtcSequence / StcSequence demux accessors (§5.5.4.2)
+- drop enumerated tool list from clean-room provenance note
+- end-to-end disc-title HDMV navigation (index.bdmv + MOBJ -> drive)
+- title-level HDMV navigation driver — close the inter-title loop
+- resolve a TitleEntry to its HDMV Movie Object id
+- reword a comment to avoid -style suffix (naming hygiene)
+- end-to-end HDMV VM pipeline (parse MOBJ image -> decode -> execute)
+- Movie Object runner — drive the whole MOBJ table across Jump/Call/Resume
+- HDMV navigation VM — minimal command interpreter (Set/Compare/Branch)
+- end-to-end PGS .sup pipeline + HDMV nav-command/register decode
+- HDMV PSR/GPR register model + named operand resolution
+- PGS renderer — palette resolution + window compositing
+- Display Set grouping + ODS fragment reassembly
+- PGS segment parser (PCS/WDS/PDS/ODS/END + ODS RLE decode)
+- decode HDMV navigation-command opcodes
+- refresh to current status, drop per-round changelog cruft
+
 ### Changed
 
 - **`SubPath` is no longer a placeholder** — it drops the stub
