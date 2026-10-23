@@ -2,7 +2,7 @@
 //! (primary) or IOKit + MMCDevice (fallback).
 //!
 //! Loads `IOKit.framework` and `CoreFoundation.framework` at runtime via
-//! [`libloading`] (matches oxideplay's SDL2 loader pattern: no link-time
+//! [`dlsym`] (matches oxideplay's SDL2 loader pattern: no link-time
 //! framework dep). The dispatch is COM-style: most of the work goes
 //! through vtables of function pointers reached via double-indirection
 //! (`**plugin`, `**interface`).
@@ -97,7 +97,7 @@ use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr;
 
-use libloading::{Library, Symbol};
+use dlsym::Bindings as _;
 
 // ---------------------------------------------------------------------------
 // IOKit / CoreFoundation FFI types
@@ -378,140 +378,100 @@ const K_IO_MMC_DEVICE_INTERFACE_ID: CFUUIDBytes = CFUUIDBytes::new([
 // Resolved FFI symbols
 // ---------------------------------------------------------------------------
 
-type Fn_IOServiceMatching = unsafe extern "C" fn(*const c_char) -> CFTypeRef;
-type Fn_IOServiceGetMatchingServices =
-    unsafe extern "C" fn(mach_port_t, CFTypeRef, *mut io_iterator_t) -> kern_return_t;
-type Fn_IOIteratorNext = unsafe extern "C" fn(io_iterator_t) -> io_object_t;
-type Fn_IOObjectRelease = unsafe extern "C" fn(io_object_t) -> kern_return_t;
-type Fn_IORegistryEntrySearchCFProperty = unsafe extern "C" fn(
-    io_registry_entry_t,
-    *const c_char,
-    CFStringRef,
-    CFAllocatorRef,
-    IOOptionBits,
-) -> CFTypeRef;
-type Fn_IOCreatePlugInInterfaceForService = unsafe extern "C" fn(
-    io_service_t,
-    CFTypeRef,
-    CFTypeRef,
-    *mut *mut *mut IOCFPlugInInterface,
-    *mut SInt32,
-) -> kern_return_t;
-type Fn_IODestroyPlugInInterface =
-    unsafe extern "C" fn(*mut *mut IOCFPlugInInterface) -> kern_return_t;
-type Fn_IORegistryEntryGetParentEntry = unsafe extern "C" fn(
-    io_registry_entry_t,
-    *const c_char,
-    *mut io_registry_entry_t,
-) -> kern_return_t;
-type Fn_CFRelease = unsafe extern "C" fn(CFTypeRef);
-type Fn_CFStringCreateWithCString =
-    unsafe extern "C" fn(CFAllocatorRef, *const c_char, CFStringEncoding) -> CFStringRef;
-type Fn_CFStringGetCString =
-    unsafe extern "C" fn(CFStringRef, *mut c_char, CFIndex, CFStringEncoding) -> Boolean;
-type Fn_CFGetTypeID = unsafe extern "C" fn(CFTypeRef) -> usize;
-type Fn_CFStringGetTypeID = unsafe extern "C" fn() -> usize;
-type Fn_CFUUIDCreateFromUUIDBytes = unsafe extern "C" fn(CFAllocatorRef, CFUUIDBytes) -> CFTypeRef;
+// Each framework is bound through `dlsym::library!`: the generated struct
+// owns the `dlsym::Library` and resolves every listed symbol when it is
+// created, so a successfully constructed value can call any method with
+// a constant-index load. None of these entry points is probed — IOKit
+// and CoreFoundation have exported every one of them since 10.0, so a
+// missing symbol is a hard load error, not an `#[optional]` slot.
+//
+// Signatures are transcribed from the corresponding SDK headers
+// (IOKitLib.h, IOCFPlugIn.h, CFBase.h, CFString.h, CFUUID.h).
 
+dlsym::library! {
+    /// `IOKit.framework` entry points used by the IORegistry walk and the
+    /// SCSITaskDevice / MMCDevice plug-in bring-up.
+    struct IoKit {
+        unsafe extern "C" {
+            fn IOServiceMatching(name: *const c_char) -> CFTypeRef;
+            fn IOServiceGetMatchingServices(
+                main_port: mach_port_t,
+                matching: CFTypeRef,
+                existing: *mut io_iterator_t,
+            ) -> kern_return_t;
+            fn IOIteratorNext(iterator: io_iterator_t) -> io_object_t;
+            fn IOObjectRelease(object: io_object_t) -> kern_return_t;
+            fn IORegistryEntrySearchCFProperty(
+                entry: io_registry_entry_t,
+                plane: *const c_char,
+                key: CFStringRef,
+                allocator: CFAllocatorRef,
+                options: IOOptionBits,
+            ) -> CFTypeRef;
+            fn IOCreatePlugInInterfaceForService(
+                service: io_service_t,
+                plugin_type: CFTypeRef,
+                interface_type: CFTypeRef,
+                the_interface: *mut *mut *mut IOCFPlugInInterface,
+                the_score: *mut SInt32,
+            ) -> kern_return_t;
+            fn IODestroyPlugInInterface(interface: *mut *mut IOCFPlugInInterface) -> kern_return_t;
+            fn IORegistryEntryGetParentEntry(
+                entry: io_registry_entry_t,
+                plane: *const c_char,
+                parent: *mut io_registry_entry_t,
+            ) -> kern_return_t;
+        }
+    }
+}
+
+dlsym::library! {
+    /// `CoreFoundation.framework` entry points: CFString construction /
+    /// readback for the `BSD Name` property match, CFUUID construction
+    /// for the plug-in QueryInterface calls, and release.
+    struct CoreFoundation {
+        unsafe extern "C" {
+            fn CFRelease(cf: CFTypeRef);
+            fn CFStringCreateWithCString(
+                alloc: CFAllocatorRef,
+                c_str: *const c_char,
+                encoding: CFStringEncoding,
+            ) -> CFStringRef;
+            fn CFStringGetCString(
+                the_string: CFStringRef,
+                buffer: *mut c_char,
+                buffer_size: CFIndex,
+                encoding: CFStringEncoding,
+            ) -> Boolean;
+            fn CFGetTypeID(cf: CFTypeRef) -> usize;
+            fn CFStringGetTypeID() -> usize;
+            fn CFUUIDCreateFromUUIDBytes(alloc: CFAllocatorRef, bytes: CFUUIDBytes) -> CFTypeRef;
+        }
+    }
+}
+
+const IOKIT_PATH: &str = "/System/Library/Frameworks/IOKit.framework/IOKit";
+const COREFOUNDATION_PATH: &str =
+    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
+
+/// Both frameworks, loaded together. Every call site receives `&Symbols`
+/// so the `IOObjectRelease` / `CFRelease` drop guards can reach the
+/// matching release function without a global.
 struct Symbols {
-    _iokit: Library,
-    _corefoundation: Library,
-
-    IOServiceMatching: Fn_IOServiceMatching,
-    IOServiceGetMatchingServices: Fn_IOServiceGetMatchingServices,
-    IOIteratorNext: Fn_IOIteratorNext,
-    IOObjectRelease: Fn_IOObjectRelease,
-    IORegistryEntrySearchCFProperty: Fn_IORegistryEntrySearchCFProperty,
-    IOCreatePlugInInterfaceForService: Fn_IOCreatePlugInInterfaceForService,
-    IODestroyPlugInInterface: Fn_IODestroyPlugInInterface,
-    IORegistryEntryGetParentEntry: Fn_IORegistryEntryGetParentEntry,
-
-    CFRelease: Fn_CFRelease,
-    CFStringCreateWithCString: Fn_CFStringCreateWithCString,
-    CFStringGetCString: Fn_CFStringGetCString,
-    CFGetTypeID: Fn_CFGetTypeID,
-    CFStringGetTypeID: Fn_CFStringGetTypeID,
-    CFUUIDCreateFromUUIDBytes: Fn_CFUUIDCreateFromUUIDBytes,
+    iokit: IoKit,
+    cf: CoreFoundation,
 }
 
 impl Symbols {
     fn load() -> Result<Self, DriveError> {
-        // SAFETY: paths are constant, well-known system frameworks.
-        // libloading::Library::new is the documented way to dlopen.
-        unsafe {
-            let iokit = Library::new("/System/Library/Frameworks/IOKit.framework/IOKit")
-                .map_err(|e| DriveError::Mmc(format!("couldn't load IOKit.framework: {e}")))?;
-            let cf =
-                Library::new("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
-                    .map_err(|e| {
-                        DriveError::Mmc(format!("couldn't load CoreFoundation.framework: {e}"))
-                    })?;
-
-            // Helper closure that retrieves a Symbol and dereferences it
-            // to a fn pointer of the requested type. The symbol borrows
-            // from the library; we copy the underlying fn pointer out
-            // and let the library handle survive in the returned struct.
-            fn get<T: Copy>(
-                lib: &Library,
-                name: &[u8],
-                what: &'static str,
-            ) -> Result<T, DriveError> {
-                // SAFETY: we trust the system framework's exported
-                // symbol layout to match the typed fn pointer above;
-                // verified against the corresponding SDK header.
-                let sym: Symbol<T> = unsafe { lib.get(name) }
-                    .map_err(|e| DriveError::Mmc(format!("missing symbol {what}: {e}")))?;
-                Ok(*sym)
-            }
-
-            Ok(Symbols {
-                IOServiceMatching: get(&iokit, b"IOServiceMatching\0", "IOServiceMatching")?,
-                IOServiceGetMatchingServices: get(
-                    &iokit,
-                    b"IOServiceGetMatchingServices\0",
-                    "IOServiceGetMatchingServices",
-                )?,
-                IOIteratorNext: get(&iokit, b"IOIteratorNext\0", "IOIteratorNext")?,
-                IOObjectRelease: get(&iokit, b"IOObjectRelease\0", "IOObjectRelease")?,
-                IORegistryEntrySearchCFProperty: get(
-                    &iokit,
-                    b"IORegistryEntrySearchCFProperty\0",
-                    "IORegistryEntrySearchCFProperty",
-                )?,
-                IOCreatePlugInInterfaceForService: get(
-                    &iokit,
-                    b"IOCreatePlugInInterfaceForService\0",
-                    "IOCreatePlugInInterfaceForService",
-                )?,
-                IODestroyPlugInInterface: get(
-                    &iokit,
-                    b"IODestroyPlugInInterface\0",
-                    "IODestroyPlugInInterface",
-                )?,
-                IORegistryEntryGetParentEntry: get(
-                    &iokit,
-                    b"IORegistryEntryGetParentEntry\0",
-                    "IORegistryEntryGetParentEntry",
-                )?,
-
-                CFRelease: get(&cf, b"CFRelease\0", "CFRelease")?,
-                CFStringCreateWithCString: get(
-                    &cf,
-                    b"CFStringCreateWithCString\0",
-                    "CFStringCreateWithCString",
-                )?,
-                CFStringGetCString: get(&cf, b"CFStringGetCString\0", "CFStringGetCString")?,
-                CFGetTypeID: get(&cf, b"CFGetTypeID\0", "CFGetTypeID")?,
-                CFStringGetTypeID: get(&cf, b"CFStringGetTypeID\0", "CFStringGetTypeID")?,
-                CFUUIDCreateFromUUIDBytes: get(
-                    &cf,
-                    b"CFUUIDCreateFromUUIDBytes\0",
-                    "CFUUIDCreateFromUUIDBytes",
-                )?,
-                _iokit: iokit,
-                _corefoundation: cf,
-            })
-        }
+        // SAFETY: paths are constant, well-known system frameworks whose
+        // initialisers are trusted; every signature in the `library!`
+        // blocks above is transcribed from the SDK header.
+        let iokit = unsafe { IoKit::open(IOKIT_PATH) }
+            .map_err(|e| DriveError::Mmc(format!("couldn't load IOKit.framework: {e}")))?;
+        let cf = unsafe { CoreFoundation::open(COREFOUNDATION_PATH) }
+            .map_err(|e| DriveError::Mmc(format!("couldn't load CoreFoundation.framework: {e}")))?;
+        Ok(Symbols { iokit, cf })
     }
 }
 
@@ -548,7 +508,7 @@ unsafe extern "C" {
     // Modern 64-bit-inode statfs. On arm64 Darwin the unsuffixed symbol
     // resolves directly; on x86_64 the C compiler rewrites `statfs` to
     // `statfs$INODE64` when `_DARWIN_USE_64_BIT_INODE` is set (which is
-    // the default since 10.6). The libloading approach for IOKit doesn't
+    // the default since 10.6). The `dlsym` approach for IOKit doesn't
     // help us here because `libc` is part of the platform — we just
     // declare the right symbol name per arch.
     #[cfg(target_arch = "x86_64")]
@@ -634,7 +594,7 @@ impl Drop for CfRef<'_> {
         if !self.ptr.is_null() {
             // SAFETY: ptr originates from a CF Create / Get-with-retain
             // call; we own exactly one reference.
-            unsafe { (self.syms.CFRelease)(self.ptr) }
+            unsafe { self.syms.cf.CFRelease(self.ptr) }
         }
     }
 }
@@ -651,7 +611,7 @@ impl Drop for IoObject<'_> {
             // SAFETY: obj comes from IOServiceGetMatchingServices /
             // IOIteratorNext and was not released elsewhere.
             unsafe {
-                (self.syms.IOObjectRelease)(self.obj);
+                self.syms.iokit.IOObjectRelease(self.obj);
             }
         }
     }
@@ -662,8 +622,10 @@ fn cf_string(syms: &Symbols, s: &str) -> Result<*const c_void, DriveError> {
         .map_err(|_| DriveError::Mmc(format!("string {s:?} contains an interior NUL")))?;
     // SAFETY: c.as_ptr() is valid for the lifetime of c; allocator is
     // the default; encoding is UTF-8.
-    let r =
-        unsafe { (syms.CFStringCreateWithCString)(ptr::null(), c.as_ptr(), kCFStringEncodingUTF8) };
+    let r = unsafe {
+        syms.cf
+            .CFStringCreateWithCString(ptr::null(), c.as_ptr(), kCFStringEncodingUTF8)
+    };
     if r.is_null() {
         return Err(DriveError::Mmc(format!(
             "CFStringCreateWithCString({s:?}) returned NULL"
@@ -684,7 +646,7 @@ fn entry_bsd_name(syms: &Symbols, entry: io_registry_entry_t) -> Option<String> 
     // SAFETY: "IOService" is the canonical plane name from IOKitKeys.h.
     let plane = b"IOService\0";
     let val = unsafe {
-        (syms.IORegistryEntrySearchCFProperty)(
+        syms.iokit.IORegistryEntrySearchCFProperty(
             entry,
             plane.as_ptr() as *const c_char,
             key.ptr,
@@ -699,15 +661,15 @@ fn entry_bsd_name(syms: &Symbols, entry: io_registry_entry_t) -> Option<String> 
 
     // Confirm it's actually a CFString (sometimes BSD Name lookups
     // return CFArray etc. on multi-link entries). Compare type IDs.
-    let got = unsafe { (syms.CFGetTypeID)(cf_val.ptr) };
-    let want = unsafe { (syms.CFStringGetTypeID)() };
+    let got = unsafe { syms.cf.CFGetTypeID(cf_val.ptr) };
+    let want = unsafe { syms.cf.CFStringGetTypeID() };
     if got != want {
         return None;
     }
 
     let mut buf = [0u8; 256];
     let ok = unsafe {
-        (syms.CFStringGetCString)(
+        syms.cf.CFStringGetCString(
             cf_val.ptr,
             buf.as_mut_ptr() as *mut c_char,
             buf.len() as CFIndex,
@@ -739,13 +701,16 @@ fn find_service_by_class_and_bsd(
     // call to IOServiceGetMatchingServices, so we do NOT wrap it in a
     // CfRef on the success path. On failure (NULL return) there's
     // nothing to release.
-    let matching = unsafe { (syms.IOServiceMatching)(class_c.as_ptr()) };
+    let matching = unsafe { syms.iokit.IOServiceMatching(class_c.as_ptr()) };
     if matching.is_null() {
         return Ok(None);
     }
 
     let mut iter: io_iterator_t = 0;
-    let kr = unsafe { (syms.IOServiceGetMatchingServices)(0, matching, &mut iter) };
+    let kr = unsafe {
+        syms.iokit
+            .IOServiceGetMatchingServices(0, matching, &mut iter)
+    };
     if kr != kIOReturnSuccess {
         return Err(DriveError::Mmc(format!(
             "IOServiceGetMatchingServices({class_name}) failed: 0x{kr:08x}"
@@ -754,7 +719,7 @@ fn find_service_by_class_and_bsd(
     let iter_guard = IoObject { syms, obj: iter };
 
     loop {
-        let svc = unsafe { (syms.IOIteratorNext)(iter_guard.obj) };
+        let svc = unsafe { syms.iokit.IOIteratorNext(iter_guard.obj) };
         if svc == 0 {
             return Ok(None);
         }
@@ -806,7 +771,7 @@ impl Drop for ScsiDevice<'_> {
                 ((**self.iface).Release)(self.iface as *mut c_void);
             }
             if !self.plugin.is_null() {
-                (self.syms.IODestroyPlugInInterface)(self.plugin);
+                self.syms.iokit.IODestroyPlugInInterface(self.plugin);
             }
         }
     }
@@ -829,7 +794,7 @@ impl Drop for MmcDevice<'_> {
                 ((**self.iface).Release)(self.iface as *mut c_void);
             }
             if !self.plugin.is_null() {
-                (self.syms.IODestroyPlugInInterface)(self.plugin);
+                self.syms.iokit.IODestroyPlugInInterface(self.plugin);
             }
         }
     }
@@ -856,7 +821,7 @@ unsafe fn try_open_plugin(
     let mut plugin: *mut *mut IOCFPlugInInterface = ptr::null_mut();
     let mut score: SInt32 = 0;
     let kr = unsafe {
-        (syms.IOCreatePlugInInterfaceForService)(
+        syms.iokit.IOCreatePlugInInterfaceForService(
             service,
             dev_type_uuid,
             plugin_uuid,
@@ -896,7 +861,7 @@ fn finalize_scsi_device<'a>(
         )
     };
     if hr != 0 || iface.is_null() {
-        unsafe { (syms.IODestroyPlugInInterface)(plugin) };
+        unsafe { syms.iokit.IODestroyPlugInInterface(plugin) };
         return Err(DriveError::Mmc(format!(
             "QueryInterface(kIOSCSITaskDeviceInterfaceID) failed: 0x{hr:08x}"
         )));
@@ -945,7 +910,7 @@ fn finalize_mmc_device<'a>(
         )
     };
     if hr != 0 || iface.is_null() {
-        unsafe { (syms.IODestroyPlugInInterface)(plugin) };
+        unsafe { syms.iokit.IODestroyPlugInInterface(plugin) };
         return Err(DriveError::Mmc(format!(
             "QueryInterface(kIOMMCDeviceInterfaceID) failed: 0x{hr:08x}"
         )));
@@ -963,8 +928,10 @@ fn open_optical_device<'a>(
     service: io_service_t,
 ) -> Result<OpticalDevice<'a>, DriveError> {
     // Wrap UUIDs into CFUUIDRef.
-    let plugin_uuid =
-        unsafe { (syms.CFUUIDCreateFromUUIDBytes)(ptr::null(), K_IO_CF_PLUGIN_INTERFACE_ID) };
+    let plugin_uuid = unsafe {
+        syms.cf
+            .CFUUIDCreateFromUUIDBytes(ptr::null(), K_IO_CF_PLUGIN_INTERFACE_ID)
+    };
     if plugin_uuid.is_null() {
         return Err(DriveError::Mmc(
             "CFUUIDCreateFromUUIDBytes(kIOCFPlugInInterfaceID) returned NULL".to_string(),
@@ -976,7 +943,8 @@ fn open_optical_device<'a>(
     };
 
     let scsi_type_uuid = unsafe {
-        (syms.CFUUIDCreateFromUUIDBytes)(ptr::null(), K_IO_SCSI_TASK_DEVICE_USER_CLIENT_TYPE_ID)
+        syms.cf
+            .CFUUIDCreateFromUUIDBytes(ptr::null(), K_IO_SCSI_TASK_DEVICE_USER_CLIENT_TYPE_ID)
     };
     if scsi_type_uuid.is_null() {
         return Err(DriveError::Mmc(
@@ -990,7 +958,8 @@ fn open_optical_device<'a>(
     };
 
     let mmc_type_uuid = unsafe {
-        (syms.CFUUIDCreateFromUUIDBytes)(ptr::null(), K_IO_MMC_DEVICE_USER_CLIENT_TYPE_ID)
+        syms.cf
+            .CFUUIDCreateFromUUIDBytes(ptr::null(), K_IO_MMC_DEVICE_USER_CLIENT_TYPE_ID)
     };
     if mmc_type_uuid.is_null() {
         return Err(DriveError::Mmc(
@@ -1033,7 +1002,7 @@ fn open_optical_device<'a>(
         match unsafe { try_open_plugin(syms, current, scsi_type_uuid.ptr, plugin_uuid.ptr) } {
             Ok(plugin) => {
                 for p in &owned_parents {
-                    unsafe { (syms.IOObjectRelease)(*p) };
+                    unsafe { syms.iokit.IOObjectRelease(*p) };
                 }
                 let scsi = finalize_scsi_device(syms, plugin)?;
                 return Ok(OpticalDevice::Scsi(scsi));
@@ -1050,7 +1019,7 @@ fn open_optical_device<'a>(
         match unsafe { try_open_plugin(syms, current, mmc_type_uuid.ptr, plugin_uuid.ptr) } {
             Ok(plugin) => {
                 for p in &owned_parents {
-                    unsafe { (syms.IOObjectRelease)(*p) };
+                    unsafe { syms.iokit.IOObjectRelease(*p) };
                 }
                 let mmc = finalize_mmc_device(syms, plugin)?;
                 return Ok(OpticalDevice::Mmc(mmc));
@@ -1063,7 +1032,7 @@ fn open_optical_device<'a>(
         // Climb to parent for the next attempt.
         let mut parent: io_registry_entry_t = 0;
         let pkr = unsafe {
-            (syms.IORegistryEntryGetParentEntry)(
+            syms.iokit.IORegistryEntryGetParentEntry(
                 current,
                 plane.as_ptr() as *const c_char,
                 &mut parent,
@@ -1071,7 +1040,7 @@ fn open_optical_device<'a>(
         };
         if pkr != kIOReturnSuccess || parent == 0 {
             for p in &owned_parents {
-                unsafe { (syms.IOObjectRelease)(*p) };
+                unsafe { syms.iokit.IOObjectRelease(*p) };
             }
             return Err(DriveError::Mmc(format!(
                 "AACS Volume ID read failed: couldn't open any user-client plugin \
@@ -1090,7 +1059,7 @@ fn open_optical_device<'a>(
 
     // Walked the full chain without success.
     for p in &owned_parents {
-        unsafe { (syms.IOObjectRelease)(*p) };
+        unsafe { syms.iokit.IOObjectRelease(*p) };
     }
     Err(DriveError::Mmc(format!(
         "AACS Volume ID read failed: couldn't open any user-client plugin \
@@ -1427,6 +1396,55 @@ mod tests {
         // (typed or opaque) lowers to a single pointer.
         let expected = std::mem::size_of::<usize>() * (4 + 17) + 8 /* version+revision+pad */;
         assert_eq!(std::mem::size_of::<MMCDeviceInterface>(), expected);
+    }
+
+    #[test]
+    fn frameworks_load_and_resolve_every_symbol() {
+        // Runtime-load smoke: open IOKit + CoreFoundation through the
+        // `dlsym::library!` bindings (every listed symbol must resolve
+        // or `load` fails) and round-trip a CFString through the
+        // resolved entry points. Needs no optical drive, only the
+        // system frameworks, so it runs on every macOS host.
+        let syms = Symbols::load().expect("IOKit + CoreFoundation load");
+
+        // SAFETY: zero-argument query on a loaded CoreFoundation.
+        let string_type = unsafe { syms.cf.CFStringGetTypeID() };
+        assert_ne!(string_type, 0, "CFStringGetTypeID returned 0");
+
+        let s = cf_string(&syms, "BSD Name").expect("CFStringCreateWithCString");
+        let guard = CfRef {
+            syms: &syms,
+            ptr: s,
+        };
+        // SAFETY: `s` is a live CFString owned by `guard`.
+        let got = unsafe { syms.cf.CFGetTypeID(guard.ptr) };
+        assert_eq!(got, string_type, "created object is not a CFString");
+
+        let mut buf = [0 as c_char; 32];
+        // SAFETY: `buf` is a valid, writable, NUL-terminated-after-call
+        // buffer of the stated length.
+        let ok = unsafe {
+            syms.cf.CFStringGetCString(
+                guard.ptr,
+                buf.as_mut_ptr(),
+                buf.len() as CFIndex,
+                kCFStringEncodingUTF8,
+            )
+        };
+        assert_ne!(ok, 0, "CFStringGetCString failed");
+        let back: String = buf
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        assert_eq!(back, "BSD Name");
+
+        // An IOKit entry point that is safe to call on a null matching
+        // dictionary: IOObjectRelease(0) is a documented no-op returning
+        // kIOReturnSuccess-or-error without touching the registry.
+        // SAFETY: a 0 handle is never a live io_object_t.
+        let _ = unsafe { syms.iokit.IOObjectRelease(0) };
+        drop(guard);
     }
 
     #[test]

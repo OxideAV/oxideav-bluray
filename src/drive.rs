@@ -7,7 +7,7 @@
 //! to the optical drive.
 //!
 //! This module owns that drive query. The platform implementations live
-//! under `drive/<os>.rs` and are loaded lazily via `libloading` against
+//! under `drive/<os>.rs` and are loaded lazily via `dlsym` against
 //! the system framework / kernel interface, matching the workspace's
 //! existing convention (see oxideplay's SDL2 loader).
 //!

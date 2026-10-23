@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - edition 2024, MSRV 1.95
+- loader: `dlsym` (`library!` bindings for IOKit + CoreFoundation) replaces `libloading` on the macOS drive-key path; public API unchanged
 
 ## [0.0.4](https://github.com/OxideAV/oxideav-bluray/compare/v0.0.3...v0.0.4) - 2026-08-15
 

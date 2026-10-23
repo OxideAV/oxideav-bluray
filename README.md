@@ -418,7 +418,7 @@ bluray://                          → auto-detect first BD-ROM mount
 - Pluggable [`StreamDecryptor`] trait so `oxideav-aacs` can plug in
   without a hard dep.
 - macOS AACS Volume Identifier reader (`drive::macos`): IOKit
-  SCSITaskDeviceInterface dlopen'd via `libloading`, MMC `READ DISC
+  SCSITaskDeviceInterface dlopen'd via `dlsym`, MMC `READ DISC
   STRUCTURE` (opcode `0xAD`, format `0x80`) against the BSD whole-disk
   node resolved via `statfs(disc_root)`. Surfaces an actionable error
   when Finder still has the volume mounted (run `diskutil unmount`
