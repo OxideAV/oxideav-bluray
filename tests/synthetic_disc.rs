@@ -16,7 +16,7 @@ use oxideav_bluray::bdmv::mpls::{
     AppInfoPlayList, ConnectionCondition, PlayItem, PlayItemFlags, PlayList, PlayListMpls,
     PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType,
 };
-use oxideav_bluray::{Disc, TitleKind, M2TS_PACKET_LEN, TS_PACKET_LEN};
+use oxideav_bluray::{Disc, M2TS_PACKET_LEN, TS_PACKET_LEN, TitleKind};
 
 fn write_file(path: &Path, bytes: &[u8]) {
     if let Some(p) = path.parent() {

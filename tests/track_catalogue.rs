@@ -21,7 +21,7 @@ use oxideav_bluray::bdmv::mpls::{
     PlayListMpls, PrimaryAudioStream, PrimaryVideoStream, StnTable, StreamCodingType, SubPath,
     SubPlayItem,
 };
-use oxideav_bluray::{Disc, SubPathType, TrackKind, M2TS_PACKET_LEN, TS_PACKET_LEN};
+use oxideav_bluray::{Disc, M2TS_PACKET_LEN, SubPathType, TS_PACKET_LEN, TrackKind};
 
 fn write_file(path: &Path, bytes: &[u8]) {
     if let Some(p) = path.parent() {
@@ -249,10 +249,12 @@ fn title_streams_by_kind_filter_walks_only_one_class() {
         .collect();
     assert_eq!(video, vec![0x1011]);
 
-    assert!(catalogue
-        .by_kind(TrackKind::SecondaryVideo)
-        .next()
-        .is_none());
+    assert!(
+        catalogue
+            .by_kind(TrackKind::SecondaryVideo)
+            .next()
+            .is_none()
+    );
 }
 
 #[test]

@@ -188,7 +188,7 @@ fn parse_query(query: &str) -> Result<(Option<u16>, ChapterSelector)> {
             None => {
                 return Err(BlurayError::malformed(format!(
                     "bluray:// query expects key=value, got `{pair}`"
-                )))
+                )));
             }
         };
         match key {

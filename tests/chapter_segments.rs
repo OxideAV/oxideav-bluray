@@ -397,11 +397,12 @@ fn open_title_chapters_rejects_out_of_range_id() {
     let disc = Disc::mount(tmp.path()).expect("mount");
     let title = disc.longest_title().expect("title").clone();
 
-    assert!(disc
-        .open_title_chapters(&title, &ChapterSelector::List(vec![99]), None)
-        .is_err());
-    assert!(disc
-        .open_title_chapters(
+    assert!(
+        disc.open_title_chapters(&title, &ChapterSelector::List(vec![99]), None)
+            .is_err()
+    );
+    assert!(
+        disc.open_title_chapters(
             &title,
             &ChapterSelector::Range {
                 start: 1,
@@ -409,7 +410,8 @@ fn open_title_chapters_rejects_out_of_range_id() {
             },
             None,
         )
-        .is_err());
+        .is_err()
+    );
 }
 
 struct TestDir {

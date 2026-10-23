@@ -93,7 +93,7 @@
 #![allow(unsafe_code)]
 
 use super::DriveError;
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr;
 
@@ -544,7 +544,7 @@ struct Statfs {
     f_reserved: [u32; 7],
 }
 
-extern "C" {
+unsafe extern "C" {
     // Modern 64-bit-inode statfs. On arm64 Darwin the unsuffixed symbol
     // resolves directly; on x86_64 the C compiler rewrites `statfs` to
     // `statfs$INODE64` when `_DARWIN_USE_64_BIT_INODE` is set (which is
@@ -759,13 +759,13 @@ fn find_service_by_class_and_bsd(
             return Ok(None);
         }
         let svc_guard = IoObject { syms, obj: svc };
-        if let Some(name) = entry_bsd_name(syms, svc) {
-            if name == bsd_name {
-                // Hand ownership of the io_service_t back to the caller.
-                let owned = svc_guard.obj;
-                std::mem::forget(svc_guard);
-                return Ok(Some(owned));
-            }
+        if let Some(name) = entry_bsd_name(syms, svc)
+            && name == bsd_name
+        {
+            // Hand ownership of the io_service_t back to the caller.
+            let owned = svc_guard.obj;
+            std::mem::forget(svc_guard);
+            return Ok(Some(owned));
         }
     }
 }

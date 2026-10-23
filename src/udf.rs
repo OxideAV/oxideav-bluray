@@ -538,13 +538,13 @@ pub fn decode_dstring(payload: &[u8]) -> Result<String> {
         16 => {
             // 16-bit BE per code-point.
             let body = &payload[1..];
-            if body.len() % 2 != 0 {
+            if !body.len().is_multiple_of(2) {
                 return Err(BlurayError::malformed(
                     "16-bit d-string with odd byte count",
                 ));
             }
             let mut s = String::with_capacity(body.len() / 2);
-            for chunk in body.chunks_exact(2) {
+            for chunk in body.as_chunks::<2>().0 {
                 let cp = u16::from_be_bytes([chunk[0], chunk[1]]);
                 if cp == 0 {
                     break;
@@ -1375,12 +1375,12 @@ impl<R: Read + Seek> UdfDisc<R> {
                     "AED continuation chain exceeds depth cap (cyclic chain?)",
                 ));
             }
-            if let Some(p) = cont.partition_ref {
-                if p != self.partition_number {
-                    return Err(BlurayError::unsupported(
-                        "AED continuation references a different partition",
-                    ));
-                }
+            if let Some(p) = cont.partition_ref
+                && p != self.partition_number
+            {
+                return Err(BlurayError::unsupported(
+                    "AED continuation references a different partition",
+                ));
             }
             let len = cont.length as usize;
             if len < AllocationExtentDescriptor::HEADER_SIZE {
@@ -1433,12 +1433,12 @@ impl<R: Read + Seek> UdfDisc<R> {
             if ext.extent_type != 0 {
                 return Err(BlurayError::unsupported("non-recorded extent in file"));
             }
-            if let Some(p) = ext.partition_ref {
-                if p != self.partition_number {
-                    return Err(BlurayError::unsupported(
-                        "extent references a different partition",
-                    ));
-                }
+            if let Some(p) = ext.partition_ref
+                && p != self.partition_number
+            {
+                return Err(BlurayError::unsupported(
+                    "extent references a different partition",
+                ));
             }
             let blocks = (ext.length as u64).div_ceil(SECTOR_SIZE);
             for i in 0..blocks {

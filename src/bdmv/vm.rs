@@ -57,7 +57,7 @@
 
 use super::movie_object::NavCommand;
 use super::nav_command::{CommandGroup, DecodedCommand, Operand, Operation, RegisterBank};
-use super::register_model::{psr_info, GPR_COUNT, PSR_COUNT};
+use super::register_model::{GPR_COUNT, PSR_COUNT, psr_info};
 
 /// The HDMV register file: two banks of 32-bit unsigned registers.
 ///
@@ -141,10 +141,10 @@ impl Registers {
     /// is read-only to navigation (Player Setting / read-only Playback
     /// Status / reserved), per the register-model class.
     fn set_psr_nav(&mut self, index: u8, value: u32) {
-        if Self::psr_nav_writable(index) {
-            if let Some(slot) = self.psr.get_mut(index as usize) {
-                *slot = value;
-            }
+        if Self::psr_nav_writable(index)
+            && let Some(slot) = self.psr.get_mut(index as usize)
+        {
+            *slot = value;
         }
     }
 }

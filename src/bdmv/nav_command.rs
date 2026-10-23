@@ -56,7 +56,7 @@
 //! Clean-room source: `docs/container/bluray/hdmv-navigation-commands.md`.
 
 use super::movie_object::NavCommand;
-use super::register_model::{psr_info, PsrInfo};
+use super::register_model::{PsrInfo, psr_info};
 
 /// Command group (`grp`, bits 28-27 of the operation word).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

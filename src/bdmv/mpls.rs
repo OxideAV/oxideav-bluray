@@ -2386,8 +2386,8 @@ fn parse_sub_play_item(r: &mut Reader<'_>) -> Result<SubPlayItem> {
     let multi_clips = if is_multi_clip_entries {
         let num_entries = r.read_u8()?;
         r.skip(1)?; // reserved
-                    // Entry id 0 is the header clip above; ids 1..n follow as
-                    // 10-byte records (5-byte name + 4-byte codec + 1-byte STC id).
+        // Entry id 0 is the header clip above; ids 1..n follow as
+        // 10-byte records (5-byte name + 4-byte codec + 1-byte STC id).
         let extra = num_entries.saturating_sub(1) as usize;
         let mut clips = Vec::with_capacity(extra.min(64));
         for _ in 0..extra {

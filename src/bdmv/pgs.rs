@@ -398,7 +398,7 @@ impl Pds {
         let palette_id = r.u8()?;
         let palette_version_number = r.u8()?;
         // The remaining body is a whole number of 5-byte entries.
-        if r.remaining() % 5 != 0 {
+        if !r.remaining().is_multiple_of(5) {
             return Err(BlurayError::malformed(
                 "PDS body not a whole number of 5-byte palette entries",
             ));

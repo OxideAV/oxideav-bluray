@@ -72,7 +72,7 @@ impl TpExtraHeader {
 /// errors at the call sites inside this crate.
 pub fn strip_tp_extra(input: &[u8], out: &mut [u8]) -> usize {
     assert!(
-        input.len() % M2TS_PACKET_LEN == 0,
+        input.len().is_multiple_of(M2TS_PACKET_LEN),
         "input not 192-byte aligned",
     );
     let n_pkts = input.len() / M2TS_PACKET_LEN;
@@ -102,7 +102,7 @@ pub fn strip_tp_extra(input: &[u8], out: &mut [u8]) -> usize {
 /// multiple of 192.
 pub fn strip_tp_extra_to_vec(input: &[u8]) -> Vec<u8> {
     assert!(
-        input.len() % M2TS_PACKET_LEN == 0,
+        input.len().is_multiple_of(M2TS_PACKET_LEN),
         "input not 192-byte aligned",
     );
     let n_pkts = input.len() / M2TS_PACKET_LEN;
@@ -190,7 +190,7 @@ impl ExactSizeIterator for M2tsIter<'_> {}
 /// error at every internal call site).
 pub fn iter_source_packets(input: &[u8]) -> M2tsIter<'_> {
     assert!(
-        input.len() % M2TS_PACKET_LEN == 0,
+        input.len().is_multiple_of(M2TS_PACKET_LEN),
         "input not 192-byte aligned",
     );
     M2tsIter { buf: input, pos: 0 }

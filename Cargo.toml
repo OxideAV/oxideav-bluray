@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-bluray"
 version = "0.0.4"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 authors = ["Mark Karpeles <admin@echelle.co.jp>"]
 description = "Read-only Blu-ray Disc (BD-ROM) UDF mount + BDMV directory walk + playlist (.mpls / .clpi) parsing + .m2ts streaming — clean-room per BDA whitepapers + ECMA-167"

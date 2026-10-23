@@ -448,11 +448,12 @@ mod tests {
             idx.resolve_movie_object(TitleEntry::Title { number: 2 }),
             None
         );
-        assert!(!idx
-            .entry(TitleEntry::Title { number: 2 })
-            .unwrap()
-            .object
-            .is_hdmv());
+        assert!(
+            !idx.entry(TitleEntry::Title { number: 2 })
+                .unwrap()
+                .object
+                .is_hdmv()
+        );
         // Title 0 (invalid; titles are 1-based) and out-of-range → None.
         assert!(idx.entry(TitleEntry::Title { number: 0 }).is_none());
         assert!(idx.entry(TitleEntry::Title { number: 99 }).is_none());

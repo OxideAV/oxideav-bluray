@@ -810,7 +810,7 @@ impl ClipInformation {
         let ts_recording_rate = r.read_u32()?;
         let number_of_source_packets = r.read_u32()?;
         r.skip(128)?; // 128 reserved bytes
-                      // TS_type_info_block: 32-byte fixed area
+        // TS_type_info_block: 32-byte fixed area
         let validity_flags = r.read_u8()?;
         let _padding = r.read_u8()?;
         let mut format_id = [0u8; 4];
@@ -1278,10 +1278,10 @@ fn encode_cpi(cpi: &Cpi) -> Vec<u8> {
     let bodies_start_offset =
         4 /*length u32*/ + 2 /*head*/ + 1 /*reserved*/ + 1 /*N*/ + headers_size;
     let bodies_start_in_body = bodies_start_offset - 4; // exclude the length u32 itself
-                                                        // `body_addr` is "offset from the position of the reserved+N byte"
-                                                        // — i.e. AFTER the length u32 AND the head u16. Subtract 6 from
-                                                        // `bodies_start_offset` to land in that base. See the parser's
-                                                        // matching comment.
+    // `body_addr` is "offset from the position of the reserved+N byte"
+    // — i.e. AFTER the length u32 AND the head u16. Subtract 6 from
+    // `bodies_start_offset` to land in that base. See the parser's
+    // matching comment.
     let bodies_start_in_body_addr_base = bodies_start_offset - 6;
 
     let mut header_metadata: Vec<(u16, u8, u32, u32, u32)> = Vec::with_capacity(cpi.ep_map.len());
@@ -1449,7 +1449,7 @@ impl BitWriter {
     }
 
     fn byte_aligned(&self) -> bool {
-        self.bit_pos % 8 == 0
+        self.bit_pos.is_multiple_of(8)
     }
 
     fn into_bytes(self) -> Vec<u8> {
@@ -1697,10 +1697,12 @@ mod tests {
         assert!(!parsed.cpi.ep_map[0].entries[0].is_angle_change_point);
         assert!(parsed.cpi.ep_map[0].entries[2].is_angle_change_point);
         assert_eq!(parsed.cpi.ep_map[0].entries[2].i_end_position_offset, 2);
-        assert!(parsed.cpi.ep_map[0]
-            .entries
-            .iter()
-            .all(|e| e.ep_stream_type == 1));
+        assert!(
+            parsed.cpi.ep_map[0]
+                .entries
+                .iter()
+                .all(|e| e.ep_stream_type == 1)
+        );
 
         assert_eq!(parsed.cpi.ep_map[1].stream_pid, 0x1100);
         assert_eq!(parsed.cpi.ep_map[1].ep_stream_type, 5);
@@ -2143,7 +2145,7 @@ mod tests {
         assert_eq!(ci.spn_to_byte(1), Some(192));
         assert_eq!(ci.spn_to_byte(1000), Some(1000 * 192)); // EOF boundary allowed
         assert_eq!(ci.spn_to_byte(1001), None); // past end
-                                                // byte → SPN (truncating).
+        // byte → SPN (truncating).
         assert_eq!(ci.byte_to_spn(0), Some(0));
         assert_eq!(ci.byte_to_spn(191), Some(0));
         assert_eq!(ci.byte_to_spn(192), Some(1));

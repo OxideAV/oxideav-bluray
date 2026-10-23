@@ -16,8 +16,8 @@
 
 use oxideav_bluray::bdmv::movie_object::MovieObjects;
 use oxideav_bluray::{
-    group_display_sets, parse_segments, CompositionState, FragmentFlag, Operand, Operation,
-    PsrClass, RegisterBank, SegmentBody, SegmentType,
+    CompositionState, FragmentFlag, Operand, Operation, PsrClass, RegisterBank, SegmentBody,
+    SegmentType, group_display_sets, parse_segments,
 };
 use oxideav_bluray::{MovieObject, NavCommand};
 
@@ -56,7 +56,7 @@ fn build_sup_stream() -> Vec<u8> {
     pcs.push(0x00); // palette_update_flag
     pcs.push(0x00); // palette_id
     pcs.push(1); // number_of_composition_objects
-                 // composition object 0:
+    // composition object 0:
     pcs.extend_from_slice(&0u16.to_be_bytes()); // object_id
     pcs.push(0); // window_id
     pcs.push(0x00); // object_cropped_flag (not cropped)
@@ -78,7 +78,7 @@ fn build_sup_stream() -> Vec<u8> {
     let mut pds = Vec::new();
     pds.push(0); // palette_id
     pds.push(0); // palette_version_number
-                 // entry 1: opaque, Y=235 Cr=128 Cb=128 (≈ white), alpha 255
+    // entry 1: opaque, Y=235 Cr=128 Cb=128 (≈ white), alpha 255
     pds.extend_from_slice(&[1, 235, 128, 128, 255]);
     // entry 2: opaque, Y=81 Cr=90 Cb=240 (≈ a blue), alpha 255
     pds.extend_from_slice(&[2, 81, 90, 240, 255]);
@@ -98,7 +98,7 @@ fn build_sup_stream() -> Vec<u8> {
     ods.extend_from_slice(&0u16.to_be_bytes()); // object_id
     ods.push(0); // object_version_number
     ods.push(0xC0); // last_in_sequence_flag = FirstAndLast
-                    // object_data_length = width(2) + height(2) + rle.len()
+    // object_data_length = width(2) + height(2) + rle.len()
     let data_len = (4 + rle.len()) as u32;
     ods.push((data_len >> 16) as u8);
     ods.push((data_len >> 8) as u8);

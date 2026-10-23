@@ -50,11 +50,11 @@
 #![allow(unsafe_code)]
 
 use super::DriveError;
-use oxideav_aacs::mmc::{
-    parse_volume_id_response, DataDirection, DriveCommand, ReadDiscStructure, ScsiResponse,
-    MMC_CDB_LEN,
-};
 use oxideav_aacs::AacsError;
+use oxideav_aacs::mmc::{
+    DataDirection, DriveCommand, MMC_CDB_LEN, ReadDiscStructure, ScsiResponse,
+    parse_volume_id_response,
+};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -367,7 +367,7 @@ pub fn read_volume_id_with_ake(
     host_priv_key: &[u8; 20],
 ) -> Result<[u8; 16], DriveError> {
     use oxideav_aacs::ake::{
-        aacs_la_pub_point, host_authenticate, read_verified_volume_id, HostCredentials,
+        HostCredentials, aacs_la_pub_point, host_authenticate, read_verified_volume_id,
     };
     use oxideav_aacs::ec::U160;
     use std::io::Read;

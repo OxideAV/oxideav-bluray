@@ -37,9 +37,9 @@
 use std::io::Cursor;
 
 use oxideav_bluray::udf::{
-    AllocationExtentDescriptor, AnchorVolumeDescriptorPointer, DescriptorTag, ExtentAd, FileEntry,
-    FileSetDescriptor, LbAddr, LogicalVolumeDescriptor, LongAd, PartitionDescriptor,
-    PrimaryVolumeDescriptor, ShortAd, TagId, UdfDisc, AVDP_SECTOR, SECTOR_SIZE,
+    AVDP_SECTOR, AllocationExtentDescriptor, AnchorVolumeDescriptorPointer, DescriptorTag,
+    ExtentAd, FileEntry, FileSetDescriptor, LbAddr, LogicalVolumeDescriptor, LongAd,
+    PartitionDescriptor, PrimaryVolumeDescriptor, SECTOR_SIZE, ShortAd, TagId, UdfDisc,
 };
 
 const SECTOR: usize = SECTOR_SIZE as usize;
@@ -98,8 +98,8 @@ fn lvd_bytes(location: u32, fsd_partition_block: u32, partition_ref: u16) -> Vec
     let t = tag(TagId::LogicalVolume, location, 440);
     buf[0..16].copy_from_slice(&t.encode());
     buf[16..20].copy_from_slice(&1u32.to_le_bytes()); // VDS seq num
-                                                      // descriptor_character_set 64 bytes at 20..84 — zeros
-                                                      // logical_volume_identifier d-string at 84..212 (128 bytes), length byte at 211
+    // descriptor_character_set 64 bytes at 20..84 — zeros
+    // logical_volume_identifier d-string at 84..212 (128 bytes), length byte at 211
     buf[84] = 8;
     buf[85..88].copy_from_slice(b"LVI");
     buf[211] = 4;
@@ -163,7 +163,7 @@ fn make_root_directory_file_entry(location: u32, fid_payload: &[u8]) -> Vec<u8> 
     buf[20..22].copy_from_slice(&4u16.to_le_bytes()); // strategy_type
     buf[22..24].copy_from_slice(&0u16.to_le_bytes()); // strategy_parameter
     buf[24..26].copy_from_slice(&1u16.to_le_bytes()); // max_entries
-                                                      // byte 26 reserved, byte 27 file_type = 4
+    // byte 26 reserved, byte 27 file_type = 4
     buf[27] = 4;
     // parent_icb 6 bytes at 28..34 — zero
     // flags = embedded(3) | strategy stuff at 0
@@ -172,8 +172,8 @@ fn make_root_directory_file_entry(location: u32, fid_payload: &[u8]) -> Vec<u8> 
     // uid/gid/perm/file_link_count at 36..50
     buf[44..48].copy_from_slice(&0u32.to_le_bytes()); // permissions
     buf[48..50].copy_from_slice(&1u16.to_le_bytes()); // file_link_count
-                                                      // record_format/disp_attr/record_length at 50..56 — zero
-                                                      // information_length u64 at 56
+    // record_format/disp_attr/record_length at 50..56 — zero
+    // information_length u64 at 56
     buf[56..64].copy_from_slice(&(fid_payload.len() as u64).to_le_bytes());
     // logical_blocks_recorded u64 at 64 — zero
     // access/mod/attribute times at 72..108 — zero

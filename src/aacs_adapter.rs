@@ -33,12 +33,12 @@
 use crate::decrypt::{DecryptError, StreamDecryptor};
 use crate::m2ts::M2TS_PACKET_LEN;
 #[cfg(feature = "aacs-online")]
+use oxideav_aacs::DeviceKey;
+use oxideav_aacs::Vuk;
+#[cfg(feature = "aacs-online")]
 use oxideav_aacs::keydb::DeviceKeyRecord;
 use oxideav_aacs::keydb::KeyDbEntry;
 use oxideav_aacs::vuk::{derive_vuk, disc_id_from_unit_key_file_bytes};
-#[cfg(feature = "aacs-online")]
-use oxideav_aacs::DeviceKey;
-use oxideav_aacs::Vuk;
 use oxideav_aacs::{AacsVolume, KeyDb, TitleKey};
 #[cfg(any(test, feature = "aacs-online"))]
 use std::io::Write;
@@ -70,7 +70,7 @@ impl std::fmt::Debug for AacsDecryptor {
 
 impl StreamDecryptor for AacsDecryptor {
     fn decrypt_units(&mut self, buf: &mut [u8], _clip_offset: u64) -> Result<(), DecryptError> {
-        if buf.len() % AACS_UNIT_LEN != 0 {
+        if !buf.len().is_multiple_of(AACS_UNIT_LEN) {
             return Err(DecryptError::new(format!(
                 "AacsDecryptor: buffer length {} is not a multiple of {AACS_UNIT_LEN}",
                 buf.len()
@@ -338,7 +338,7 @@ fn resolve_aacs_entry(
                     return Ok(Some(ResolvedEntry {
                         entry: e,
                         source: ResolvedSource::Keydb,
-                    }))
+                    }));
                 }
                 None => eprintln!(
                     "oxideav-bluray: matched KEYDB.cfg line for {disc_id_hex} did \
@@ -577,8 +577,8 @@ fn parse_hex16_env(name: &str, s: &str) -> Option<[u8; 16]> {
 /// [`KeyDbEntry`]. Returns `None` if the line fails to parse cleanly.
 fn parse_single_keydb_line(line: &str) -> Option<KeyDbEntry> {
     let mini = KeyDb::parse(line).ok()?;
-    let out = mini.entries().next().cloned();
-    out
+
+    mini.entries().next().cloned()
 }
 
 // ---------------------------------------------------------------------
@@ -1206,17 +1206,25 @@ mod tests {
         prev: Option<String>,
     }
     impl EnvOverride {
+        #[allow(unsafe_code)]
         fn set(key: &'static str, value: &str) -> Self {
             let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
+            // SAFETY: every caller holds `ENV_LOCK` for the lifetime of
+            // the returned guard, so no other test thread reads or
+            // writes the process environment while it is mutated.
+            unsafe { std::env::set_var(key, value) };
             Self { key, prev }
         }
     }
     impl Drop for EnvOverride {
+        #[allow(unsafe_code)]
         fn drop(&mut self) {
+            // SAFETY: the guard is dropped while the owning test still
+            // holds `ENV_LOCK` (see `set`), so the restore cannot race
+            // another thread's environment access.
             match &self.prev {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
             }
         }
     }
