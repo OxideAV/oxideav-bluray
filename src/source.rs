@@ -52,6 +52,7 @@ use crate::error::{BlurayError, Result};
 
 /// Disc-location target carried inside a parsed [`BlurayUri`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BlurayUriTarget {
     /// `bluray://` — auto-detect.
     AutoDetect,
@@ -65,6 +66,7 @@ pub enum BlurayUriTarget {
 /// `bluray://` URI. Indices are 1-based and match the order returned by
 /// [`crate::Disc::chapters`] (chapter 1 → index 0).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChapterSelector {
     /// No `chapters=` query — emit one segment per chapter in the title.
     All,
@@ -85,6 +87,7 @@ pub enum ChapterSelector {
 /// `?chapters=` query params. Pre-query-string callers only need
 /// [`Self::target`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BlurayUri {
     pub target: BlurayUriTarget,
     /// 1-based title id from `?title=` if present. `None` means "use

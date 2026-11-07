@@ -60,6 +60,7 @@ use crate::error::{BlurayError, Result};
 
 /// Connection condition between PlayItems (§5.4.4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectionCondition {
     /// `0x01` — Non-seamless connection (new media-time origin).
     NonSeamless,
@@ -98,6 +99,7 @@ impl ConnectionCondition {
 /// between; link points are author-private cue points that are not
 /// surfaced as chapters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MarkType {
     /// `0x01` — Entry mark. The boundaries of a chapter; a player's
     /// chapter-search jumps land on these.
@@ -132,6 +134,7 @@ impl MarkType {
 /// §2.4.4.10) for video; for audio / graphics they're BDA-private
 /// values from the BD-AV white paper §5.4.4 Table 5-X.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum StreamCodingType {
     /// `0x02` — MPEG-2 (ISO/IEC 13818-2) video.
     Mpeg2Video,
@@ -289,6 +292,7 @@ impl StreamCodingType {
 /// scan kind), so a player labelling its video track has a single
 /// enum to switch over instead of duplicating the magic numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum VideoFormat {
     /// `0x1` — 480i (NTSC SD interlaced).
     Video480i,
@@ -387,6 +391,7 @@ impl VideoFormat {
 /// [`Self::fps_q`] returns the exact rational the rate expands to so
 /// callers do not have to keep the BD-AV table in mind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum FrameRate {
     /// `0x1` — 24000/1001 (NTSC film).
     Fps23_976,
@@ -465,6 +470,7 @@ impl FrameRate {
 /// §5.4.4.4). Only the two common display ratios are documented; any
 /// other nibble round-trips as [`Self::Other`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum AspectRatio {
     /// `0x2` — 4:3 display aspect.
     Ratio4x3,
@@ -528,6 +534,7 @@ impl AspectRatio {
 /// downmix to feed the decoder without re-deriving the layout from
 /// the raw nibble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum AudioFormat {
     /// `0x1` — Mono (1.0).
     Mono,
@@ -598,6 +605,7 @@ impl AudioFormat {
 /// `48192`) cover the dual-rate carriage some lossless audio codecs
 /// use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SampleRate {
     /// `0x1` — 48 kHz.
     Hz48000,
@@ -747,6 +755,7 @@ pub struct PgsSubtitleStream {
 /// One Interactive Graphic Stream entry — used by BD-J / HDMV menu
 /// overlay. Layout matches [`PgsSubtitleStream`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IgsInteractiveStream {
     pub elementary_pid: u16,
     pub coding_type: StreamCodingType,
@@ -757,6 +766,7 @@ pub struct IgsInteractiveStream {
 /// commentary mixdown). Carries the same per-track attributes as a
 /// primary audio stream.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SecondaryAudioStream {
     pub elementary_pid: u16,
     pub coding_type: StreamCodingType,
@@ -780,6 +790,7 @@ impl SecondaryAudioStream {
 /// One secondary-video stream entry (Picture-in-Picture overlay).
 /// Layout matches [`PrimaryVideoStream`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SecondaryVideoStream {
     pub elementary_pid: u16,
     pub coding_type: StreamCodingType,
@@ -807,6 +818,7 @@ impl SecondaryVideoStream {
 
 /// One Picture-in-Picture Presentation Graphic Stream entry.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PipPgStream {
     pub elementary_pid: u16,
     pub coding_type: StreamCodingType,
@@ -819,6 +831,7 @@ pub struct PipPgStream {
 /// counted classes; per the BD-AV layout they live in the trailing
 /// portion of the table after num_pip_pg streams. Many discs ship none.)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TextSubtitleStream {
     pub elementary_pid: u16,
     pub coding_type: StreamCodingType,
@@ -881,6 +894,7 @@ impl StnTable {
     note = "use `StnTable` and its per-stream vectors (`primary_video`, `primary_audio`, `pg_subtitles`, ...) instead"
 )]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StnTableSummary {
     pub num_primary_video: u8,
     pub num_primary_audio: u8,
@@ -925,6 +939,7 @@ pub struct AngleClip {
 /// fields are surfaced verbatim because their internal bit semantics are
 /// not pinned by the consulted references.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct PlayItemFlags {
     /// `PlayItem_random_access_flag` (§5.4.4.1) — the top bit of the
     /// byte immediately after the 8-byte `UO_mask_table`. When set, the
@@ -1037,6 +1052,7 @@ impl PlayItem {
 /// [`PlayItem::angle_clip`]. Lets a streamer look up an angle's `.m2ts`
 /// / `.clpi` stem without cloning the underlying `String`.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct AngleClipRef<'a> {
     pub clip_information_file_name: &'a str,
     pub clip_codec_identifier: &'a [u8; 4],
@@ -1049,6 +1065,7 @@ pub struct AngleClipRef<'a> {
 /// `docs/container/bluray/mpls-subpath-uo-mask.md` ("SubPath_type —
 /// PlayList SubPath type codes").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SubPathType {
     /// `0x02` — primary-audio presentation path of the Browsable
     /// slideshow.
@@ -1266,6 +1283,7 @@ impl SubPath {
 /// same 90 kHz title axis as [`Chapter::start_pts_90k`] and
 /// `TitleSource::seek_to`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SubPlayItemWindow {
     /// Index of the owning SubPath in `play_list.sub_paths`.
     pub sub_path_index: usize,
@@ -1306,6 +1324,7 @@ impl SubPlayItemWindow {
 /// scattering magic numbers; obtained via
 /// [`AppInfoPlayList::playback_kind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum PlayListPlaybackType {
     /// `0x01` — Sequential. PlayItems play in the order recorded.
     Sequential,
@@ -1424,6 +1443,7 @@ impl PlayListMark {
 /// presentation timestamp ready to hand to
 /// [`crate::TitleSource::seek_to`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Chapter {
     /// 0-based chapter index in playback order (chapter 1 is index 0).
     pub index: usize,
@@ -1446,6 +1466,7 @@ pub struct Chapter {
 /// derivation over already-parsed marks + PlayItem durations — no new wire
 /// layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChapterSpan {
     /// 0-based chapter index in playback order (chapter 1 is index 0).
     pub index: usize,

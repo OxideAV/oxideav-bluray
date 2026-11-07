@@ -89,6 +89,7 @@ impl AppInfoBdmv {
 /// Object referenced by an `IndexEntry` — either an HDMV movie-object
 /// id or a BD-J bdjo file-name stem.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IndexObjectType {
     Hdmv {
         playback_type: u8,

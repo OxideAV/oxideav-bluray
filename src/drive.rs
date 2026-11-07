@@ -34,6 +34,7 @@
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DriveError {
     #[error("OXIDEAV_AACS_VOLUME_ID env override is not 32 hex characters: {0:?}")]
     BadEnvOverride(String),

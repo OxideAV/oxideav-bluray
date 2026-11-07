@@ -87,6 +87,7 @@ impl CommandGroup {
 /// so a caller can still introspect a command we don't have a name
 /// for without losing information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Operation {
     // --- Branch / GOTO (sub_grp 0) ---
     Nop,
@@ -178,6 +179,7 @@ pub enum Operand {
 /// A register reference resolved against the HDMV register model: its
 /// bank, index, and (for PSRs) the named [`PsrInfo`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ResolvedRegister {
     /// The register bank this operand targets.
     pub bank: RegisterBank,
@@ -234,6 +236,7 @@ impl Operand {
 
 /// A fully decoded HDMV navigation command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodedCommand {
     /// Number of operands the command actually uses (`op_cnt`, 0..2).
     pub operand_count: u8,

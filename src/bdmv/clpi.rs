@@ -264,6 +264,7 @@ impl SequenceInfo {
 /// decode. For PG / IG / text-subtitle streams the byte is reserved
 /// (zero) and the language tag carries the meaningful payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StreamCodingInfo {
     pub pid: u16,
     pub stream_coding_type: u8,
@@ -281,6 +282,36 @@ pub struct StreamCodingInfo {
 }
 
 impl StreamCodingInfo {
+    /// Build a stream entry for `pid` / `stream_coding_type` with the
+    /// format, aspect-ratio and language fields zeroed.
+    pub fn new(pid: u16, stream_coding_type: u8) -> Self {
+        StreamCodingInfo {
+            pid,
+            stream_coding_type,
+            format_info_byte: 0,
+            aspect_ratio_nibble: 0,
+            language_code: [0; 3],
+        }
+    }
+
+    /// Set the packed format / rate byte.
+    pub fn with_format_info_byte(mut self, v: u8) -> Self {
+        self.format_info_byte = v;
+        self
+    }
+
+    /// Set the aspect-ratio nibble.
+    pub fn with_aspect_ratio_nibble(mut self, v: u8) -> Self {
+        self.aspect_ratio_nibble = v;
+        self
+    }
+
+    /// Set the ISO 639-2 language code.
+    pub fn with_language_code(mut self, v: [u8; 3]) -> Self {
+        self.language_code = v;
+        self
+    }
+
     /// Typed view of the 8-bit `stream_coding_type` (the canonical PMT
     /// `stream_type` for video, BDA-private codes for audio / graphics).
     pub fn coding_type(&self) -> StreamCodingType {
@@ -335,6 +366,7 @@ impl StreamCodingInfo {
 
 /// One program inside ProgramInfo (§5.5.4.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ProgramEntry {
     pub spn_program_sequence_start: u32,
     pub program_map_pid: u16,
@@ -342,6 +374,19 @@ pub struct ProgramEntry {
 }
 
 impl ProgramEntry {
+    /// Build a program-sequence entry.
+    pub fn new(
+        spn_program_sequence_start: u32,
+        program_map_pid: u16,
+        streams: Vec<StreamCodingInfo>,
+    ) -> Self {
+        ProgramEntry {
+            spn_program_sequence_start,
+            program_map_pid,
+            streams,
+        }
+    }
+
     /// Find this program's elementary stream carried on `pid`. `None`
     /// when no stream in the program declares that PID.
     pub fn stream_by_pid(&self, pid: u16) -> Option<&StreamCodingInfo> {
@@ -422,6 +467,7 @@ impl ProgramInfo {
 /// MPEG-TS `stream_type` (the 8-bit values returned by
 /// `StreamCodingType::as_raw`, e.g. `0x1B` for AVC).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum EpStreamType {
     /// `0x0` — Reserved / unused EP_map header. Code 0 appears in
     /// authored fixtures whose CLPI lays out an EP_map slot for a

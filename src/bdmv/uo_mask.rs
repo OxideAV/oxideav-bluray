@@ -28,6 +28,7 @@ use std::fmt;
 /// [`UoMask::reserved_bits`] for detecting a mask that sets them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum UserOperation {
     /// Wire bit 0 — `menu_call` (jump to the Top Menu title).
     MenuCall = 0,

@@ -51,6 +51,7 @@ struct ResumeFrame {
 
 /// Why a [`MobjRunner::run`] / [`MobjRunner::resume`] returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RunOutcome {
     /// The run completed: the entry object's command list (and any callers
     /// on the resume stack) finished, with the resume stack empty.

@@ -214,6 +214,7 @@ fn operand_value(op: Option<Operand>, regs: &Registers) -> u32 {
 /// taken literally, register references read from the file at the moment of
 /// the branch), so the player layer does not need to re-resolve operands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NavRequest {
     /// `JumpObject` — switch to another Movie Object by id (operand 1).
     JumpObject { mobj_id: u32 },
@@ -249,6 +250,7 @@ pub enum NavRequest {
 
 /// The outcome of stepping the VM one command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Step {
     /// The command executed (register/PC mutation, or a no-op) and the VM
     /// is ready to step the next command. Carries the new program counter.

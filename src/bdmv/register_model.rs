@@ -63,6 +63,7 @@ impl PsrClass {
 /// A named Player Status Register: its index, human-readable name, and
 /// access class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PsrInfo {
     /// The PSR index (0..127).
     pub index: u8,
@@ -130,6 +131,7 @@ pub fn psr_info(index: u8) -> Option<PsrInfo> {
 /// convention — how tools/templates use the registers — not a
 /// hardware-enforced semantic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GprConvention {
     /// Human-readable conventional use of this GPR.
     pub conventional_use: &'static str,

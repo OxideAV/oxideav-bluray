@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `StreamCodingInfo::new` + `with_format_info_byte` /
+  `with_aspect_ratio_nibble` / `with_language_code`, and
+  `ProgramEntry::new`, so CLPI program tables stay buildable.
+
+### Changed
+
+- `#[non_exhaustive]` on the growable enums `AspectRatio`, `AudioFormat`,
+  `BlurayError`, `BlurayUriTarget`, `ChapterSelector`,
+  `ConnectionCondition`, `DriveError`, `DriveOutcome`, `EpStreamType`,
+  `FrameRate`, `IndexObjectType`, `MarkType`, `NavRequest`, `Operation`,
+  `PlayListPlaybackType`, `RunOutcome`, `SampleRate`, `SegmentBody`,
+  `SegmentType`, `Step`, `StreamCodingType`, `SubPathType`, `TagId`,
+  `TitleKind`, `TrackKind`, `UserOperation` and `VideoFormat`.
+- `#[non_exhaustive]` on the parsed / derived records `AdContinuation`,
+  `AllocExtent`, `AnchorVolumeDescriptorPointer`, `AngleChangePoint`,
+  `AngleClipRef`, `BlurayUri`, `Chapter`, `ChapterSegment`, `ChapterSpan`,
+  `DecodedCommand`, `DecodedObject`, `DirEntry`, `DiscTitleMeta`,
+  `DisplaySet`, `FileEntry`, `FileIdentifierDescriptor`,
+  `FileSetDescriptor`, `GprConvention`, `IcbTag`, `IgsInteractiveStream`,
+  `LogicalVolumeDescriptor`, `PartitionDescriptor`, `PipPgStream`,
+  `PlayItemFlags`, `PrimaryVolumeDescriptor`, `ProgramEntry`, `PsrInfo`,
+  `PtsContinuitySegment`, `ReassembledObject`, `RenderedDisplaySet`,
+  `ResolvedRegister`, `RgbaImage`, `SecondaryAudioStream`,
+  `SecondaryVideoStream`, `StnTableSummary`, `StreamCodingInfo`,
+  `SubPlayItemWindow`, `TextSubtitleStream`, `TitleInfo`, `Track`,
+  `TrackCatalogue` and `UdfDisc`. The authored MPLS / CLPI / index /
+  MovieObject / PGS-segment wire records that callers build for
+  `encode()` stay exhaustive.
+
 - edition 2024, MSRV 1.95
 - loader: `dlsym` (`library!` bindings for IOKit + CoreFoundation) replaces `libloading` on the macOS drive-key path; public API unchanged
 

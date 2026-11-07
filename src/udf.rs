@@ -72,6 +72,7 @@ pub const VRS_FIRST_SECTOR: u64 = 16;
 /// ECMA-167 §3/7.2.1 unless otherwise noted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum TagId {
     PrimaryVolume = 1,
     AnchorVolumeDescriptorPointer = 2,
@@ -414,6 +415,7 @@ impl ExtAd {
 /// (§14.14.1 short / §14.14.2 long / §14.14.3 extended) so the file
 /// walk can run a single loop.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct AllocExtent {
     /// Bytes this extent contributes to the file body. For an ext_ad
     /// this is its `Information Length`; for short/long it's the
@@ -437,6 +439,7 @@ pub struct AllocExtent {
 /// Descriptor (§14.5) followed by one or more further allocation
 /// descriptors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AdContinuation {
     /// 30-bit Extent Length, in bytes, of the continuation extent.
     pub length: u32,
@@ -578,6 +581,7 @@ pub fn decode_dstring_field(field: &[u8]) -> Result<String> {
 // ─────────────────────── AnchorVolumeDescriptorPointer (§10.2) ───────────────────────
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct AnchorVolumeDescriptorPointer {
     pub tag: DescriptorTag,
     pub main_volume_descriptor_sequence: ExtentAd,
@@ -613,6 +617,7 @@ impl AnchorVolumeDescriptorPointer {
 // ─────────────────────── PrimaryVolumeDescriptor (§10.1) ───────────────────────
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PrimaryVolumeDescriptor {
     pub tag: DescriptorTag,
     pub volume_descriptor_sequence_number: u32,
@@ -645,6 +650,7 @@ impl PrimaryVolumeDescriptor {
 // ─────────────────────── PartitionDescriptor (§10.5) ───────────────────────
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PartitionDescriptor {
     pub tag: DescriptorTag,
     pub volume_descriptor_sequence_number: u32,
@@ -685,6 +691,7 @@ impl PartitionDescriptor {
 // ─────────────────────── LogicalVolumeDescriptor (§10.6) ───────────────────────
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LogicalVolumeDescriptor {
     pub tag: DescriptorTag,
     pub volume_descriptor_sequence_number: u32,
@@ -726,6 +733,7 @@ impl LogicalVolumeDescriptor {
 // ─────────────────────── FileSetDescriptor (§14.1) ───────────────────────
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FileSetDescriptor {
     pub tag: DescriptorTag,
     pub root_directory_icb: LongAd,
@@ -768,6 +776,7 @@ impl FileSetDescriptor {
 // ─────────────────────── FileIdentifierDescriptor (§14.4) ───────────────────────
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FileIdentifierDescriptor {
     pub tag: DescriptorTag,
     pub file_version_number: u16,
@@ -826,6 +835,7 @@ impl FileIdentifierDescriptor {
 /// A File Entry's ICB Tag (§14.6) — 20 bytes immediately after the
 /// descriptor tag. We surface only the fields we use.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct IcbTag {
     pub prior_recorded_entries: u32,
     pub strategy_type: u16,
@@ -886,6 +896,7 @@ impl AdType {
 /// §14.17.11) is surfaced via [`Self::object_size`]; for a plain FE
 /// the field is `None`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FileEntry {
     pub tag: DescriptorTag,
     pub icb_tag: IcbTag,
@@ -1236,6 +1247,7 @@ pub fn probe_vrs<R: Read + Seek>(r: &mut R) -> Result<bool> {
 
 /// A successfully mounted UDF volume. Holds the partition base, the
 /// root directory ICB, and an owned reader for sector I/O. Read-only.
+#[non_exhaustive]
 pub struct UdfDisc<R: Read + Seek> {
     reader: R,
     pub partition_start_sector: u64,
@@ -1515,6 +1527,7 @@ impl<R: Read + Seek> UdfDisc<R> {
 
 /// A single entry in a UDF directory listing.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DirEntry {
     pub name: String,
     pub icb: LongAd,

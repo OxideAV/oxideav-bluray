@@ -92,6 +92,7 @@ impl SegmentHeader {
 
 /// `segment_type` enumeration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SegmentType {
     /// Palette Definition Segment (`0x14`).
     Pds,
@@ -566,6 +567,7 @@ pub struct Segment {
 
 /// The typed body of a [`Segment`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SegmentBody {
     Pcs(Pcs),
     Wds(Wds),
@@ -668,6 +670,7 @@ pub fn parse_segments(buf: &[u8]) -> Result<Vec<Segment>> {
 
 /// A decoded paletted bitmap: `width × height` CLUT indices, row-major.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodedObject {
     pub width: u16,
     pub height: u16,
@@ -811,6 +814,7 @@ pub fn decode_rle(data: &[u8], width: u16, height: u16) -> Result<DecodedObject>
 /// [`DisplaySet::reassemble_objects`] then folds each ODS fragment chain
 /// back into whole RLE objects ready for [`decode_rle`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DisplaySet {
     /// The Presentation Composition Segment that opens the DS.
     pub pcs: Pcs,
@@ -952,6 +956,7 @@ struct ReassembleAcc {
 /// `rle_data` with [`decode_rle`] (using `width`/`height`) to get the
 /// paletted bitmap.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReassembledObject {
     pub object_id: u16,
     pub object_version_number: u8,
@@ -1282,6 +1287,7 @@ impl Palette {
 /// A decoded, palette-resolved RGBA bitmap: `width × height` straight-alpha
 /// pixels, row-major (top-left first).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RgbaImage {
     pub width: u16,
     pub height: u16,
@@ -1335,6 +1341,7 @@ impl DecodedObject {
 /// palette-resolved, and painted into the PCS-declared graphics plane at the
 /// position (and crop) the PCS gives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RenderedDisplaySet {
     /// The graphics-plane bitmap (`pcs.width × pcs.height`).
     pub plane: RgbaImage,

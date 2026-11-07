@@ -36,6 +36,7 @@ use crate::source::ChapterSelector;
 
 /// HDMV vs BD-J title classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TitleKind {
     Hdmv,
     BdJ,
@@ -43,6 +44,7 @@ pub enum TitleKind {
 
 /// One playable title.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TitleInfo {
     /// 1-based disc index.
     pub id: u16,
@@ -820,6 +822,7 @@ struct ClipSeekInfo {
 /// segment's PTS axis carries through (no reproject needed across
 /// the seam) or restarts (reproject required).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PtsContinuitySegment {
     /// 0-based index of this PlayItem in the title's PlayList. Matches
     /// `PlayItem`'s position in `PlayListMpls::play_list.play_items`,
@@ -906,6 +909,7 @@ pub struct PtsContinuitySegment {
 /// [`play_item_index`] / [`clip_stem`] (so a UI can label the switch
 /// boundary by chapter / clip number).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AngleChangePoint {
     /// 0-based PlayItem index inside the title's PlayList. Matches the
     /// position in `PlayListMpls::play_list.play_items`.
@@ -1573,6 +1577,7 @@ impl Read for TitleSource {
 /// keyframe-rounded (see [`Disc::open_title_chapters`] for the
 /// boundary caveat).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChapterSegment {
     /// 1-based chapter id (matches `Disc::chapters()` order + 1).
     pub chapter_id: u32,
@@ -1716,6 +1721,7 @@ impl Iterator for ChapterSegments {
 /// thumbnails, etc., and the `<di:name>` element itself is the only
 /// universally-shipped field.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DiscTitleMeta {
     /// The disc's display title — content of the `<di:name>` element
     /// (the BD-ROM spec's "DiscInfo name").
@@ -1790,6 +1796,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// types (`PrimaryVideoStream`, `PrimaryAudioStream`, …) into a single
 /// enum so a remuxer can iterate one flat list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum TrackKind {
     /// Primary video — the title's main video stream.
     PrimaryVideo,
@@ -1816,6 +1823,7 @@ pub enum TrackKind {
 /// (the "language not specified" pad many discs ship for the primary
 /// audio mix).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Track {
     /// MPEG-TS elementary PID carrying this stream. Stable across the
     /// whole title (BD-ROM AV §5.2.3.3 requires the PID assignment to
@@ -1860,6 +1868,7 @@ impl Track {
 /// Order matches the canonical STN class order documented on
 /// [`Disc::title_streams`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TrackCatalogue {
     pub tracks: Vec<Track>,
 }

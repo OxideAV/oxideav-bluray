@@ -78,6 +78,7 @@ struct TitleFrame {
 /// when the script either finishes, asks to start/alter **playback**, or
 /// hits a structural problem.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DriveOutcome {
     /// The navigation script finished: the entry title (and any titles on
     /// the title-call stack) ran to completion with nothing left to do and
