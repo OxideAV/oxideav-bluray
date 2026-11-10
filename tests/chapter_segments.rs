@@ -64,6 +64,7 @@ fn make_clpi(entry_points: &[(u32, u32)], n_source_packets: u32) -> Vec<u8> {
         })
         .collect();
     let clpi = ClipInformation {
+        extension: Default::default(),
         version: *b"0200",
         clip_info: ClipInfo {
             clip_stream_type: 1,
@@ -94,20 +95,18 @@ fn make_clpi(entry_points: &[(u32, u32)], n_source_packets: u32) -> Vec<u8> {
 
 fn primary_video_stn() -> StnTable {
     StnTable {
-        primary_video: vec![PrimaryVideoStream {
-            elementary_pid: 0x1011,
-            coding_type: StreamCodingType::AvcVideo,
-            video_format: 0x06,
-            frame_rate: 0x03,
-            aspect_ratio: 0x03,
-        }],
-        primary_audio: vec![PrimaryAudioStream {
-            elementary_pid: 0x1100,
-            coding_type: StreamCodingType::Ac3Audio,
-            audio_format: 0x03,
-            sample_rate: 0x01,
-            language_code: *b"eng",
-        }],
+        primary_video: vec![
+            PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+                .with_video_format(0x06)
+                .with_frame_rate(0x03)
+                .with_aspect_ratio(0x03),
+        ],
+        primary_audio: vec![
+            PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+                .with_audio_format(0x03)
+                .with_sample_rate(0x01)
+                .with_language_code(*b"eng"),
+        ],
         ..StnTable::default()
     }
 }
@@ -125,6 +124,7 @@ fn synth_three_chapter_disc(root: &Path) {
     let bdmv = root.join("BDMV");
 
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,

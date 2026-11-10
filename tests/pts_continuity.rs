@@ -59,6 +59,7 @@ fn make_m2ts(n_packets: usize) -> Vec<u8> {
 /// 45 kHz units, as the on-disc field is encoded).
 fn make_clpi(n_source_packets: u32, stc_presentation_start_45k: u32) -> Vec<u8> {
     let clpi = ClipInformation {
+        extension: Default::default(),
         version: *b"0200",
         clip_info: ClipInfo {
             clip_stream_type: 1,
@@ -106,20 +107,18 @@ fn make_clpi(n_source_packets: u32, stc_presentation_start_45k: u32) -> Vec<u8> 
 
 fn primary_video_stn() -> StnTable {
     StnTable {
-        primary_video: vec![PrimaryVideoStream {
-            elementary_pid: 0x1011,
-            coding_type: StreamCodingType::AvcVideo,
-            video_format: 0x06,
-            frame_rate: 0x03,
-            aspect_ratio: 0x03,
-        }],
-        primary_audio: vec![PrimaryAudioStream {
-            elementary_pid: 0x1100,
-            coding_type: StreamCodingType::Ac3Audio,
-            audio_format: 0x03,
-            sample_rate: 0x01,
-            language_code: *b"eng",
-        }],
+        primary_video: vec![
+            PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+                .with_video_format(0x06)
+                .with_frame_rate(0x03)
+                .with_aspect_ratio(0x03),
+        ],
+        primary_audio: vec![
+            PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+                .with_audio_format(0x03)
+                .with_sample_rate(0x01)
+                .with_language_code(*b"eng"),
+        ],
         ..StnTable::default()
     }
 }
@@ -206,6 +205,7 @@ fn three_playitems_emit_three_continuity_segments_with_correct_byte_pts_bounds()
     }
 
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,
@@ -306,6 +306,7 @@ fn first_playitem_connection_condition_normalised_to_nonseamless() {
     let bdmv = root.join("BDMV");
 
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,
@@ -363,6 +364,7 @@ fn missing_sequence_info_falls_back_to_zero_stc_origin() {
     let bdmv = root.join("BDMV");
 
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,
@@ -394,6 +396,7 @@ fn missing_sequence_info_falls_back_to_zero_stc_origin() {
 
     // Hand-build a CLPI with `sequence_info.atc_sequences` empty.
     let clpi = ClipInformation {
+        extension: Default::default(),
         version: *b"0200",
         clip_info: ClipInfo {
             clip_stream_type: 1,
@@ -442,6 +445,7 @@ fn map_clip_pts_to_title_pts_walks_across_playitem_seams() {
     let bdmv = root.join("BDMV");
 
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,
@@ -554,6 +558,7 @@ fn segment_for_playitem_after_in_offset_advances_clip_axis_correctly() {
     // a downstream demuxer that sees clip-local PTS = 3 s on that
     // byte should reproject to title PTS = 0.
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,

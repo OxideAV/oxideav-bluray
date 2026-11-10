@@ -56,6 +56,10 @@
 //! bit → operation map.
 
 use crate::bdmv::common::{BdmvHeader, Reader};
+use crate::bdmv::extension::{
+    EXT_ID_STN_TABLE_SS, EXT_ID_SUB_PATH_EXTENSION, ExtensionDataEntry, encode_extension_data,
+    parse_extension_data,
+};
 use crate::error::{BlurayError, Result};
 
 /// Connection condition between PlayItems (§5.4.4.2).
@@ -140,6 +144,10 @@ pub enum StreamCodingType {
     Mpeg2Video,
     /// `0x1B` — H.264 / MPEG-4 AVC (ISO/IEC 14496-10) video.
     AvcVideo,
+    /// `0x20` — stereoscopic dependent-view video (the MVC dependent
+    /// view a 3D PlayList lists in its `STN_table_SS`, and its clip in
+    /// `ProgramInfo_SS`).
+    MvcDependentVideo,
     /// `0x24` — H.265 / HEVC (ISO/IEC 23008-2) video.
     HevcVideo,
     /// `0xEA` — SMPTE VC-1 video.
@@ -178,6 +186,7 @@ impl StreamCodingType {
         match v {
             0x02 => Self::Mpeg2Video,
             0x1B => Self::AvcVideo,
+            0x20 => Self::MvcDependentVideo,
             0x24 => Self::HevcVideo,
             0xEA => Self::Vc1Video,
             0x80 => Self::LpcmAudio,
@@ -200,6 +209,7 @@ impl StreamCodingType {
         match self {
             Self::Mpeg2Video => 0x02,
             Self::AvcVideo => 0x1B,
+            Self::MvcDependentVideo => 0x20,
             Self::HevcVideo => 0x24,
             Self::Vc1Video => 0xEA,
             Self::LpcmAudio => 0x80,
@@ -221,7 +231,11 @@ impl StreamCodingType {
     pub fn is_video(self) -> bool {
         matches!(
             self,
-            Self::Mpeg2Video | Self::AvcVideo | Self::HevcVideo | Self::Vc1Video
+            Self::Mpeg2Video
+                | Self::AvcVideo
+                | Self::MvcDependentVideo
+                | Self::HevcVideo
+                | Self::Vc1Video
         )
     }
 
@@ -265,6 +279,7 @@ impl StreamCodingType {
         let s = match self {
             Self::Mpeg2Video => "MPEG-2 Video",
             Self::AvcVideo => "H.264/AVC Video",
+            Self::MvcDependentVideo => "H.264/MVC Dependent View",
             Self::HevcVideo => "H.265/HEVC Video",
             Self::Vc1Video => "VC-1 Video",
             Self::LpcmAudio => "LPCM Audio",
@@ -673,13 +688,237 @@ impl SampleRate {
     }
 }
 
+/// One `stream_entry()` of an STN_table / STN_table_SS — *where* a
+/// listed elementary stream is carried.
+///
+/// Every `stream_entry()` is 10 bytes on the wire (`length = 9`, then
+/// a `type` byte and an 8-byte zero-padded body); the body layout
+/// depends on the type (`docs/container/bluray/stn-table-observed.md`
+/// §2):
+///
+/// | type | body (bits) | carrier |
+/// |---:|---|---|
+/// | 1 | `ref_to_stream_PID_of_mainClip` 16 | the PlayItem's own clip |
+/// | 2 | `ref_to_SubPath_id` 8, `ref_to_subClip_entry_id` 8, `ref_to_stream_PID_of_subClip` 16 | a separate clip reached through a SubPath |
+/// | 3 | `ref_to_SubPath_id` 8, `ref_to_stream_PID_of_mainClip` 16 | the PlayItem's clip, *played through* a SubPath (in-mux PiP) |
+/// | 4 | as type 3 | the PlayItem's clip, through an enhancement-layer SubPath (`SubPath_type` 10) |
+///
+/// The parser is length-based: it reads the recorded `length`, decodes
+/// the fields the type defines when the body is long enough, and skips
+/// the rest. A body too short for its type, or an unassigned type
+/// value, surfaces as [`Self::Unknown`] with the raw body preserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StreamEntry {
+    /// Type 1 — stream multiplexed in the clip of this PlayItem (the
+    /// main path).
+    MainClip {
+        /// `ref_to_stream_PID_of_mainClip`.
+        pid: u16,
+    },
+    /// Type 2 — stream in a separate clip: SubPath
+    /// `sub_path_id` → its live SubPlayItem → clip entry
+    /// `sub_clip_entry_id` (0 = the SubPlayItem's own
+    /// `Clip_Information_file_name[0]`, 1.. = its multi-clip
+    /// alternates) → `pid` inside that clip.
+    SubClip {
+        /// `ref_to_SubPath_id` (8 bits) — index into the PlayList's
+        /// SubPath loop (main STN) or the ExtensionData SubPath list
+        /// (STN_table_SS).
+        sub_path_id: u8,
+        /// `ref_to_subClip_entry_id` (8 bits).
+        sub_clip_entry_id: u8,
+        /// `ref_to_stream_PID_of_subClip`.
+        pid: u16,
+    },
+    /// Type 3 — stream multiplexed in the PlayItem's own clip but
+    /// presented through SubPath `sub_path_id` (in-mux synchronous PiP,
+    /// `SubPath_type` 7). The SubPath supplies timing only.
+    InMuxSubPath {
+        /// `ref_to_SubPath_id` (8 bits).
+        sub_path_id: u8,
+        /// `ref_to_stream_PID_of_mainClip`.
+        pid: u16,
+    },
+    /// Type 4 — same body as type 3, against an enhancement-layer
+    /// SubPath (`SubPath_type` 10).
+    EnhancementLayer {
+        /// `ref_to_SubPath_id` (8 bits).
+        sub_path_id: u8,
+        /// `ref_to_stream_PID_of_mainClip`.
+        pid: u16,
+    },
+    /// Any other `type` value, or a body too short for its type. The
+    /// first 8 body bytes after the type are kept verbatim
+    /// (zero-filled when shorter).
+    Unknown {
+        /// The raw `type` byte (0 when the entry had no type byte).
+        stream_type: u8,
+        /// Up to 8 body bytes following the type byte.
+        body: [u8; 8],
+    },
+}
+
+impl Default for StreamEntry {
+    fn default() -> Self {
+        Self::MainClip { pid: 0 }
+    }
+}
+
+impl StreamEntry {
+    /// Type-1 entry for `pid` in the PlayItem's own clip.
+    pub fn main_clip(pid: u16) -> Self {
+        Self::MainClip { pid }
+    }
+
+    /// Type-2 entry: `pid` in clip entry `sub_clip_entry_id` of
+    /// SubPath `sub_path_id`.
+    pub fn sub_clip(sub_path_id: u8, sub_clip_entry_id: u8, pid: u16) -> Self {
+        Self::SubClip {
+            sub_path_id,
+            sub_clip_entry_id,
+            pid,
+        }
+    }
+
+    /// Type-3 entry: in-mux `pid` presented through SubPath
+    /// `sub_path_id`.
+    pub fn in_mux_sub_path(sub_path_id: u8, pid: u16) -> Self {
+        Self::InMuxSubPath { sub_path_id, pid }
+    }
+
+    /// Type-4 entry: in-mux `pid` presented through enhancement-layer
+    /// SubPath `sub_path_id`.
+    pub fn enhancement_layer(sub_path_id: u8, pid: u16) -> Self {
+        Self::EnhancementLayer { sub_path_id, pid }
+    }
+
+    /// The wire `type` byte.
+    pub fn stream_type(&self) -> u8 {
+        match self {
+            Self::MainClip { .. } => 1,
+            Self::SubClip { .. } => 2,
+            Self::InMuxSubPath { .. } => 3,
+            Self::EnhancementLayer { .. } => 4,
+            Self::Unknown { stream_type, .. } => *stream_type,
+        }
+    }
+
+    /// The referenced elementary PID (in the main clip for types 1/3/4,
+    /// in the sub-clip for type 2). `None` for [`Self::Unknown`].
+    pub fn pid(&self) -> Option<u16> {
+        match *self {
+            Self::MainClip { pid }
+            | Self::SubClip { pid, .. }
+            | Self::InMuxSubPath { pid, .. }
+            | Self::EnhancementLayer { pid, .. } => Some(pid),
+            Self::Unknown { .. } => None,
+        }
+    }
+
+    /// `ref_to_SubPath_id` for types 2/3/4; `None` for type 1 /
+    /// unknown.
+    pub fn sub_path_id(&self) -> Option<u8> {
+        match *self {
+            Self::SubClip { sub_path_id, .. }
+            | Self::InMuxSubPath { sub_path_id, .. }
+            | Self::EnhancementLayer { sub_path_id, .. } => Some(sub_path_id),
+            _ => None,
+        }
+    }
+
+    /// `ref_to_subClip_entry_id` for type 2; `None` otherwise.
+    pub fn sub_clip_entry_id(&self) -> Option<u8> {
+        match *self {
+            Self::SubClip {
+                sub_clip_entry_id, ..
+            } => Some(sub_clip_entry_id),
+            _ => None,
+        }
+    }
+
+    /// `true` when the stream's packets live in the PlayItem's own
+    /// clip (types 1, 3 and 4); `false` for a sub-clip (type 2) or an
+    /// unknown entry.
+    pub fn is_in_main_clip(&self) -> bool {
+        matches!(
+            self,
+            Self::MainClip { .. } | Self::InMuxSubPath { .. } | Self::EnhancementLayer { .. }
+        )
+    }
+
+    /// Serialise as the 10-byte wire form (`length = 9`, type, body).
+    pub fn to_bytes(&self) -> [u8; 10] {
+        let mut out = [0u8; 10];
+        out[0] = 9;
+        out[1] = self.stream_type();
+        match *self {
+            Self::MainClip { pid } => out[2..4].copy_from_slice(&pid.to_be_bytes()),
+            Self::SubClip {
+                sub_path_id,
+                sub_clip_entry_id,
+                pid,
+            } => {
+                out[2] = sub_path_id;
+                out[3] = sub_clip_entry_id;
+                out[4..6].copy_from_slice(&pid.to_be_bytes());
+            }
+            Self::InMuxSubPath { sub_path_id, pid }
+            | Self::EnhancementLayer { sub_path_id, pid } => {
+                out[2] = sub_path_id;
+                out[3..5].copy_from_slice(&pid.to_be_bytes());
+            }
+            Self::Unknown { body, .. } => out[2..10].copy_from_slice(&body),
+        }
+        out
+    }
+
+    /// Decode a `stream_entry()` body (the bytes after the `length`
+    /// byte). See the type-level docs for the per-type layout.
+    pub fn from_body(body: &[u8]) -> Self {
+        let Some((&stream_type, rest)) = body.split_first() else {
+            return Self::Unknown {
+                stream_type: 0,
+                body: [0; 8],
+            };
+        };
+        let be16 = |b: &[u8]| u16::from_be_bytes([b[0], b[1]]);
+        match stream_type {
+            1 if rest.len() >= 2 => Self::MainClip { pid: be16(rest) },
+            2 if rest.len() >= 4 => Self::SubClip {
+                sub_path_id: rest[0],
+                sub_clip_entry_id: rest[1],
+                pid: be16(&rest[2..]),
+            },
+            3 if rest.len() >= 3 => Self::InMuxSubPath {
+                sub_path_id: rest[0],
+                pid: be16(&rest[1..]),
+            },
+            4 if rest.len() >= 3 => Self::EnhancementLayer {
+                sub_path_id: rest[0],
+                pid: be16(&rest[1..]),
+            },
+            _ => {
+                let mut raw = [0u8; 8];
+                let n = rest.len().min(8);
+                raw[..n].copy_from_slice(&rest[..n]);
+                Self::Unknown {
+                    stream_type,
+                    body: raw,
+                }
+            }
+        }
+    }
+}
+
 /// One primary-video stream entry inside [`StnTable::primary_video`]
-/// (BD-ROM Part 3 §5.4.4.4 "video stream_attributes").
+/// (BD-ROM Part 3 §5.4.4.4 "video stream_attributes"). Also the shape
+/// of the dependent-view entry of an [`StnTableSs`].
 ///
 /// Wire layout (post-header per-stream):
 ///
 /// ```text
-///   stream_entry      length-prefixed block, type 1 = in-mux PID
+///   stream_entry      10 bytes, see StreamEntry
 ///   stream_attributes length-prefixed block:
 ///     stream_coding_type             u8
 ///     video_format(4) | frame_rate(4) u8
@@ -690,9 +929,13 @@ impl SampleRate {
 /// fields; per-codec interpretation tables live in BD-AV §5.4.4
 /// (e.g. `frame_rate == 0x03` → 24000/1001 fps).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PrimaryVideoStream {
-    /// MPEG-TS elementary PID carrying the stream.
+    /// Elementary PID carrying the stream, in whichever clip
+    /// [`Self::entry`] names (`entry.pid()`, 0 for an unknown entry).
     pub elementary_pid: u16,
+    /// The decoded `stream_entry()` — where the stream is carried.
+    pub entry: StreamEntry,
     pub coding_type: StreamCodingType,
     pub video_format: u8, // 4-bit
     pub frame_rate: u8,   // 4-bit
@@ -700,6 +943,41 @@ pub struct PrimaryVideoStream {
 }
 
 impl PrimaryVideoStream {
+    /// A type-1 (main-clip) entry for `pid` with zeroed attributes.
+    pub fn new(pid: u16, coding_type: StreamCodingType) -> Self {
+        Self {
+            elementary_pid: pid,
+            entry: StreamEntry::main_clip(pid),
+            coding_type,
+            ..Self::default()
+        }
+    }
+
+    /// Replace the stream entry (also updates [`Self::elementary_pid`]).
+    pub fn with_entry(mut self, entry: StreamEntry) -> Self {
+        self.elementary_pid = entry.pid().unwrap_or(0);
+        self.entry = entry;
+        self
+    }
+
+    /// Set the 4-bit `video_format`.
+    pub fn with_video_format(mut self, v: u8) -> Self {
+        self.video_format = v;
+        self
+    }
+
+    /// Set the 4-bit `frame_rate`.
+    pub fn with_frame_rate(mut self, v: u8) -> Self {
+        self.frame_rate = v;
+        self
+    }
+
+    /// Set the 4-bit `aspect_ratio`.
+    pub fn with_aspect_ratio(mut self, v: u8) -> Self {
+        self.aspect_ratio = v;
+        self
+    }
+
     /// Typed view of [`Self::video_format`] (BD-ROM Part 3 §5.4.4.4).
     pub fn video_format_kind(&self) -> VideoFormat {
         VideoFormat::from_raw(self.video_format)
@@ -724,8 +1002,12 @@ impl PrimaryVideoStream {
 /// the raw nibbles. `language_code` is a 3-byte ISO 639-2/T tag (e.g.
 /// `*b"eng"`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PrimaryAudioStream {
+    /// Elementary PID (`entry.pid()`).
     pub elementary_pid: u16,
+    /// The decoded `stream_entry()`.
+    pub entry: StreamEntry,
     pub coding_type: StreamCodingType,
     pub audio_format: u8, // 4-bit
     pub sample_rate: u8,  // 4-bit
@@ -733,6 +1015,41 @@ pub struct PrimaryAudioStream {
 }
 
 impl PrimaryAudioStream {
+    /// A type-1 (main-clip) entry for `pid` with zeroed attributes.
+    pub fn new(pid: u16, coding_type: StreamCodingType) -> Self {
+        Self {
+            elementary_pid: pid,
+            entry: StreamEntry::main_clip(pid),
+            coding_type,
+            ..Self::default()
+        }
+    }
+
+    /// Replace the stream entry (also updates [`Self::elementary_pid`]).
+    pub fn with_entry(mut self, entry: StreamEntry) -> Self {
+        self.elementary_pid = entry.pid().unwrap_or(0);
+        self.entry = entry;
+        self
+    }
+
+    /// Set the 4-bit `audio_presentation_type`.
+    pub fn with_audio_format(mut self, v: u8) -> Self {
+        self.audio_format = v;
+        self
+    }
+
+    /// Set the 4-bit `sampling_frequency`.
+    pub fn with_sample_rate(mut self, v: u8) -> Self {
+        self.sample_rate = v;
+        self
+    }
+
+    /// Set the ISO 639-2/T language tag.
+    pub fn with_language_code(mut self, v: [u8; 3]) -> Self {
+        self.language_code = v;
+        self
+    }
+
     /// Typed view of [`Self::audio_format`] (BD-ROM Part 3 §5.4.4.4).
     pub fn audio_format_kind(&self) -> AudioFormat {
         AudioFormat::from_raw(self.audio_format)
@@ -744,38 +1061,137 @@ impl PrimaryAudioStream {
     }
 }
 
-/// One Presentation Graphic Stream (BD bitmap subtitle) entry.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PgsSubtitleStream {
-    pub elementary_pid: u16,
-    pub coding_type: StreamCodingType,
-    pub language_code: [u8; 3],
+/// Shared builder surface for the language-tagged graphics records
+/// (PG, IG, PiP PG).
+macro_rules! graphics_stream_record {
+    ($(#[$m:meta])* $name:ident) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+        #[non_exhaustive]
+        pub struct $name {
+            /// Elementary PID (`entry.pid()`).
+            pub elementary_pid: u16,
+            /// The decoded `stream_entry()`.
+            pub entry: StreamEntry,
+            pub coding_type: StreamCodingType,
+            pub language_code: [u8; 3],
+        }
+
+        impl $name {
+            /// A type-1 (main-clip) entry for `pid`, language unset.
+            pub fn new(pid: u16, coding_type: StreamCodingType) -> Self {
+                Self {
+                    elementary_pid: pid,
+                    entry: StreamEntry::main_clip(pid),
+                    coding_type,
+                    language_code: [0; 3],
+                }
+            }
+
+            /// Replace the stream entry (also updates
+            /// `elementary_pid`).
+            pub fn with_entry(mut self, entry: StreamEntry) -> Self {
+                self.elementary_pid = entry.pid().unwrap_or(0);
+                self.entry = entry;
+                self
+            }
+
+            /// Set the ISO 639-2/T language tag.
+            pub fn with_language_code(mut self, v: [u8; 3]) -> Self {
+                self.language_code = v;
+                self
+            }
+        }
+    };
 }
 
-/// One Interactive Graphic Stream entry — used by BD-J / HDMV menu
-/// overlay. Layout matches [`PgsSubtitleStream`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct IgsInteractiveStream {
-    pub elementary_pid: u16,
-    pub coding_type: StreamCodingType,
-    pub language_code: [u8; 3],
-}
+graphics_stream_record!(
+    /// One Presentation Graphic Stream (BD bitmap subtitle) entry.
+    PgsSubtitleStream
+);
+
+graphics_stream_record!(
+    /// One Interactive Graphic Stream entry — used by BD-J / HDMV menu
+    /// overlay. Layout matches [`PgsSubtitleStream`].
+    IgsInteractiveStream
+);
+
+graphics_stream_record!(
+    /// One Picture-in-Picture Presentation Graphic Stream entry.
+    ///
+    /// PiP PG entries have no loop of their own: the STN_table's PG
+    /// loop runs to `number_of_PG_textST_stream_entries +
+    /// number_of_PiP_PG_textST_stream_entries_plus`, and the entries
+    /// past the first `number_of_PG_textST_stream_entries` are the PiP
+    /// ones (`docs/container/bluray/stn-table-observed.md` §1). They
+    /// share the PG stream-id space: PiP PG `k` is PG_textST stream id
+    /// `pg_subtitles.len() + k`.
+    PipPgStream
+);
 
 /// One secondary-audio stream entry (Picture-in-Picture / director's
 /// commentary mixdown). Carries the same per-track attributes as a
-/// primary audio stream.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// primary audio stream, plus its
+/// `comb_info_Secondary_audio_Primary_audio()` block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SecondaryAudioStream {
+    /// Elementary PID (`entry.pid()`).
     pub elementary_pid: u16,
+    /// The decoded `stream_entry()`.
+    pub entry: StreamEntry,
     pub coding_type: StreamCodingType,
     pub audio_format: u8,
     pub sample_rate: u8,
     pub language_code: [u8; 3],
+    /// `comb_info_Secondary_audio_Primary_audio()` — the primary-audio
+    /// **stream ids** (indices into [`StnTable::primary_audio`]) this
+    /// secondary audio may be mixed with.
+    pub primary_audio_refs: Vec<u8>,
 }
 
 impl SecondaryAudioStream {
+    /// A type-1 (main-clip) entry for `pid` with zeroed attributes.
+    pub fn new(pid: u16, coding_type: StreamCodingType) -> Self {
+        Self {
+            elementary_pid: pid,
+            entry: StreamEntry::main_clip(pid),
+            coding_type,
+            ..Self::default()
+        }
+    }
+
+    /// Replace the stream entry (also updates [`Self::elementary_pid`]).
+    pub fn with_entry(mut self, entry: StreamEntry) -> Self {
+        self.elementary_pid = entry.pid().unwrap_or(0);
+        self.entry = entry;
+        self
+    }
+
+    /// Set the 4-bit `audio_presentation_type`.
+    pub fn with_audio_format(mut self, v: u8) -> Self {
+        self.audio_format = v;
+        self
+    }
+
+    /// Set the 4-bit `sampling_frequency`.
+    pub fn with_sample_rate(mut self, v: u8) -> Self {
+        self.sample_rate = v;
+        self
+    }
+
+    /// Set the ISO 639-2/T language tag.
+    pub fn with_language_code(mut self, v: [u8; 3]) -> Self {
+        self.language_code = v;
+        self
+    }
+
+    /// Set the primary-audio stream-id combination list.
+    pub fn with_primary_audio_refs(mut self, v: Vec<u8>) -> Self {
+        self.primary_audio_refs = v;
+        self
+    }
+
     /// Typed view of [`Self::audio_format`] (BD-ROM Part 3 §5.4.4.4).
     pub fn audio_format_kind(&self) -> AudioFormat {
         AudioFormat::from_raw(self.audio_format)
@@ -788,18 +1204,78 @@ impl SecondaryAudioStream {
 }
 
 /// One secondary-video stream entry (Picture-in-Picture overlay).
-/// Layout matches [`PrimaryVideoStream`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Attributes match [`PrimaryVideoStream`]; followed on the wire by
+/// the `comb_info_Secondary_video_Secondary_audio()` and
+/// `comb_info_Secondary_video_PiP_PG_textST()` blocks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SecondaryVideoStream {
+    /// Elementary PID (`entry.pid()`).
     pub elementary_pid: u16,
+    /// The decoded `stream_entry()` — typically type 3 (in-mux PiP) or
+    /// type 2 (out-of-mux PiP).
+    pub entry: StreamEntry,
     pub coding_type: StreamCodingType,
     pub video_format: u8,
     pub frame_rate: u8,
     pub aspect_ratio: u8,
+    /// `comb_info_Secondary_video_Secondary_audio()` — secondary-audio
+    /// stream ids (indices into [`StnTable::secondary_audio`]) that
+    /// may accompany this PiP.
+    pub secondary_audio_refs: Vec<u8>,
+    /// `comb_info_Secondary_video_PiP_PG_textST()` — PiP PG stream ids
+    /// that may accompany this PiP.
+    pub pip_pg_refs: Vec<u8>,
 }
 
 impl SecondaryVideoStream {
+    /// A type-1 (main-clip) entry for `pid` with zeroed attributes.
+    pub fn new(pid: u16, coding_type: StreamCodingType) -> Self {
+        Self {
+            elementary_pid: pid,
+            entry: StreamEntry::main_clip(pid),
+            coding_type,
+            ..Self::default()
+        }
+    }
+
+    /// Replace the stream entry (also updates [`Self::elementary_pid`]).
+    pub fn with_entry(mut self, entry: StreamEntry) -> Self {
+        self.elementary_pid = entry.pid().unwrap_or(0);
+        self.entry = entry;
+        self
+    }
+
+    /// Set the 4-bit `video_format`.
+    pub fn with_video_format(mut self, v: u8) -> Self {
+        self.video_format = v;
+        self
+    }
+
+    /// Set the 4-bit `frame_rate`.
+    pub fn with_frame_rate(mut self, v: u8) -> Self {
+        self.frame_rate = v;
+        self
+    }
+
+    /// Set the 4-bit `aspect_ratio`.
+    pub fn with_aspect_ratio(mut self, v: u8) -> Self {
+        self.aspect_ratio = v;
+        self
+    }
+
+    /// Set the secondary-audio stream-id combination list.
+    pub fn with_secondary_audio_refs(mut self, v: Vec<u8>) -> Self {
+        self.secondary_audio_refs = v;
+        self
+    }
+
+    /// Set the PiP PG stream-id combination list.
+    pub fn with_pip_pg_refs(mut self, v: Vec<u8>) -> Self {
+        self.pip_pg_refs = v;
+        self
+    }
+
     /// Typed view of [`Self::video_format`] (BD-ROM Part 3 §5.4.4.4).
     pub fn video_format_kind(&self) -> VideoFormat {
         VideoFormat::from_raw(self.video_format)
@@ -816,20 +1292,10 @@ impl SecondaryVideoStream {
     }
 }
 
-/// One Picture-in-Picture Presentation Graphic Stream entry.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct PipPgStream {
-    pub elementary_pid: u16,
-    pub coding_type: StreamCodingType,
-    pub language_code: [u8; 3],
-}
-
 /// One text-subtitle stream entry. Carries a single-byte
 /// `character_code` plus the standard 3-byte ISO 639-2/T language tag.
-/// (Text subs are an optional class in the STN_table beyond the seven
-/// counted classes; per the BD-AV layout they live in the trailing
-/// portion of the table after num_pip_pg streams. Many discs ship none.)
+/// (Not produced by the parser — text-subtitle entries share the PG
+/// loop and surface there with their raw coding type.)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TextSubtitleStream {
@@ -846,13 +1312,19 @@ impl Default for StreamCodingType {
 }
 
 /// Per-PlayItem stream-type table (BD-ROM Part 3 §5.4.4.4). One vector
-/// per stream class; every entry carries the elementary PID + decoded
-/// per-codec attribute fields a downstream muxer needs to label each
-/// track.
+/// per stream class; every entry carries its decoded
+/// [`StreamEntry`] + the per-codec attribute fields a downstream muxer
+/// needs to label each track.
 ///
-/// Round-trips through [`PlayListMpls::encode`]: the encoded byte
-/// pattern is the spec-conformant `STN_table()` block with one
-/// `stream_entry` + `stream_attributes` pair per stream.
+/// Header: 16-bit length, 16 reserved bits, eight 8-bit counts
+/// (primary video, primary audio, PG_textST, IG, secondary audio,
+/// secondary video, PiP PG_textST "plus", and an eighth count byte),
+/// 32 reserved bits. Loops in the order primary video → primary audio
+/// → PG_textST (+ PiP PG appended) → IG → secondary audio (+ comb
+/// info) → secondary video (+ two comb infos). See
+/// `docs/container/bluray/stn-table-observed.md` §1.
+///
+/// Round-trips through [`PlayListMpls::encode`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StnTable {
     pub primary_video: Vec<PrimaryVideoStream>,
@@ -863,8 +1335,14 @@ pub struct StnTable {
     pub ig_streams: Vec<IgsInteractiveStream>,
     pub secondary_audio: Vec<SecondaryAudioStream>,
     pub secondary_video: Vec<SecondaryVideoStream>,
-    /// Picture-in-Picture Presentation Graphic Streams.
+    /// Picture-in-Picture Presentation Graphic Streams (the PG-loop
+    /// entries past `pg_subtitles`).
     pub pip_pg: Vec<PipPgStream>,
+    /// The eighth count byte of the STN header. Zero on every observed
+    /// playlist; one reading names it an enhancement-layer stream
+    /// count, another reserved. Preserved verbatim; no loop is parsed
+    /// for it.
+    pub eighth_count: u8,
 }
 
 impl StnTable {
@@ -1246,6 +1724,24 @@ impl SubPlayItem {
     pub fn num_clips(&self) -> usize {
         1 + self.multi_clips.len()
     }
+
+    /// Clip entry `entry_id` of this SubPlayItem: `0` is the header
+    /// clip (`Clip_Information_file_name[0]`), `1..` the multi-clip
+    /// alternates. Multi-clip entries are **alternates** sharing this
+    /// SubPlayItem's single IN/OUT/sync window — a type-2
+    /// `stream_entry` picks one by its `ref_to_subClip_entry_id`
+    /// (`docs/container/bluray/stn-table-observed.md` §4). `None` past
+    /// the last entry.
+    pub fn clip_entry(&self, entry_id: u8) -> Option<SubPlayItemClip> {
+        if entry_id == 0 {
+            return Some(SubPlayItemClip {
+                clip_information_file_name: self.clip_information_file_name.clone(),
+                clip_codec_identifier: self.clip_codec_identifier,
+                stc_id_ref: self.stc_id_ref,
+            });
+        }
+        self.multi_clips.get(entry_id as usize - 1).cloned()
+    }
 }
 
 /// One `SubPath()` (§5.4.4) — an auxiliary presentation path beside
@@ -1495,6 +1991,242 @@ impl ChapterSpan {
     }
 }
 
+/// One `STN_table_SS` block (PlayList ExtensionData `(2, 1)`) — the
+/// stereoscopic stream table of one PlayItem
+/// (`docs/container/bluray/stn-table-observed.md` §3).
+///
+/// Observed layout: `length` (16), a 16-bit flags word whose top bit
+/// is `fixed_offset_during_PopUp`, then the dependent-view
+/// `stream_entry()` (type 2 into the ExtensionData SubPath list) +
+/// video `stream_attributes()`, then trailing bytes whose meaning is
+/// not established (kept verbatim in [`Self::trailing`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StnTableSs {
+    /// The 16-bit flags word after `length`, verbatim.
+    pub flags: u16,
+    /// The dependent-view video entry, when the block is long enough
+    /// to carry one.
+    pub dependent_view: Option<PrimaryVideoStream>,
+    /// Bytes after the dependent-view attributes, verbatim.
+    pub trailing: Vec<u8>,
+}
+
+impl StnTableSs {
+    /// Build a block with a dependent-view entry and no trailing bytes.
+    pub fn new(dependent_view: Option<PrimaryVideoStream>) -> Self {
+        Self {
+            flags: 0,
+            dependent_view,
+            trailing: Vec::new(),
+        }
+    }
+
+    /// Set the raw flags word.
+    pub fn with_flags(mut self, flags: u16) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Set the trailing bytes.
+    pub fn with_trailing(mut self, trailing: Vec<u8>) -> Self {
+        self.trailing = trailing;
+        self
+    }
+
+    /// `fixed_offset_during_PopUp` — the top bit of [`Self::flags`].
+    pub fn fixed_offset_during_popup(&self) -> bool {
+        self.flags & 0x8000 != 0
+    }
+
+    /// Parse every `STN_table_SS` block of an ExtensionData `(2, 1)`
+    /// data block — one per PlayItem, back to back, each sized by its
+    /// own `length`.
+    pub fn parse_all(data: &[u8]) -> Result<Vec<Self>> {
+        let mut r = Reader::new(data);
+        let mut out = Vec::new();
+        while r.remaining() >= 2 {
+            let len = r.read_u16()? as usize;
+            let end = r.pos + len;
+            if end > data.len() {
+                return Err(BlurayError::malformed("STN_table_SS overruns its block"));
+            }
+            let flags = if len >= 2 { r.read_u16()? } else { 0 };
+            let mut dependent_view = None;
+            let mark = r.pos;
+            if end - r.pos >= 2 {
+                match parse_video_pair(&mut r, end) {
+                    Ok(v) => dependent_view = Some(v),
+                    Err(_) => r.seek(mark)?,
+                }
+            }
+            let trailing = r.slice(end - r.pos)?.to_vec();
+            out.push(Self {
+                flags,
+                dependent_view,
+                trailing,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Serialise blocks as an ExtensionData `(2, 1)` data block.
+    pub fn encode_all(blocks: &[Self]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for b in blocks {
+            let len_off = out.len();
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(&b.flags.to_be_bytes());
+            if let Some(v) = &b.dependent_view {
+                encode_video_pair(&mut out, v);
+            }
+            out.extend_from_slice(&b.trailing);
+            let len = (out.len() - len_off - 2) as u16;
+            out[len_off..len_off + 2].copy_from_slice(&len.to_be_bytes());
+        }
+        out
+    }
+}
+
+/// Parse a SubPath-extension data block (PlayList ExtensionData
+/// `(2, 2)`): `length` (32), `number_of_SubPath_extensions` (16), then
+/// ordinary `SubPath()` blocks.
+pub fn parse_sub_path_extension(data: &[u8]) -> Result<Vec<SubPath>> {
+    let mut r = Reader::new(data);
+    let len = r.read_u32()? as usize;
+    let end = (4 + len).min(data.len());
+    let n = r.read_u16()? as usize;
+    let mut out = Vec::with_capacity(n.min(64));
+    for _ in 0..n {
+        if r.pos >= end {
+            return Err(BlurayError::malformed(
+                "SubPath extension overruns its block",
+            ));
+        }
+        out.push(parse_sub_path(&mut r)?);
+    }
+    Ok(out)
+}
+
+/// Serialise SubPaths as a SubPath-extension data block (inverse of
+/// [`parse_sub_path_extension`]).
+pub fn encode_sub_path_extension(sub_paths: &[SubPath]) -> Vec<u8> {
+    let mut out = vec![0u8; 4];
+    out.extend_from_slice(&(sub_paths.len() as u16).to_be_bytes());
+    for sp in sub_paths {
+        encode_sub_path(&mut out, sp);
+    }
+    let len = (out.len() - 4) as u32;
+    out[..4].copy_from_slice(&len.to_be_bytes());
+    out
+}
+
+/// A PlayList's `ExtensionData()` — every raw entry plus the typed
+/// views of the ones this crate decodes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PlayListExtension {
+    /// Every entry, in table order. This is what
+    /// [`PlayListMpls::encode`] writes back.
+    pub entries: Vec<ExtensionDataEntry>,
+    /// Decoded `(2, 1)` — one `STN_table_SS` per PlayItem (empty for a
+    /// 2D PlayList).
+    pub stn_table_ss: Vec<StnTableSs>,
+    /// Decoded `(2, 2)` — the stereoscopic SubPath list that a type-2
+    /// entry inside an `STN_table_SS` indexes.
+    pub sub_paths: Vec<SubPath>,
+}
+
+impl PlayListExtension {
+    /// Build from raw entries, decoding the typed views. A typed view
+    /// whose block fails to parse is left empty (the raw entry stays).
+    pub fn from_entries(entries: Vec<ExtensionDataEntry>) -> Self {
+        let mut stn_table_ss = Vec::new();
+        let mut sub_paths = Vec::new();
+        for e in &entries {
+            match e.id() {
+                EXT_ID_STN_TABLE_SS => {
+                    stn_table_ss = StnTableSs::parse_all(&e.data).unwrap_or_default();
+                }
+                EXT_ID_SUB_PATH_EXTENSION => {
+                    sub_paths = parse_sub_path_extension(&e.data).unwrap_or_default();
+                }
+                _ => {}
+            }
+        }
+        Self {
+            entries,
+            stn_table_ss,
+            sub_paths,
+        }
+    }
+
+    /// Build a stereoscopic extension: an `STN_table_SS` per PlayItem
+    /// and the SubPath list they reference, encoded as entries `(2, 1)`
+    /// and `(2, 2)`.
+    pub fn stereoscopic(stn_table_ss: Vec<StnTableSs>, sub_paths: Vec<SubPath>) -> Self {
+        Self::from_entries(vec![
+            ExtensionDataEntry::new(2, 1, StnTableSs::encode_all(&stn_table_ss)),
+            ExtensionDataEntry::new(2, 2, encode_sub_path_extension(&sub_paths)),
+        ])
+    }
+
+    /// The raw entry with the given `(ID1, ID2)`, if present.
+    pub fn entry(&self, id1: u16, id2: u16) -> Option<&ExtensionDataEntry> {
+        self.entries.iter().find(|e| e.id() == (id1, id2))
+    }
+
+    /// `true` when the PlayList carries no extension entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Which SubPath list a `stream_entry()`'s `ref_to_SubPath_id`
+/// indexes: the PlayList's own SubPath loop (entries of the main
+/// `STN_table`) or the ExtensionData `(2, 2)` list (entries of an
+/// `STN_table_SS`) — `docs/container/bluray/stn-table-observed.md` §2/§3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum SubPathList {
+    /// `PlayList().SubPath[]`.
+    #[default]
+    PlayList,
+    /// ExtensionData `(2, 2)` SubPath extension list.
+    Extension,
+}
+
+/// A `stream_entry()` joined to the clip that carries its packets for
+/// one PlayItem — the result of [`PlayListMpls::resolve_stream_entry`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResolvedStream {
+    /// Elementary PID inside [`Self::clip_information_file_name`].
+    pub pid: u16,
+    /// 5-digit stem of the carrying clip (`STREAM/<stem>.m2ts`).
+    pub clip_information_file_name: String,
+    /// The carrying clip's codec identifier (`b"M2TS"`).
+    pub clip_codec_identifier: [u8; 4],
+    /// `ref_to_STC_id` of the carrying clip reference.
+    pub stc_id_ref: u8,
+    /// The SubPath list the entry referenced (`None` for type 1).
+    pub sub_path_list: Option<SubPathList>,
+    /// Index of the referenced SubPath in that list (types 2/3/4).
+    pub sub_path_index: Option<usize>,
+    /// Index of the live SubPlayItem inside the SubPath (type 2 always;
+    /// types 3/4 when the SubPath has one for this PlayItem).
+    pub sub_play_item_index: Option<usize>,
+    /// Clip entry within that SubPlayItem (type 2).
+    pub sub_clip_entry_id: Option<u8>,
+}
+
+impl ResolvedStream {
+    /// `true` when the packets come from the PlayItem's own clip.
+    pub fn is_main_clip(&self) -> bool {
+        self.sub_clip_entry_id.is_none()
+    }
+}
+
 /// Parsed `.mpls` file.
 #[derive(Debug, Clone)]
 pub struct PlayListMpls {
@@ -1502,6 +2234,9 @@ pub struct PlayListMpls {
     pub app_info: AppInfoPlayList,
     pub play_list: PlayList,
     pub marks: Vec<PlayListMark>,
+    /// `ExtensionData()` — raw entries plus the decoded stereoscopic
+    /// `STN_table_SS` list and SubPath extension.
+    pub extension: PlayListExtension,
 }
 
 impl PlayListMpls {
@@ -1522,7 +2257,7 @@ impl PlayListMpls {
         r.seek(8)?;
         let playlist_start = r.read_u32()? as usize;
         let marks_start = r.read_u32()? as usize;
-        let _ext_start = r.read_u32()? as usize;
+        let ext_start = r.read_u32()? as usize;
         // 20 reserved bytes at 20..40
         r.seek(40)?;
 
@@ -1609,7 +2344,108 @@ impl PlayListMpls {
                 sub_paths,
             },
             marks,
+            extension: PlayListExtension::from_entries(parse_extension_data(buf, ext_start)),
         })
+    }
+
+    /// The SubPath at `index` of `list`.
+    pub fn sub_path(&self, list: SubPathList, index: usize) -> Option<&SubPath> {
+        match list {
+            SubPathList::PlayList => self.play_list.sub_paths.get(index),
+            SubPathList::Extension => self.extension.sub_paths.get(index),
+        }
+    }
+
+    /// The SubPlayItem of SubPath `(list, sub_path_index)` that is live
+    /// while PlayItem `play_item_index` plays: the one whose
+    /// `sync_PlayItem_id` names that PlayItem, or — for a SubPath with a
+    /// single SubPlayItem (an asynchronous path) — that one. Several
+    /// SubPlayItems form a **sequence**, each synchronised to its own
+    /// PlayItem (`docs/container/bluray/stn-table-observed.md` §4).
+    pub fn live_sub_play_item(
+        &self,
+        list: SubPathList,
+        sub_path_index: usize,
+        play_item_index: usize,
+    ) -> Option<(usize, &SubPlayItem)> {
+        let sp = self.sub_path(list, sub_path_index)?;
+        if let Some(hit) = sp
+            .sub_play_items
+            .iter()
+            .enumerate()
+            .find(|(_, spi)| spi.sync_play_item_id as usize == play_item_index)
+        {
+            return Some(hit);
+        }
+        if sp.sub_play_items.len() == 1 {
+            return Some((0, &sp.sub_play_items[0]));
+        }
+        None
+    }
+
+    /// Join a `stream_entry()` listed in PlayItem `play_item_index`'s
+    /// table to the clip carrying its packets
+    /// (`docs/container/bluray/stn-table-observed.md` §2, implementer
+    /// recipe):
+    ///
+    /// - type 1 → the PlayItem's clip, `ref_to_stream_PID_of_mainClip`;
+    /// - type 3 / 4 → the PlayItem's clip (the SubPath supplies timing
+    ///   only);
+    /// - type 2 → SubPath `ref_to_SubPath_id` of `list` → its live
+    ///   SubPlayItem ([`Self::live_sub_play_item`]) → clip entry
+    ///   `ref_to_subClip_entry_id` ([`SubPlayItem::clip_entry`]).
+    ///
+    /// `list` is [`SubPathList::PlayList`] for the main `STN_table` and
+    /// [`SubPathList::Extension`] for an `STN_table_SS`. `None` when an
+    /// index is out of range or the entry type is unknown.
+    pub fn resolve_stream_entry(
+        &self,
+        play_item_index: usize,
+        entry: &StreamEntry,
+        list: SubPathList,
+    ) -> Option<ResolvedStream> {
+        let pi = self.play_list.play_items.get(play_item_index)?;
+        let main = |pid: u16, sp: Option<usize>| {
+            let spi = sp.and_then(|i| self.live_sub_play_item(list, i, play_item_index));
+            ResolvedStream {
+                pid,
+                clip_information_file_name: pi.clip_information_file_name.clone(),
+                clip_codec_identifier: pi.clip_codec_identifier,
+                stc_id_ref: pi.stc_id_ref,
+                sub_path_list: sp.map(|_| list),
+                sub_path_index: sp,
+                sub_play_item_index: spi.map(|(i, _)| i),
+                sub_clip_entry_id: None,
+            }
+        };
+        match *entry {
+            StreamEntry::MainClip { pid } => Some(main(pid, None)),
+            StreamEntry::InMuxSubPath { sub_path_id, pid }
+            | StreamEntry::EnhancementLayer { sub_path_id, pid } => {
+                self.sub_path(list, sub_path_id as usize)?;
+                Some(main(pid, Some(sub_path_id as usize)))
+            }
+            StreamEntry::SubClip {
+                sub_path_id,
+                sub_clip_entry_id,
+                pid,
+            } => {
+                let (spi_idx, spi) =
+                    self.live_sub_play_item(list, sub_path_id as usize, play_item_index)?;
+                let clip = spi.clip_entry(sub_clip_entry_id)?;
+                Some(ResolvedStream {
+                    pid,
+                    clip_information_file_name: clip.clip_information_file_name,
+                    clip_codec_identifier: clip.clip_codec_identifier,
+                    stc_id_ref: clip.stc_id_ref,
+                    sub_path_list: Some(list),
+                    sub_path_index: Some(sub_path_id as usize),
+                    sub_play_item_index: Some(spi_idx),
+                    sub_clip_entry_id: Some(sub_clip_entry_id),
+                })
+            }
+            StreamEntry::Unknown { .. } => None,
+        }
     }
 
     /// Total title duration in 90 kHz ticks (sum of PlayItem durations).
@@ -1827,6 +2663,14 @@ impl PlayListMpls {
         let mark_body_len = (out.len() - mark_body_start) as u32;
         out[mark_len_off..mark_len_off + 4].copy_from_slice(&mark_body_len.to_be_bytes());
 
+        // ExtensionData() block — only when there is something to carry
+        // (address 0 = absent).
+        if !self.extension.entries.is_empty() {
+            let ext_start = out.len() as u32;
+            out.extend_from_slice(&encode_extension_data(&self.extension.entries));
+            out[16..20].copy_from_slice(&ext_start.to_be_bytes());
+        }
+
         // Backfill offsets.
         out[8..12].copy_from_slice(&playlist_start.to_be_bytes());
         out[12..16].copy_from_slice(&marks_start.to_be_bytes());
@@ -1892,66 +2736,14 @@ fn parse_play_item(r: &mut Reader<'_>) -> Result<PlayItem> {
         (1, Vec::new())
     };
 
-    // STN_table() — read the count header + every per-stream
-    // (stream_entry + stream_attributes) pair. Per BD-ROM Part 3
-    // §5.4.4.4 the streams appear in this fixed order:
-    //   primary_video × N1, primary_audio × N2, pg × N3, ig × N4,
-    //   secondary_audio × N5, secondary_video × N6, pip_pg × N7.
-    // Text-subtitle entries (if any) live in the trailing block of the
-    // table; we collect them by scanning the residue.
+    // STN_table() — see `parse_stn_table`; length-bounded.
     let stn_len = r.read_u16()? as usize;
     let stn_body_start = r.pos;
     let stn_body_end = stn_body_start + stn_len;
-    let stn_table = if stn_len >= 14 {
-        // 2 reserved bytes
-        r.skip(2)?;
-        let num_primary_video = r.read_u8()?;
-        let num_primary_audio = r.read_u8()?;
-        let num_pg = r.read_u8()?;
-        let num_ig = r.read_u8()?;
-        let num_secondary_audio = r.read_u8()?;
-        let num_secondary_video = r.read_u8()?;
-        let num_pip_pg = r.read_u8()?;
-        // 5 reserved bytes consumed at the fixed offset (the 14-byte
-        // STN header: 2 reserved + 7 count bytes + 5 reserved).
-        r.skip(5)?;
-
-        // The remaining body holds the per-stream pairs in the order
-        // above. Each pair is `length`-prefixed; if the buffer runs out
-        // (malformed authoring) we surface a clean error rather than
-        // panic. Bound the inner readers by `stn_body_end` so a bogus
-        // length byte can't escape the STN block.
-        let mut t = StnTable::default();
-        for _ in 0..num_primary_video {
-            t.primary_video.push(parse_primary_video_stream(r)?);
-        }
-        for _ in 0..num_primary_audio {
-            t.primary_audio.push(parse_primary_audio_stream(r)?);
-        }
-        for _ in 0..num_pg {
-            t.pg_subtitles.push(parse_pg_subtitle_stream(r)?);
-        }
-        for _ in 0..num_ig {
-            t.ig_streams.push(parse_ig_stream(r)?);
-        }
-        for _ in 0..num_secondary_audio {
-            // Secondary audio adds 1-byte num_secondary_audio_extra_pid
-            // + N additional PID bytes per entry — but we follow the
-            // simplified layout (same as primary audio) per BD-ROM
-            // Part 3 §5.4.4.4. Anything trailing is skipped by the
-            // stream_attributes length envelope.
-            t.secondary_audio.push(parse_secondary_audio_stream(r)?);
-        }
-        for _ in 0..num_secondary_video {
-            t.secondary_video.push(parse_secondary_video_stream(r)?);
-        }
-        for _ in 0..num_pip_pg {
-            t.pip_pg.push(parse_pip_pg_stream(r)?);
-        }
-        t
-    } else {
-        StnTable::default()
-    };
+    if stn_body_end > r.buf.len() {
+        return Err(BlurayError::malformed("STN_table overruns buffer"));
+    }
+    let stn_table = parse_stn_table(r, stn_body_end)?;
     r.seek(stn_body_end)?;
 
     // Skip any tail bytes (`length` covers everything from here).
@@ -2028,74 +2820,7 @@ fn encode_play_item(out: &mut Vec<u8>, pi: &PlayItem) {
         }
     }
 
-    // STN_table() — 14-byte header (2 reserved + 7 counts + 5 reserved)
-    // followed by one (stream_entry + stream_attributes) pair per
-    // stream in the canonical class order.
-    let stn_len_off = out.len();
-    out.extend_from_slice(&[0u8; 2]); // placeholder for STN body length
-    let stn_body_start = out.len();
-    out.extend_from_slice(&[0u8; 2]); // 2 reserved
-    out.push(pi.stn_table.primary_video.len() as u8);
-    out.push(pi.stn_table.primary_audio.len() as u8);
-    out.push(pi.stn_table.pg_subtitles.len() as u8);
-    out.push(pi.stn_table.ig_streams.len() as u8);
-    out.push(pi.stn_table.secondary_audio.len() as u8);
-    out.push(pi.stn_table.secondary_video.len() as u8);
-    out.push(pi.stn_table.pip_pg.len() as u8);
-    out.extend_from_slice(&[0u8; 5]); // 5 reserved
-
-    for s in &pi.stn_table.primary_video {
-        encode_video_stream(
-            out,
-            s.elementary_pid,
-            s.coding_type,
-            s.video_format,
-            s.frame_rate,
-            s.aspect_ratio,
-        );
-    }
-    for s in &pi.stn_table.primary_audio {
-        encode_audio_stream(
-            out,
-            s.elementary_pid,
-            s.coding_type,
-            s.audio_format,
-            s.sample_rate,
-            &s.language_code,
-        );
-    }
-    for s in &pi.stn_table.pg_subtitles {
-        encode_language_stream(out, s.elementary_pid, s.coding_type, &s.language_code);
-    }
-    for s in &pi.stn_table.ig_streams {
-        encode_language_stream(out, s.elementary_pid, s.coding_type, &s.language_code);
-    }
-    for s in &pi.stn_table.secondary_audio {
-        encode_audio_stream(
-            out,
-            s.elementary_pid,
-            s.coding_type,
-            s.audio_format,
-            s.sample_rate,
-            &s.language_code,
-        );
-    }
-    for s in &pi.stn_table.secondary_video {
-        encode_video_stream(
-            out,
-            s.elementary_pid,
-            s.coding_type,
-            s.video_format,
-            s.frame_rate,
-            s.aspect_ratio,
-        );
-    }
-    for s in &pi.stn_table.pip_pg {
-        encode_language_stream(out, s.elementary_pid, s.coding_type, &s.language_code);
-    }
-
-    let stn_body_len = (out.len() - stn_body_start) as u16;
-    out[stn_len_off..stn_len_off + 2].copy_from_slice(&stn_body_len.to_be_bytes());
+    encode_stn_table(out, &pi.stn_table);
 
     let body_len = (out.len() - body_start) as u16;
     out[len_off..len_off + 2].copy_from_slice(&body_len.to_be_bytes());
@@ -2105,251 +2830,324 @@ fn encode_play_item(out: &mut Vec<u8>, pi: &PlayItem) {
 //
 // Each per-stream record is two length-prefixed blocks:
 //
-//   stream_entry:
-//     length            u8     (count of payload bytes after this byte)
-//     stream_type       u8     1 = in-mux elementary stream from main Clip
-//                              2/3/4 = from a SubPath / overlay (unused here)
-//     ref_to_stream_PID u16    big-endian elementary PID (type 1 only)
-//     [padding to `length`]
+//   stream_entry:      length u8 (9 on every observed playlist), type u8,
+//                      type-specific body — see `StreamEntry`.
+//   stream_attributes: length u8, stream_coding_type u8, per-codec bytes.
 //
-//   stream_attributes:
-//     length             u8
-//     stream_coding_type u8
-//     [per-codec attribute bytes]
-//     [padding to `length`]
+// Secondary audio adds `comb_info_Secondary_audio_Primary_audio()`;
+// secondary video adds `comb_info_Secondary_video_Secondary_audio()` +
+// `comb_info_Secondary_video_PiP_PG_textST()`. Each comb_info is
+// `count u8 | reserved u8 | count × id u8 | one pad byte if count is odd`
+// (`docs/container/bluray/stn-table-observed.md` §1).
 //
-// The parser reads only the fields it surfaces; everything in the
-// length envelope past the recognised fields is skipped — that's both
-// how the spec allows authoring tools to add new attribute bytes and
-// how we stay forward-compatible with codecs we haven't enumerated.
+// Everything is parsed against the recorded lengths: bytes past the
+// recognised fields inside a length envelope are skipped, and every
+// envelope is bounded by the enclosing STN_table length.
 
-/// Parse the `stream_entry` block. Returns the elementary PID (zero
-/// when the entry is non-in-mux — type 2/3/4 carry a SubPath ref + ref
-/// stream ID instead of a direct PID; we leave those at zero rather
-/// than fabricating a value).
-fn parse_stream_entry(r: &mut Reader<'_>) -> Result<u16> {
+/// Read one length-prefixed sub-block bounded by `limit`; returns the
+/// body slice and advances past it.
+fn read_len8_block<'a>(r: &mut Reader<'a>, limit: usize, what: &str) -> Result<&'a [u8]> {
     let len = r.read_u8()? as usize;
-    let start = r.pos;
-    let end = start + len;
-    if end > r.buf.len() {
-        return Err(BlurayError::malformed("stream_entry overruns buffer"));
+    if r.pos + len > limit {
+        return Err(BlurayError::malformed(format!("{what} overruns its table")));
     }
-    let pid = if len >= 3 {
-        let stream_type = r.read_u8()?;
-        if stream_type == 1 {
-            r.read_u16()?
-        } else {
-            // Non-in-mux: leave PID at 0 — the demuxer won't see this
-            // PID on the main TS anyway, so the muxer-relevant field
-            // is absent.
-            0
+    r.slice(len)
+}
+
+/// Parse one `stream_entry()` bounded by `limit`.
+fn parse_stream_entry(r: &mut Reader<'_>, limit: usize) -> Result<StreamEntry> {
+    let body = read_len8_block(r, limit, "stream_entry")?;
+    Ok(StreamEntry::from_body(body))
+}
+
+/// The decoded fields of a `stream_attributes()` block. Video carries
+/// `video_format|frame_rate` + `aspect_ratio`; audio carries
+/// `presentation_type|sampling_frequency` + language; graphics carry
+/// the language directly after the coding type.
+#[derive(Default)]
+struct Attrs {
+    coding: u8,
+    nibbles: u8,
+    aspect: u8,
+    lang: [u8; 3],
+}
+
+fn parse_stream_attributes(r: &mut Reader<'_>, limit: usize) -> Result<Attrs> {
+    let body = read_len8_block(r, limit, "stream_attributes")?;
+    let mut a = Attrs::default();
+    let Some((&coding, rest)) = body.split_first() else {
+        return Ok(a);
+    };
+    a.coding = coding;
+    let ct = StreamCodingType::from_raw(coding);
+    if ct.is_graphics() {
+        if rest.len() >= 3 {
+            a.lang.copy_from_slice(&rest[..3]);
         }
     } else {
-        0
-    };
-    r.seek(end)?;
-    Ok(pid)
+        if let Some(&b) = rest.first() {
+            a.nibbles = b;
+        }
+        if ct.is_video() {
+            if let Some(&b) = rest.get(1) {
+                a.aspect = (b >> 4) & 0xF;
+            }
+        } else if rest.len() >= 4 {
+            a.lang.copy_from_slice(&rest[1..4]);
+        }
+    }
+    Ok(a)
 }
 
-fn encode_stream_entry(out: &mut Vec<u8>, pid: u16) {
-    // Fixed 9-byte payload (the spec-canonical in-mux entry length).
-    let payload_len: u8 = 9;
-    out.push(payload_len);
-    let start = out.len();
-    out.push(1); // stream_type = 1 (in-mux)
-    out.extend_from_slice(&pid.to_be_bytes());
-    // Pad to `payload_len` bytes with zeros.
-    while out.len() - start < payload_len as usize {
+/// Parse one comb_info block: `count | reserved | ids… | pad if odd`.
+fn parse_comb_info(r: &mut Reader<'_>, limit: usize) -> Result<Vec<u8>> {
+    if r.pos + 2 > limit {
+        return Err(BlurayError::malformed("comb_info overruns its table"));
+    }
+    let n = r.read_u8()? as usize;
+    r.skip(1)?; // reserved_for_word_align
+    let padded = n + (n & 1);
+    if r.pos + padded > limit {
+        return Err(BlurayError::malformed("comb_info ids overrun its table"));
+    }
+    let ids = r.slice(n)?.to_vec();
+    r.skip(n & 1)?;
+    Ok(ids)
+}
+
+fn encode_comb_info(out: &mut Vec<u8>, ids: &[u8]) {
+    let n = ids.len().min(255);
+    out.push(n as u8);
+    out.push(0);
+    out.extend_from_slice(&ids[..n]);
+    if n & 1 == 1 {
         out.push(0);
     }
 }
 
-fn parse_primary_video_stream(r: &mut Reader<'_>) -> Result<PrimaryVideoStream> {
-    let elementary_pid = parse_stream_entry(r)?;
-    let len = r.read_u8()? as usize;
-    let start = r.pos;
-    let end = start + len;
-    if end > r.buf.len() {
-        return Err(BlurayError::malformed("video stream_attributes overruns"));
+fn video_record(entry: StreamEntry, a: &Attrs) -> PrimaryVideoStream {
+    PrimaryVideoStream::new(0, StreamCodingType::from_raw(a.coding))
+        .with_entry(entry)
+        .with_video_format(a.nibbles >> 4)
+        .with_frame_rate(a.nibbles & 0xF)
+        .with_aspect_ratio(a.aspect)
+}
+
+fn audio_record(entry: StreamEntry, a: &Attrs) -> PrimaryAudioStream {
+    PrimaryAudioStream::new(0, StreamCodingType::from_raw(a.coding))
+        .with_entry(entry)
+        .with_audio_format(a.nibbles >> 4)
+        .with_sample_rate(a.nibbles & 0xF)
+        .with_language_code(a.lang)
+}
+
+/// Parse one video `stream_entry()` + `stream_attributes()` pair.
+pub(crate) fn parse_video_pair(r: &mut Reader<'_>, limit: usize) -> Result<PrimaryVideoStream> {
+    let entry = parse_stream_entry(r, limit)?;
+    let a = parse_stream_attributes(r, limit)?;
+    Ok(video_record(entry, &a))
+}
+
+/// Parse the body of an `STN_table()` (everything after its 16-bit
+/// length), bounded by `end`.
+fn parse_stn_table(r: &mut Reader<'_>, end: usize) -> Result<StnTable> {
+    if r.pos + 14 > end {
+        // Too short for the header — tolerate as an empty table.
+        return Ok(StnTable::default());
     }
-    let coding_raw = if len >= 1 { r.read_u8()? } else { 0 };
-    let (video_format, frame_rate) = if r.pos < end {
-        let b = r.read_u8()?;
-        ((b >> 4) & 0xF, b & 0xF)
-    } else {
-        (0, 0)
+    r.skip(2)?; // reserved
+    let n_pv = r.read_u8()? as usize;
+    let n_pa = r.read_u8()? as usize;
+    let n_pg = r.read_u8()? as usize;
+    let n_ig = r.read_u8()? as usize;
+    let n_sa = r.read_u8()? as usize;
+    let n_sv = r.read_u8()? as usize;
+    let n_pip_pg = r.read_u8()? as usize;
+    let eighth_count = r.read_u8()?;
+    r.skip(4)?; // reserved
+
+    let mut t = StnTable {
+        eighth_count,
+        ..StnTable::default()
     };
-    let aspect_ratio = if r.pos < end {
-        (r.read_u8()? >> 4) & 0xF
-    } else {
-        0
+    for _ in 0..n_pv {
+        t.primary_video.push(parse_video_pair(r, end)?);
+    }
+    for _ in 0..n_pa {
+        let entry = parse_stream_entry(r, end)?;
+        let a = parse_stream_attributes(r, end)?;
+        t.primary_audio.push(audio_record(entry, &a));
+    }
+    // PiP PG entries are appended to the PG loop.
+    for i in 0..n_pg + n_pip_pg {
+        let entry = parse_stream_entry(r, end)?;
+        let a = parse_stream_attributes(r, end)?;
+        let coding = StreamCodingType::from_raw(a.coding);
+        if i < n_pg {
+            t.pg_subtitles.push(
+                PgsSubtitleStream::new(0, coding)
+                    .with_entry(entry)
+                    .with_language_code(a.lang),
+            );
+        } else {
+            t.pip_pg.push(
+                PipPgStream::new(0, coding)
+                    .with_entry(entry)
+                    .with_language_code(a.lang),
+            );
+        }
+    }
+    for _ in 0..n_ig {
+        let entry = parse_stream_entry(r, end)?;
+        let a = parse_stream_attributes(r, end)?;
+        t.ig_streams.push(
+            IgsInteractiveStream::new(0, StreamCodingType::from_raw(a.coding))
+                .with_entry(entry)
+                .with_language_code(a.lang),
+        );
+    }
+    for _ in 0..n_sa {
+        let entry = parse_stream_entry(r, end)?;
+        let a = parse_stream_attributes(r, end)?;
+        let refs = parse_comb_info(r, end)?;
+        t.secondary_audio.push(
+            SecondaryAudioStream::new(0, StreamCodingType::from_raw(a.coding))
+                .with_entry(entry)
+                .with_audio_format(a.nibbles >> 4)
+                .with_sample_rate(a.nibbles & 0xF)
+                .with_language_code(a.lang)
+                .with_primary_audio_refs(refs),
+        );
+    }
+    for _ in 0..n_sv {
+        let entry = parse_stream_entry(r, end)?;
+        let a = parse_stream_attributes(r, end)?;
+        let sa_refs = parse_comb_info(r, end)?;
+        let pg_refs = parse_comb_info(r, end)?;
+        t.secondary_video.push(
+            SecondaryVideoStream::new(0, StreamCodingType::from_raw(a.coding))
+                .with_entry(entry)
+                .with_video_format(a.nibbles >> 4)
+                .with_frame_rate(a.nibbles & 0xF)
+                .with_aspect_ratio(a.aspect)
+                .with_secondary_audio_refs(sa_refs)
+                .with_pip_pg_refs(pg_refs),
+        );
+    }
+    Ok(t)
+}
+
+/// Encoder-side stream entry: a type-1 entry is written from
+/// `elementary_pid` (so a hand-built record that only set the PID
+/// still encodes), any other type from the entry itself.
+fn encode_stream_entry(out: &mut Vec<u8>, entry: &StreamEntry, pid: u16) {
+    let e = match entry {
+        StreamEntry::MainClip { .. } => StreamEntry::main_clip(pid),
+        other => *other,
     };
-    r.seek(end)?;
-    Ok(PrimaryVideoStream {
-        elementary_pid,
-        coding_type: StreamCodingType::from_raw(coding_raw),
-        video_format,
-        frame_rate,
-        aspect_ratio,
-    })
+    out.extend_from_slice(&e.to_bytes());
 }
 
-fn parse_primary_audio_stream(r: &mut Reader<'_>) -> Result<PrimaryAudioStream> {
-    let elementary_pid = parse_stream_entry(r)?;
-    let len = r.read_u8()? as usize;
-    let start = r.pos;
-    let end = start + len;
-    if end > r.buf.len() {
-        return Err(BlurayError::malformed("audio stream_attributes overruns"));
-    }
-    let coding_raw = if len >= 1 { r.read_u8()? } else { 0 };
-    let (audio_format, sample_rate) = if r.pos < end {
-        let b = r.read_u8()?;
-        ((b >> 4) & 0xF, b & 0xF)
-    } else {
-        (0, 0)
-    };
-    let mut language_code = [0u8; 3];
-    if r.pos + 3 <= end {
-        language_code.copy_from_slice(r.slice(3)?);
-    }
-    r.seek(end)?;
-    Ok(PrimaryAudioStream {
-        elementary_pid,
-        coding_type: StreamCodingType::from_raw(coding_raw),
-        audio_format,
-        sample_rate,
-        language_code,
-    })
-}
-
-fn parse_language_stream(r: &mut Reader<'_>) -> Result<(u16, StreamCodingType, [u8; 3])> {
-    let elementary_pid = parse_stream_entry(r)?;
-    let len = r.read_u8()? as usize;
-    let start = r.pos;
-    let end = start + len;
-    if end > r.buf.len() {
-        return Err(BlurayError::malformed(
-            "graphics stream_attributes overruns",
-        ));
-    }
-    let coding_raw = if len >= 1 { r.read_u8()? } else { 0 };
-    let mut language_code = [0u8; 3];
-    if r.pos + 3 <= end {
-        language_code.copy_from_slice(r.slice(3)?);
-    }
-    r.seek(end)?;
-    Ok((
-        elementary_pid,
-        StreamCodingType::from_raw(coding_raw),
-        language_code,
-    ))
-}
-
-fn parse_pg_subtitle_stream(r: &mut Reader<'_>) -> Result<PgsSubtitleStream> {
-    let (elementary_pid, coding_type, language_code) = parse_language_stream(r)?;
-    Ok(PgsSubtitleStream {
-        elementary_pid,
-        coding_type,
-        language_code,
-    })
-}
-
-fn parse_ig_stream(r: &mut Reader<'_>) -> Result<IgsInteractiveStream> {
-    let (elementary_pid, coding_type, language_code) = parse_language_stream(r)?;
-    Ok(IgsInteractiveStream {
-        elementary_pid,
-        coding_type,
-        language_code,
-    })
-}
-
-fn parse_secondary_audio_stream(r: &mut Reader<'_>) -> Result<SecondaryAudioStream> {
-    let p = parse_primary_audio_stream(r)?;
-    Ok(SecondaryAudioStream {
-        elementary_pid: p.elementary_pid,
-        coding_type: p.coding_type,
-        audio_format: p.audio_format,
-        sample_rate: p.sample_rate,
-        language_code: p.language_code,
-    })
-}
-
-fn parse_secondary_video_stream(r: &mut Reader<'_>) -> Result<SecondaryVideoStream> {
-    let p = parse_primary_video_stream(r)?;
-    Ok(SecondaryVideoStream {
-        elementary_pid: p.elementary_pid,
-        coding_type: p.coding_type,
-        video_format: p.video_format,
-        frame_rate: p.frame_rate,
-        aspect_ratio: p.aspect_ratio,
-    })
-}
-
-fn parse_pip_pg_stream(r: &mut Reader<'_>) -> Result<PipPgStream> {
-    let (elementary_pid, coding_type, language_code) = parse_language_stream(r)?;
-    Ok(PipPgStream {
-        elementary_pid,
-        coding_type,
-        language_code,
-    })
-}
-
-fn encode_video_stream(
-    out: &mut Vec<u8>,
-    pid: u16,
-    coding: StreamCodingType,
-    video_format: u8,
-    frame_rate: u8,
-    aspect_ratio: u8,
-) {
-    encode_stream_entry(out, pid);
-    let attr_len: u8 = 5;
-    out.push(attr_len);
-    let start = out.len();
+fn encode_video_attrs(out: &mut Vec<u8>, coding: StreamCodingType, vf: u8, fr: u8, ar: u8) {
+    out.push(5);
     out.push(coding.as_raw());
-    out.push(((video_format & 0xF) << 4) | (frame_rate & 0xF));
-    out.push((aspect_ratio & 0xF) << 4);
-    while out.len() - start < attr_len as usize {
-        out.push(0);
-    }
+    out.push(((vf & 0xF) << 4) | (fr & 0xF));
+    out.push((ar & 0xF) << 4);
+    out.extend_from_slice(&[0, 0]);
 }
 
-fn encode_audio_stream(
-    out: &mut Vec<u8>,
-    pid: u16,
-    coding: StreamCodingType,
-    audio_format: u8,
-    sample_rate: u8,
-    language_code: &[u8; 3],
-) {
-    encode_stream_entry(out, pid);
-    let attr_len: u8 = 6;
-    out.push(attr_len);
-    let start = out.len();
+fn encode_audio_attrs(out: &mut Vec<u8>, coding: StreamCodingType, af: u8, sr: u8, lang: &[u8; 3]) {
+    out.push(5);
     out.push(coding.as_raw());
-    out.push(((audio_format & 0xF) << 4) | (sample_rate & 0xF));
-    out.extend_from_slice(language_code);
-    while out.len() - start < attr_len as usize {
-        out.push(0);
-    }
+    out.push(((af & 0xF) << 4) | (sr & 0xF));
+    out.extend_from_slice(lang);
 }
 
-fn encode_language_stream(
-    out: &mut Vec<u8>,
-    pid: u16,
-    coding: StreamCodingType,
-    language_code: &[u8; 3],
-) {
-    encode_stream_entry(out, pid);
-    let attr_len: u8 = 4;
-    out.push(attr_len);
-    let start = out.len();
+fn encode_graphics_attrs(out: &mut Vec<u8>, coding: StreamCodingType, lang: &[u8; 3]) {
+    out.push(5);
     out.push(coding.as_raw());
-    out.extend_from_slice(language_code);
-    while out.len() - start < attr_len as usize {
-        out.push(0);
+    out.extend_from_slice(lang);
+    out.push(0);
+}
+
+/// Encode one video `stream_entry()` + `stream_attributes()` pair.
+pub(crate) fn encode_video_pair(out: &mut Vec<u8>, s: &PrimaryVideoStream) {
+    encode_stream_entry(out, &s.entry, s.elementary_pid);
+    encode_video_attrs(
+        out,
+        s.coding_type,
+        s.video_format,
+        s.frame_rate,
+        s.aspect_ratio,
+    );
+}
+
+/// Encode an `STN_table()` including its 16-bit length.
+fn encode_stn_table(out: &mut Vec<u8>, t: &StnTable) {
+    let len_off = out.len();
+    out.extend_from_slice(&[0u8; 2]);
+    let body_start = out.len();
+    out.extend_from_slice(&[0u8; 2]); // reserved
+    out.push(t.primary_video.len() as u8);
+    out.push(t.primary_audio.len() as u8);
+    out.push(t.pg_subtitles.len() as u8);
+    out.push(t.ig_streams.len() as u8);
+    out.push(t.secondary_audio.len() as u8);
+    out.push(t.secondary_video.len() as u8);
+    out.push(t.pip_pg.len() as u8);
+    out.push(t.eighth_count);
+    out.extend_from_slice(&[0u8; 4]); // reserved
+
+    for s in &t.primary_video {
+        encode_video_pair(out, s);
     }
+    for s in &t.primary_audio {
+        encode_stream_entry(out, &s.entry, s.elementary_pid);
+        encode_audio_attrs(
+            out,
+            s.coding_type,
+            s.audio_format,
+            s.sample_rate,
+            &s.language_code,
+        );
+    }
+    for s in &t.pg_subtitles {
+        encode_stream_entry(out, &s.entry, s.elementary_pid);
+        encode_graphics_attrs(out, s.coding_type, &s.language_code);
+    }
+    for s in &t.pip_pg {
+        encode_stream_entry(out, &s.entry, s.elementary_pid);
+        encode_graphics_attrs(out, s.coding_type, &s.language_code);
+    }
+    for s in &t.ig_streams {
+        encode_stream_entry(out, &s.entry, s.elementary_pid);
+        encode_graphics_attrs(out, s.coding_type, &s.language_code);
+    }
+    for s in &t.secondary_audio {
+        encode_stream_entry(out, &s.entry, s.elementary_pid);
+        encode_audio_attrs(
+            out,
+            s.coding_type,
+            s.audio_format,
+            s.sample_rate,
+            &s.language_code,
+        );
+        encode_comb_info(out, &s.primary_audio_refs);
+    }
+    for s in &t.secondary_video {
+        encode_stream_entry(out, &s.entry, s.elementary_pid);
+        encode_video_attrs(
+            out,
+            s.coding_type,
+            s.video_format,
+            s.frame_rate,
+            s.aspect_ratio,
+        );
+        encode_comb_info(out, &s.secondary_audio_refs);
+        encode_comb_info(out, &s.pip_pg_refs);
+    }
+    let body_len = (out.len() - body_start) as u16;
+    out[len_off..len_off + 2].copy_from_slice(&body_len.to_be_bytes());
 }
 
 fn parse_sub_path(r: &mut Reader<'_>) -> Result<SubPath> {
@@ -2404,29 +3202,11 @@ fn parse_sub_play_item(r: &mut Reader<'_>) -> Result<SubPlayItem> {
     let out_time_ticks = r.read_u32()?;
     let sync_play_item_id = r.read_u16()?;
     let sync_start_pts_ticks = r.read_u32()?;
+    if body_end > r.buf.len() {
+        return Err(BlurayError::malformed("SubPlayItem overruns buffer"));
+    }
     let multi_clips = if is_multi_clip_entries {
-        let num_entries = r.read_u8()?;
-        r.skip(1)?; // reserved
-        // Entry id 0 is the header clip above; ids 1..n follow as
-        // 10-byte records (5-byte name + 4-byte codec + 1-byte STC id).
-        let extra = num_entries.saturating_sub(1) as usize;
-        let mut clips = Vec::with_capacity(extra.min(64));
-        for _ in 0..extra {
-            let stem_bytes = r.slice(5)?;
-            let clip_information_file_name = std::str::from_utf8(stem_bytes)
-                .map_err(|_| BlurayError::malformed("SubPlayItem multi-clip name not ASCII"))?
-                .to_string();
-            let codec_bytes = r.slice(4)?;
-            let mut clip_codec_identifier = [0u8; 4];
-            clip_codec_identifier.copy_from_slice(codec_bytes);
-            let stc_id_ref = r.read_u8()?;
-            clips.push(SubPlayItemClip {
-                clip_information_file_name,
-                clip_codec_identifier,
-                stc_id_ref,
-            });
-        }
-        clips
+        parse_multi_clip_entries(r, body_end)?
     } else {
         Vec::new()
     };
@@ -2443,6 +3223,58 @@ fn parse_sub_play_item(r: &mut Reader<'_>) -> Result<SubPlayItem> {
         sync_start_pts_ticks,
         multi_clips,
     })
+}
+
+/// Parse the multi-clip extension of a `SubPlayItem()` against its
+/// recorded length (`docs/container/bluray/stn-table-observed.md` §4).
+///
+/// Two layouts exist in the evidence: `count, reserved` + 10-byte
+/// entries (observed), and `reserved, count` + 11-byte entries (an
+/// older printed syntax). The count is the **total** clip count
+/// including entry 0, so `count − 1` entries follow; of the two bytes
+/// after `sync_start_PTS_of_PlayItem` the non-zero one is the count.
+/// The entry stride is then derived from the bytes left in the
+/// SubPlayItem (`remaining / (count − 1)`); each entry's first 10
+/// bytes are `Clip_Information_file_name` (5), `Clip_codec_identifier`
+/// (4) and `ref_to_STC_id` (1), anything past that is skipped.
+fn parse_multi_clip_entries(r: &mut Reader<'_>, body_end: usize) -> Result<Vec<SubPlayItemClip>> {
+    if r.pos + 2 > body_end {
+        return Err(BlurayError::malformed(
+            "SubPlayItem multi-clip header overruns its length",
+        ));
+    }
+    let b0 = r.read_u8()?;
+    let b1 = r.read_u8()?;
+    let count = if b0 != 0 { b0 } else { b1 };
+    let extra = count.saturating_sub(1) as usize;
+    if extra == 0 {
+        return Ok(Vec::new());
+    }
+    let remaining = body_end - r.pos;
+    let stride = remaining / extra;
+    if stride < 10 {
+        return Err(BlurayError::malformed(format!(
+            "SubPlayItem multi-clip entries: {extra} entries in {remaining} bytes"
+        )));
+    }
+    let mut clips = Vec::with_capacity(extra);
+    for _ in 0..extra {
+        let entry_start = r.pos;
+        let stem_bytes = r.slice(5)?;
+        let clip_information_file_name = std::str::from_utf8(stem_bytes)
+            .map_err(|_| BlurayError::malformed("SubPlayItem multi-clip name not ASCII"))?
+            .to_string();
+        let mut clip_codec_identifier = [0u8; 4];
+        clip_codec_identifier.copy_from_slice(r.slice(4)?);
+        let stc_id_ref = r.read_u8()?;
+        clips.push(SubPlayItemClip {
+            clip_information_file_name,
+            clip_codec_identifier,
+            stc_id_ref,
+        });
+        r.seek(entry_start + stride)?;
+    }
+    Ok(clips)
 }
 
 fn encode_sub_path(out: &mut Vec<u8>, sp: &SubPath) {
@@ -2510,6 +3342,7 @@ mod tests {
 
     fn sample_mpls() -> PlayListMpls {
         PlayListMpls {
+            extension: Default::default(),
             version: *b"0200",
             app_info: AppInfoPlayList {
                 playback_type: 1,
@@ -2531,20 +3364,18 @@ mod tests {
                         multi_clip_count: 1,
                         angles: Vec::new(),
                         stn_table: StnTable {
-                            primary_video: vec![PrimaryVideoStream {
-                                elementary_pid: 0x1011,
-                                coding_type: StreamCodingType::AvcVideo,
-                                video_format: 0x06,
-                                frame_rate: 0x03,
-                                aspect_ratio: 0x03,
-                            }],
-                            primary_audio: vec![PrimaryAudioStream {
-                                elementary_pid: 0x1100,
-                                coding_type: StreamCodingType::Ac3Audio,
-                                audio_format: 0x03,
-                                sample_rate: 0x01,
-                                language_code: *b"eng",
-                            }],
+                            primary_video: vec![
+                                PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+                                    .with_video_format(0x06)
+                                    .with_frame_rate(0x03)
+                                    .with_aspect_ratio(0x03),
+                            ],
+                            primary_audio: vec![
+                                PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+                                    .with_audio_format(0x03)
+                                    .with_sample_rate(0x01)
+                                    .with_language_code(*b"eng"),
+                            ],
                             ..StnTable::default()
                         },
                         flags: PlayItemFlags::default(),
@@ -2559,34 +3390,26 @@ mod tests {
                         multi_clip_count: 1,
                         angles: Vec::new(),
                         stn_table: StnTable {
-                            primary_video: vec![PrimaryVideoStream {
-                                elementary_pid: 0x1011,
-                                coding_type: StreamCodingType::AvcVideo,
-                                video_format: 0x06,
-                                frame_rate: 0x03,
-                                aspect_ratio: 0x03,
-                            }],
-                            primary_audio: vec![
-                                PrimaryAudioStream {
-                                    elementary_pid: 0x1100,
-                                    coding_type: StreamCodingType::Ac3Audio,
-                                    audio_format: 0x03,
-                                    sample_rate: 0x01,
-                                    language_code: *b"eng",
-                                },
-                                PrimaryAudioStream {
-                                    elementary_pid: 0x1101,
-                                    coding_type: StreamCodingType::DtsHdMaAudio,
-                                    audio_format: 0x06,
-                                    sample_rate: 0x01,
-                                    language_code: *b"jpn",
-                                },
+                            primary_video: vec![
+                                PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+                                    .with_video_format(0x06)
+                                    .with_frame_rate(0x03)
+                                    .with_aspect_ratio(0x03),
                             ],
-                            pg_subtitles: vec![PgsSubtitleStream {
-                                elementary_pid: 0x1200,
-                                coding_type: StreamCodingType::PgsSubtitle,
-                                language_code: *b"eng",
-                            }],
+                            primary_audio: vec![
+                                PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+                                    .with_audio_format(0x03)
+                                    .with_sample_rate(0x01)
+                                    .with_language_code(*b"eng"),
+                                PrimaryAudioStream::new(0x1101, StreamCodingType::DtsHdMaAudio)
+                                    .with_audio_format(0x06)
+                                    .with_sample_rate(0x01)
+                                    .with_language_code(*b"jpn"),
+                            ],
+                            pg_subtitles: vec![
+                                PgsSubtitleStream::new(0x1200, StreamCodingType::PgsSubtitle)
+                                    .with_language_code(*b"eng"),
+                            ],
                             ..StnTable::default()
                         },
                         flags: PlayItemFlags::default(),
@@ -3400,6 +4223,7 @@ mod tests {
     /// exercise the round-trip + the [`PlayItem::angle_clip`] selector.
     fn multi_angle_mpls() -> PlayListMpls {
         PlayListMpls {
+            extension: Default::default(),
             version: *b"0200",
             app_info: AppInfoPlayList {
                 playback_type: 1,
@@ -3431,20 +4255,18 @@ mod tests {
                         },
                     ],
                     stn_table: StnTable {
-                        primary_video: vec![PrimaryVideoStream {
-                            elementary_pid: 0x1011,
-                            coding_type: StreamCodingType::AvcVideo,
-                            video_format: 0x06,
-                            frame_rate: 0x03,
-                            aspect_ratio: 0x03,
-                        }],
-                        primary_audio: vec![PrimaryAudioStream {
-                            elementary_pid: 0x1100,
-                            coding_type: StreamCodingType::Ac3Audio,
-                            audio_format: 0x03,
-                            sample_rate: 0x01,
-                            language_code: *b"eng",
-                        }],
+                        primary_video: vec![
+                            PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+                                .with_video_format(0x06)
+                                .with_frame_rate(0x03)
+                                .with_aspect_ratio(0x03),
+                        ],
+                        primary_audio: vec![
+                            PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+                                .with_audio_format(0x03)
+                                .with_sample_rate(0x01)
+                                .with_language_code(*b"eng"),
+                        ],
                         ..StnTable::default()
                     },
                     flags: PlayItemFlags::default(),
@@ -3587,6 +4409,7 @@ mod tests {
     /// remux pipeline needs.
     fn stn_table_mpls() -> PlayListMpls {
         PlayListMpls {
+            extension: Default::default(),
             version: *b"0200",
             app_info: AppInfoPlayList {
                 playback_type: 1,
@@ -3607,34 +4430,26 @@ mod tests {
                     multi_clip_count: 1,
                     angles: Vec::new(),
                     stn_table: StnTable {
-                        primary_video: vec![PrimaryVideoStream {
-                            elementary_pid: 0x1011,
-                            coding_type: StreamCodingType::AvcVideo,
-                            video_format: 0x06, // 1080p
-                            frame_rate: 0x03,   // 25 fps (BD-AV §5.4.4.4)
-                            aspect_ratio: 0x03, // 16:9
-                        }],
-                        primary_audio: vec![
-                            PrimaryAudioStream {
-                                elementary_pid: 0x1100,
-                                coding_type: StreamCodingType::Ac3Audio,
-                                audio_format: 0x03, // stereo
-                                sample_rate: 0x01,  // 48 kHz
-                                language_code: *b"eng",
-                            },
-                            PrimaryAudioStream {
-                                elementary_pid: 0x1101,
-                                coding_type: StreamCodingType::DtsHdMaAudio,
-                                audio_format: 0x06, // multichannel (5.1)
-                                sample_rate: 0x05,  // 192 kHz (BD-AV §5.4.4.4)
-                                language_code: *b"jpn",
-                            },
+                        primary_video: vec![
+                            PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+                                .with_video_format(0x06)
+                                .with_frame_rate(0x03)
+                                .with_aspect_ratio(0x03),
                         ],
-                        pg_subtitles: vec![PgsSubtitleStream {
-                            elementary_pid: 0x1200,
-                            coding_type: StreamCodingType::PgsSubtitle,
-                            language_code: *b"eng",
-                        }],
+                        primary_audio: vec![
+                            PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+                                .with_audio_format(0x03)
+                                .with_sample_rate(0x01)
+                                .with_language_code(*b"eng"),
+                            PrimaryAudioStream::new(0x1101, StreamCodingType::DtsHdMaAudio)
+                                .with_audio_format(0x06)
+                                .with_sample_rate(0x05)
+                                .with_language_code(*b"jpn"),
+                        ],
+                        pg_subtitles: vec![
+                            PgsSubtitleStream::new(0x1200, StreamCodingType::PgsSubtitle)
+                                .with_language_code(*b"eng"),
+                        ],
                         ..StnTable::default()
                     },
                     flags: PlayItemFlags::default(),
@@ -3706,30 +4521,25 @@ mod tests {
         // commercial disc doesn't always ship.
         let mut m = stn_table_mpls();
         let pi = &mut m.play_list.play_items[0];
-        pi.stn_table.ig_streams.push(IgsInteractiveStream {
-            elementary_pid: 0x1400,
-            coding_type: StreamCodingType::IgsInteractive,
-            language_code: *b"eng",
-        });
-        pi.stn_table.secondary_audio.push(SecondaryAudioStream {
-            elementary_pid: 0x1A00,
-            coding_type: StreamCodingType::EAc3SecondaryAudio,
-            audio_format: 0x03,
-            sample_rate: 0x01,
-            language_code: *b"fre",
-        });
-        pi.stn_table.secondary_video.push(SecondaryVideoStream {
-            elementary_pid: 0x1B00,
-            coding_type: StreamCodingType::AvcVideo,
-            video_format: 0x04,
-            frame_rate: 0x03,
-            aspect_ratio: 0x03,
-        });
-        pi.stn_table.pip_pg.push(PipPgStream {
-            elementary_pid: 0x1300,
-            coding_type: StreamCodingType::PgsSubtitle,
-            language_code: *b"jpn",
-        });
+        pi.stn_table.ig_streams.push(
+            IgsInteractiveStream::new(0x1400, StreamCodingType::IgsInteractive)
+                .with_language_code(*b"eng"),
+        );
+        pi.stn_table.secondary_audio.push(
+            SecondaryAudioStream::new(0x1A00, StreamCodingType::EAc3SecondaryAudio)
+                .with_audio_format(0x03)
+                .with_sample_rate(0x01)
+                .with_language_code(*b"fre"),
+        );
+        pi.stn_table.secondary_video.push(
+            SecondaryVideoStream::new(0x1B00, StreamCodingType::AvcVideo)
+                .with_video_format(0x04)
+                .with_frame_rate(0x03)
+                .with_aspect_ratio(0x03),
+        );
+        pi.stn_table.pip_pg.push(
+            PipPgStream::new(0x1300, StreamCodingType::PgsSubtitle).with_language_code(*b"jpn"),
+        );
 
         let bytes = m.encode();
         let parsed = PlayListMpls::parse(&bytes).unwrap();
@@ -3955,13 +4765,10 @@ mod tests {
     fn primary_video_stream_typed_accessors() {
         // 1080p / 23.976 / 16:9 — the most common BD-AV main-feature
         // authoring pattern.
-        let v = PrimaryVideoStream {
-            elementary_pid: 0x1011,
-            coding_type: StreamCodingType::AvcVideo,
-            video_format: 0x06,
-            frame_rate: 0x01,
-            aspect_ratio: 0x03,
-        };
+        let v = PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+            .with_video_format(0x06)
+            .with_frame_rate(0x01)
+            .with_aspect_ratio(0x03);
         assert_eq!(v.video_format_kind(), VideoFormat::Video1080p);
         assert_eq!(v.frame_rate_kind(), FrameRate::Fps23_976);
         assert_eq!(v.aspect_ratio_kind(), AspectRatio::Ratio16x9);
@@ -3971,13 +4778,10 @@ mod tests {
 
     #[test]
     fn primary_audio_stream_typed_accessors() {
-        let a = PrimaryAudioStream {
-            elementary_pid: 0x1100,
-            coding_type: StreamCodingType::DtsHdMaAudio,
-            audio_format: 0x06,
-            sample_rate: 0x04,
-            language_code: *b"eng",
-        };
+        let a = PrimaryAudioStream::new(0x1100, StreamCodingType::DtsHdMaAudio)
+            .with_audio_format(0x06)
+            .with_sample_rate(0x04)
+            .with_language_code(*b"eng");
         assert_eq!(a.audio_format_kind(), AudioFormat::Multi);
         assert_eq!(a.sample_rate_kind(), SampleRate::Hz96000);
         assert_eq!(a.audio_format_kind().channel_count(), Some(6));
@@ -3986,24 +4790,18 @@ mod tests {
 
     #[test]
     fn secondary_audio_video_typed_accessors() {
-        let sv = SecondaryVideoStream {
-            elementary_pid: 0x1B00,
-            coding_type: StreamCodingType::AvcVideo,
-            video_format: 0x05,
-            frame_rate: 0x07,
-            aspect_ratio: 0x03,
-        };
+        let sv = SecondaryVideoStream::new(0x1B00, StreamCodingType::AvcVideo)
+            .with_video_format(0x05)
+            .with_frame_rate(0x07)
+            .with_aspect_ratio(0x03);
         assert_eq!(sv.video_format_kind(), VideoFormat::Video720p);
         assert_eq!(sv.frame_rate_kind(), FrameRate::Fps59_94);
         assert_eq!(sv.aspect_ratio_kind(), AspectRatio::Ratio16x9);
 
-        let sa = SecondaryAudioStream {
-            elementary_pid: 0x1A00,
-            coding_type: StreamCodingType::EAc3SecondaryAudio,
-            audio_format: 0x03,
-            sample_rate: 0x01,
-            language_code: *b"jpn",
-        };
+        let sa = SecondaryAudioStream::new(0x1A00, StreamCodingType::EAc3SecondaryAudio)
+            .with_audio_format(0x03)
+            .with_sample_rate(0x01)
+            .with_language_code(*b"jpn");
         assert_eq!(sa.audio_format_kind(), AudioFormat::Stereo);
         assert_eq!(sa.sample_rate_kind(), SampleRate::Hz48000);
     }
@@ -4034,5 +4832,159 @@ mod tests {
         assert_eq!(pa_jpn.audio_format_kind(), AudioFormat::Multi);
         assert_eq!(pa_jpn.sample_rate_kind(), SampleRate::Hz192000);
         assert_eq!(&pa_jpn.language_code, b"jpn");
+    }
+
+    #[test]
+    fn stream_entry_types_round_trip_and_degrade() {
+        for e in [
+            StreamEntry::main_clip(0x1011),
+            StreamEntry::sub_clip(3, 2, 0x1A00),
+            StreamEntry::in_mux_sub_path(1, 0x1B01),
+            StreamEntry::enhancement_layer(0, 0x1015),
+        ] {
+            let b = e.to_bytes();
+            assert_eq!(b[0], 9);
+            assert_eq!(StreamEntry::from_body(&b[1..]), e);
+        }
+        // Too short for type 2 → Unknown with the raw body kept.
+        assert_eq!(
+            StreamEntry::from_body(&[2, 7, 8]),
+            StreamEntry::Unknown {
+                stream_type: 2,
+                body: [7, 8, 0, 0, 0, 0, 0, 0]
+            }
+        );
+        assert_eq!(StreamEntry::from_body(&[9, 1, 2]).stream_type(), 9);
+        assert_eq!(StreamEntry::from_body(&[]).pid(), None);
+        assert_eq!(StreamEntry::sub_clip(3, 2, 7).sub_clip_entry_id(), Some(2));
+        assert_eq!(StreamEntry::main_clip(7).sub_path_id(), None);
+    }
+
+    #[test]
+    fn full_stn_round_trip_with_pip_pg_and_comb_info() {
+        let mut pl = sample_mpls();
+        let t = &mut pl.play_list.play_items[0].stn_table;
+        t.pg_subtitles = vec![
+            PgsSubtitleStream::new(0x1200, StreamCodingType::PgsSubtitle)
+                .with_language_code(*b"eng"),
+        ];
+        t.pip_pg = vec![
+            PipPgStream::new(0, StreamCodingType::PgsSubtitle)
+                .with_entry(StreamEntry::in_mux_sub_path(0, 0x1240))
+                .with_language_code(*b"fra"),
+        ];
+        t.ig_streams = vec![
+            IgsInteractiveStream::new(0x1400, StreamCodingType::IgsInteractive)
+                .with_language_code(*b"jpn"),
+        ];
+        t.secondary_audio = vec![
+            SecondaryAudioStream::new(0, StreamCodingType::EAc3SecondaryAudio)
+                .with_entry(StreamEntry::sub_clip(0, 1, 0x1A00))
+                .with_audio_format(3)
+                .with_sample_rate(1)
+                .with_language_code(*b"eng")
+                .with_primary_audio_refs(vec![0, 1, 2]),
+        ];
+        t.secondary_video = vec![
+            SecondaryVideoStream::new(0, StreamCodingType::AvcVideo)
+                .with_entry(StreamEntry::in_mux_sub_path(0, 0x1B00))
+                .with_video_format(5)
+                .with_frame_rate(1)
+                .with_secondary_audio_refs(vec![0])
+                .with_pip_pg_refs(vec![0, 1]),
+        ];
+        t.eighth_count = 0;
+        let bytes = pl.encode();
+        let back = PlayListMpls::parse(&bytes).unwrap();
+        assert_eq!(
+            back.play_list.play_items[0].stn_table,
+            pl.play_list.play_items[0].stn_table
+        );
+        // PiP PG lives in the PG loop: the count byte is PG-only, the
+        // PiP-plus count separate, and the PiP entry is encoded right
+        // after the PG entries (before IG).
+        let pg_entry = StreamEntry::in_mux_sub_path(0, 0x1240).to_bytes();
+        let ig_entry = StreamEntry::main_clip(0x1400).to_bytes();
+        let pos = |needle: &[u8]| bytes.windows(needle.len()).position(|w| w == needle);
+        assert!(pos(&pg_entry).unwrap() < pos(&ig_entry).unwrap());
+        assert_eq!(bytes.len(), pl.encode().len());
+        assert_eq!(PlayListMpls::parse(&bytes).unwrap().encode(), bytes);
+    }
+
+    fn sub_play_item_bytes(tail: &[u8], multi: bool) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"00010M2TS");
+        b.extend_from_slice(&((1u32 << 1) | u32::from(multi)).to_be_bytes());
+        b.push(0); // STC
+        b.extend_from_slice(&100u32.to_be_bytes());
+        b.extend_from_slice(&200u32.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&100u32.to_be_bytes());
+        b.extend_from_slice(tail);
+        let mut out = (b.len() as u16).to_be_bytes().to_vec();
+        out.extend_from_slice(&b);
+        out
+    }
+
+    #[test]
+    fn multi_clip_entries_parse_either_byte_order_and_stride() {
+        // Observed layout: count first, 10-byte entries.
+        let mut tail = vec![3, 0];
+        tail.extend_from_slice(b"00011M2TS\x01");
+        tail.extend_from_slice(b"00012M2TS\x02");
+        let buf = sub_play_item_bytes(&tail, true);
+        let spi = parse_sub_play_item(&mut Reader::new(&buf)).unwrap();
+        assert_eq!(spi.num_clips(), 3);
+        assert_eq!(
+            spi.clip_entry(2).unwrap().clip_information_file_name,
+            "00012"
+        );
+        assert_eq!(spi.clip_entry(2).unwrap().stc_id_ref, 2);
+
+        // Older printed layout: reserved first, 11-byte entries.
+        let mut tail = vec![0, 3];
+        tail.extend_from_slice(b"00011M2TS\x01\x00");
+        tail.extend_from_slice(b"00012M2TS\x02\x00");
+        let buf = sub_play_item_bytes(&tail, true);
+        let spi2 = parse_sub_play_item(&mut Reader::new(&buf)).unwrap();
+        assert_eq!(spi2.multi_clips, spi.multi_clips);
+
+        // Count past what the length can hold → malformed, not a panic.
+        let buf = sub_play_item_bytes(&[9, 0, 1, 2, 3], true);
+        assert!(parse_sub_play_item(&mut Reader::new(&buf)).is_err());
+
+        // A count of 1 (entry 0 only) carries no extra entries.
+        let buf = sub_play_item_bytes(&[1, 0], true);
+        let spi3 = parse_sub_play_item(&mut Reader::new(&buf)).unwrap();
+        assert_eq!(spi3.num_clips(), 1);
+    }
+
+    #[test]
+    fn stn_table_ss_and_sub_path_extension_round_trip() {
+        let mut pl = sample_mpls();
+        let dv = PrimaryVideoStream::new(0, StreamCodingType::MvcDependentVideo)
+            .with_entry(StreamEntry::sub_clip(0, 0, 0x1012))
+            .with_video_format(7)
+            .with_frame_rate(3);
+        let ss = vec![
+            StnTableSs::new(Some(dv)).with_trailing(vec![0, 1, 0xFF, 0]),
+            StnTableSs::new(Some(dv)).with_flags(0x8000),
+        ];
+        let sp = SubPath {
+            sub_path_type: 8,
+            is_repeat_subpath: false,
+            sub_play_items: pl.play_list.sub_paths[0].sub_play_items.clone(),
+        };
+        pl.extension = PlayListExtension::stereoscopic(ss.clone(), vec![sp.clone()]);
+        assert_eq!(pl.extension.stn_table_ss, ss);
+        assert!(pl.extension.stn_table_ss[1].fixed_offset_during_popup());
+        let back = PlayListMpls::parse(&pl.encode()).unwrap();
+        assert_eq!(back.extension, pl.extension);
+        assert_eq!(back.extension.sub_paths, vec![sp]);
+        let r = back
+            .resolve_stream_entry(1, &dv.entry, SubPathList::Extension)
+            .unwrap();
+        assert_eq!(r.clip_information_file_name, "00009");
+        assert_eq!(r.pid, 0x1012);
     }
 }

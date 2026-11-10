@@ -67,6 +67,7 @@ fn make_clpi(entry_points: &[(u32, u32)], n_source_packets: u32) -> Vec<u8> {
         })
         .collect();
     let clpi = ClipInformation {
+        extension: Default::default(),
         version: *b"0200",
         clip_info: ClipInfo {
             clip_stream_type: 1,
@@ -118,6 +119,7 @@ fn seek_to_lands_on_keyframe_packet() {
     let out_b = 45_000 * 10;
 
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,
@@ -139,20 +141,18 @@ fn seek_to_lands_on_keyframe_packet() {
                     multi_clip_count: 1,
                     angles: Vec::new(),
                     stn_table: StnTable {
-                        primary_video: vec![PrimaryVideoStream {
-                            elementary_pid: 0x1011,
-                            coding_type: StreamCodingType::AvcVideo,
-                            video_format: 0x06,
-                            frame_rate: 0x03,
-                            aspect_ratio: 0x03,
-                        }],
-                        primary_audio: vec![PrimaryAudioStream {
-                            elementary_pid: 0x1100,
-                            coding_type: StreamCodingType::Ac3Audio,
-                            audio_format: 0x03,
-                            sample_rate: 0x01,
-                            language_code: *b"eng",
-                        }],
+                        primary_video: vec![
+                            PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+                                .with_video_format(0x06)
+                                .with_frame_rate(0x03)
+                                .with_aspect_ratio(0x03),
+                        ],
+                        primary_audio: vec![
+                            PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+                                .with_audio_format(0x03)
+                                .with_sample_rate(0x01)
+                                .with_language_code(*b"eng"),
+                        ],
                         ..StnTable::default()
                     },
                     flags: PlayItemFlags::default(),
@@ -167,20 +167,18 @@ fn seek_to_lands_on_keyframe_packet() {
                     multi_clip_count: 1,
                     angles: Vec::new(),
                     stn_table: StnTable {
-                        primary_video: vec![PrimaryVideoStream {
-                            elementary_pid: 0x1011,
-                            coding_type: StreamCodingType::AvcVideo,
-                            video_format: 0x06,
-                            frame_rate: 0x03,
-                            aspect_ratio: 0x03,
-                        }],
-                        primary_audio: vec![PrimaryAudioStream {
-                            elementary_pid: 0x1100,
-                            coding_type: StreamCodingType::Ac3Audio,
-                            audio_format: 0x03,
-                            sample_rate: 0x01,
-                            language_code: *b"eng",
-                        }],
+                        primary_video: vec![
+                            PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+                                .with_video_format(0x06)
+                                .with_frame_rate(0x03)
+                                .with_aspect_ratio(0x03),
+                        ],
+                        primary_audio: vec![
+                            PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+                                .with_audio_format(0x03)
+                                .with_sample_rate(0x01)
+                                .with_language_code(*b"eng"),
+                        ],
                         ..StnTable::default()
                     },
                     flags: PlayItemFlags::default(),
@@ -300,6 +298,7 @@ fn seek_to_without_cpi_falls_back_to_clip_start() {
     let bdmv = root.join("BDMV");
 
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,
@@ -320,20 +319,18 @@ fn seek_to_without_cpi_falls_back_to_clip_start() {
                 multi_clip_count: 1,
                 angles: Vec::new(),
                 stn_table: StnTable {
-                    primary_video: vec![PrimaryVideoStream {
-                        elementary_pid: 0x1011,
-                        coding_type: StreamCodingType::AvcVideo,
-                        video_format: 0x06,
-                        frame_rate: 0x03,
-                        aspect_ratio: 0x03,
-                    }],
-                    primary_audio: vec![PrimaryAudioStream {
-                        elementary_pid: 0x1100,
-                        coding_type: StreamCodingType::Ac3Audio,
-                        audio_format: 0x03,
-                        sample_rate: 0x01,
-                        language_code: *b"eng",
-                    }],
+                    primary_video: vec![
+                        PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+                            .with_video_format(0x06)
+                            .with_frame_rate(0x03)
+                            .with_aspect_ratio(0x03),
+                    ],
+                    primary_audio: vec![
+                        PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+                            .with_audio_format(0x03)
+                            .with_sample_rate(0x01)
+                            .with_language_code(*b"eng"),
+                    ],
                     ..StnTable::default()
                 },
                 flags: PlayItemFlags::default(),
@@ -405,6 +402,7 @@ fn disc_chapters_map_to_seekable_keyframes() {
     // IN = 5 s (clip-local), so a mark at clip-local 7 s in item 1 sits
     // 2 s into the PlayItem → title 10 s + 2 s = 12 s.
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,
@@ -426,20 +424,18 @@ fn disc_chapters_map_to_seekable_keyframes() {
                     multi_clip_count: 1,
                     angles: Vec::new(),
                     stn_table: StnTable {
-                        primary_video: vec![PrimaryVideoStream {
-                            elementary_pid: 0x1011,
-                            coding_type: StreamCodingType::AvcVideo,
-                            video_format: 0x06,
-                            frame_rate: 0x03,
-                            aspect_ratio: 0x03,
-                        }],
-                        primary_audio: vec![PrimaryAudioStream {
-                            elementary_pid: 0x1100,
-                            coding_type: StreamCodingType::Ac3Audio,
-                            audio_format: 0x03,
-                            sample_rate: 0x01,
-                            language_code: *b"eng",
-                        }],
+                        primary_video: vec![
+                            PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+                                .with_video_format(0x06)
+                                .with_frame_rate(0x03)
+                                .with_aspect_ratio(0x03),
+                        ],
+                        primary_audio: vec![
+                            PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+                                .with_audio_format(0x03)
+                                .with_sample_rate(0x01)
+                                .with_language_code(*b"eng"),
+                        ],
                         ..StnTable::default()
                     },
                     flags: PlayItemFlags::default(),
@@ -454,20 +450,18 @@ fn disc_chapters_map_to_seekable_keyframes() {
                     multi_clip_count: 1,
                     angles: Vec::new(),
                     stn_table: StnTable {
-                        primary_video: vec![PrimaryVideoStream {
-                            elementary_pid: 0x1011,
-                            coding_type: StreamCodingType::AvcVideo,
-                            video_format: 0x06,
-                            frame_rate: 0x03,
-                            aspect_ratio: 0x03,
-                        }],
-                        primary_audio: vec![PrimaryAudioStream {
-                            elementary_pid: 0x1100,
-                            coding_type: StreamCodingType::Ac3Audio,
-                            audio_format: 0x03,
-                            sample_rate: 0x01,
-                            language_code: *b"eng",
-                        }],
+                        primary_video: vec![
+                            PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+                                .with_video_format(0x06)
+                                .with_frame_rate(0x03)
+                                .with_aspect_ratio(0x03),
+                        ],
+                        primary_audio: vec![
+                            PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+                                .with_audio_format(0x03)
+                                .with_sample_rate(0x01)
+                                .with_language_code(*b"eng"),
+                        ],
                         ..StnTable::default()
                     },
                     flags: PlayItemFlags::default(),

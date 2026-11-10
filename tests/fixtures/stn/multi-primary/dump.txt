@@ -1,0 +1,169 @@
+# 00000.mpls  (250 bytes)
+0x0000  type_indicator                     [4d 50 4c 53] = 'MPLS'
+0x0004  version_number                     [30 32 30 30] = '0200'
+0x0008  PlayList_start_address             [00 00 00 3a] = 58 (0x3a)
+0x000c  PlayListMark_start_address         [00 00 00 e6] = 230 (0xe6)
+0x0010  ExtensionData_start_address        [00 00 00 00] = 0 (0x0)
+0x0014  reserved(160)                      [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00]
+0x0028  === AppInfoPlayList                []
+0x0028  length                             [00 00 00 0e] = 14 (0xe)
+0x002c  (AppInfoPlayList body)             [00 01 00 00 00 00 00 00 00 00 00 00 40 00]
+0x003a  === PlayList                       []
+0x003a  length                             [00 00 00 a8] = 168 (0xa8)
+0x003e  reserved                           [00 00] = 0 (0x0)
+0x0040  number_of_PlayItems                [00 01] = 1 (0x1)
+0x0042  number_of_SubPaths                 [00 00] = 0 (0x0)
+0x0044    === PlayItem[0]                    []
+0x0044    length                             [00 a0] = 160 (0xa0)
+0x0046    Clip_Information_file_name         [30 30 30 30 30] = '00000'
+0x004b    Clip_codec_identifier              [4d 32 54 53] = 'M2TS'
+0x004f    reserved(11)|is_multi_angle(1)|connection_condition(4) [00 01] = multi_angle=0 cc=1
+0x0051    ref_to_STC_id                      [00] = 0 (0x0)
+0x0052    IN_time                            [01 9b fc c0] = 27000000 (0x19bfcc0)
+0x0056    OUT_time                           [01 9e bc 94] = 27180180 (0x19ebc94)
+0x005a    UO_mask_table                      [00 00 00 00 00 00 00 00]
+0x0062    random_access_flag(1)|reserved(7)  [00] = 0
+0x0063    still_mode                         [00] = 0 (0x0)
+0x0064    still_time                         [00 00] = 0 (0x0)
+0x0066      STN_table.length                   [00 7e] = 126 (0x7e)
+0x0068      reserved                           [00 00] = 0 (0x0)
+0x006a      number_of_primary_video_stream_entries [01] = 1 (0x1)
+0x006b      number_of_primary_audio_stream_entries [04] = 4 (0x4)
+0x006c      number_of_PG_textST_stream_entries [02] = 2 (0x2)
+0x006d      number_of_IG_stream_entries        [00] = 0 (0x0)
+0x006e      number_of_secondary_audio_stream_entries [00] = 0 (0x0)
+0x006f      number_of_secondary_video_stream_entries [00] = 0 (0x0)
+0x0070      number_of_PiP_PG_textST_plus_stream_entries [00] = 0 (0x0)
+0x0071      number_of_DV(wiki)/reserved(Sony)_stream_entries [00] = 0 (0x0)
+0x0072      reserved(32; Sony: 40 incl. the 8th count byte) [00 00 00 00]
+0x0076      --- primary_video[0]               []
+0x0076        stream_entry.length                [09] = 9 (0x9)
+0x0077        stream_entry.type                  [01] = 1 (0x1)
+0x0078        ref_to_stream_PID_of_mainClip      [10 11] = 4113 (0x1011)
+0x007a        reserved                           [00 00 00 00 00 00]
+0x0080        stream_attributes.length           [05] = 5 (0x5)
+0x0081        stream_coding_type                 [1b] = 0x1b H.264/AVC
+0x0082        video_format(4)|frame_rate(4)      [61] = format=6 rate=1
+0x0083        (remaining/reserved)               [00 00 00]
+0x0086      --- primary_audio[0]               []
+0x0086        stream_entry.length                [09] = 9 (0x9)
+0x0087        stream_entry.type                  [01] = 1 (0x1)
+0x0088        ref_to_stream_PID_of_mainClip      [11 00] = 4352 (0x1100)
+0x008a        reserved                           [00 00 00 00 00 00]
+0x0090        stream_attributes.length           [05] = 5 (0x5)
+0x0091        stream_coding_type                 [81] = 0x81 AC-3
+0x0092        presentation_type(4)|sampling_freq(4) [31] = pt=3 fs=1
+0x0093        language_code                      [65 6e 67] = 'eng'
+0x0096      --- primary_audio[1]               []
+0x0096        stream_entry.length                [09] = 9 (0x9)
+0x0097        stream_entry.type                  [01] = 1 (0x1)
+0x0098        ref_to_stream_PID_of_mainClip      [11 01] = 4353 (0x1101)
+0x009a        reserved                           [00 00 00 00 00 00]
+0x00a0        stream_attributes.length           [05] = 5 (0x5)
+0x00a1        stream_coding_type                 [81] = 0x81 AC-3
+0x00a2        presentation_type(4)|sampling_freq(4) [61] = pt=6 fs=1
+0x00a3        language_code                      [66 72 61] = 'fra'
+0x00a6      --- primary_audio[2]               []
+0x00a6        stream_entry.length                [09] = 9 (0x9)
+0x00a7        stream_entry.type                  [01] = 1 (0x1)
+0x00a8        ref_to_stream_PID_of_mainClip      [11 02] = 4354 (0x1102)
+0x00aa        reserved                           [00 00 00 00 00 00]
+0x00b0        stream_attributes.length           [05] = 5 (0x5)
+0x00b1        stream_coding_type                 [80] = 0x80 LPCM
+0x00b2        presentation_type(4)|sampling_freq(4) [31] = pt=3 fs=1
+0x00b3        language_code                      [6a 70 6e] = 'jpn'
+0x00b6      --- primary_audio[3]               []
+0x00b6        stream_entry.length                [09] = 9 (0x9)
+0x00b7        stream_entry.type                  [01] = 1 (0x1)
+0x00b8        ref_to_stream_PID_of_mainClip      [11 03] = 4355 (0x1103)
+0x00ba        reserved                           [00 00 00 00 00 00]
+0x00c0        stream_attributes.length           [05] = 5 (0x5)
+0x00c1        stream_coding_type                 [82] = 0x82 DTS
+0x00c2        presentation_type(4)|sampling_freq(4) [31] = pt=3 fs=1
+0x00c3        language_code                      [64 65 75] = 'deu'
+0x00c6      --- PG_textST[0]                   []
+0x00c6        stream_entry.length                [09] = 9 (0x9)
+0x00c7        stream_entry.type                  [01] = 1 (0x1)
+0x00c8        ref_to_stream_PID_of_mainClip      [12 00] = 4608 (0x1200)
+0x00ca        reserved                           [00 00 00 00 00 00]
+0x00d0        stream_attributes.length           [05] = 5 (0x5)
+0x00d1        stream_coding_type                 [90] = 0x90 PG
+0x00d2        language_code                      [65 6e 67] = 'eng'
+0x00d5        (remaining/reserved)               [00]
+0x00d6      --- PG_textST[1]                   []
+0x00d6        stream_entry.length                [09] = 9 (0x9)
+0x00d7        stream_entry.type                  [01] = 1 (0x1)
+0x00d8        ref_to_stream_PID_of_mainClip      [12 01] = 4609 (0x1201)
+0x00da        reserved                           [00 00 00 00 00 00]
+0x00e0        stream_attributes.length           [05] = 5 (0x5)
+0x00e1        stream_coding_type                 [90] = 0x90 PG
+0x00e2        language_code                      [66 72 61] = 'fra'
+0x00e5        (remaining/reserved)               [00]
+0x00e6  === PlayListMark                   []
+0x00e6  length                             [00 00 00 10] = 16 (0x10)
+0x00ea  (marks)                            [00 01 00 01 00 00 01 9b fc c0 ff ff 00 00 00 00]
+
+# 00000.clpi  (496 bytes)
+0x0000  type_indicator                     [48 44 4d 56] = 'HDMV'
+0x0004  version_number                     [30 32 30 30] = '0200'
+0x0008  SequenceInfo_start_address         [00 00 00 dc] = 220 (0xdc)
+0x000c  ProgramInfo_start_address          [00 00 00 f8] = 248 (0xf8)
+0x0010  CPI_start_address                  [00 00 01 b0] = 432 (0x1b0)
+0x0014  ClipMark_start_address             [00 00 01 e8] = 488 (0x1e8)
+0x0018  ExtensionData_start_address        [00 00 01 ec] = 492 (0x1ec)
+0x001c  reserved(96)                       [00 00 00 00 00 00 00 00 00 00 00 00]
+0x0028  === ClipInfo                       []
+0x0028  length                             [00 00 00 b0] = 176 (0xb0)
+0x002c    reserved                           [00 00] = 0 (0x0)
+0x002e    Clip_stream_type                   [01] = 1 (0x1)
+0x002f    application_type                   [01] = 1 (0x1)
+0x0030    reserved(31)|is_ATC_delta(1)       [00 00 00 00] = 0 (0x0)
+0x0034    TS_recording_rate                  [00 5b 8d 80] = 6000000 (0x5b8d80)
+0x0038    number_of_source_packets           [00 00 2a e0] = 10976 (0x2ae0)
+0x003c    (rest of ClipInfo incl. TS_type_info_block / ATC deltas) [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 1e 80 48 44 4d 56 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00]
+0x00f8  === ProgramInfo                    []
+0x00f8  length                             [00 00 00 b2] = 178 (0xb2)
+0x00fc  reserved                           [00] = 0 (0x0)
+0x00fd  number_of_program_sequences        [01] = 1 (0x1)
+0x00fe    SPN_program_sequence_start         [00 00 00 00] = 0 (0x0)
+0x0102    program_map_PID                    [01 00] = 256 (0x100)
+0x0104    number_of_streams_in_ps            [07] = 7 (0x7)
+0x0105    reserved                           [00] = 0 (0x0)
+0x0106    --- stream[0]                      []
+0x0106      stream_PID                         [10 11] = 4113 (0x1011)
+0x0108      StreamCodingInfo.length            [15] = 21 (0x15)
+0x0109      stream_coding_type                 [1b] = 0x1b H.264/AVC
+0x010a      (coding info body)                 [61 30 00 00 30 30 30 30 30 30 30 30 30 30 30 30 00 00 00 00]
+0x011e    --- stream[1]                      []
+0x011e      stream_PID                         [11 00] = 4352 (0x1100)
+0x0120      StreamCodingInfo.length            [15] = 21 (0x15)
+0x0121      stream_coding_type                 [81] = 0x81 AC-3
+0x0122      (coding info body)                 [31 65 6e 67 30 30 30 30 30 30 30 30 30 30 30 30 00 00 00 00]
+0x0136    --- stream[2]                      []
+0x0136      stream_PID                         [11 01] = 4353 (0x1101)
+0x0138      StreamCodingInfo.length            [15] = 21 (0x15)
+0x0139      stream_coding_type                 [81] = 0x81 AC-3
+0x013a      (coding info body)                 [61 66 72 61 30 30 30 30 30 30 30 30 30 30 30 30 00 00 00 00]
+0x014e    --- stream[3]                      []
+0x014e      stream_PID                         [11 02] = 4354 (0x1102)
+0x0150      StreamCodingInfo.length            [15] = 21 (0x15)
+0x0151      stream_coding_type                 [80] = 0x80 LPCM
+0x0152      (coding info body)                 [31 6a 70 6e 30 30 30 30 30 30 30 30 30 30 30 30 00 00 00 00]
+0x0166    --- stream[4]                      []
+0x0166      stream_PID                         [11 03] = 4355 (0x1103)
+0x0168      StreamCodingInfo.length            [15] = 21 (0x15)
+0x0169      stream_coding_type                 [82] = 0x82 DTS
+0x016a      (coding info body)                 [31 64 65 75 30 30 30 30 30 30 30 30 30 30 30 30 00 00 00 00]
+0x017e    --- stream[5]                      []
+0x017e      stream_PID                         [12 00] = 4608 (0x1200)
+0x0180      StreamCodingInfo.length            [15] = 21 (0x15)
+0x0181      stream_coding_type                 [90] = 0x90 PG
+0x0182      (coding info body)                 [65 6e 67 00 30 30 30 30 30 30 30 30 30 30 30 30 00 00 00 00]
+0x0196    --- stream[6]                      []
+0x0196      stream_PID                         [12 01] = 4609 (0x1201)
+0x0198      StreamCodingInfo.length            [15] = 21 (0x15)
+0x0199      stream_coding_type                 [90] = 0x90 PG
+0x019a      (coding info body)                 [66 72 61 00 30 30 30 30 30 30 30 30 30 30 30 30 00 00 00 00]
+0x01ec  === ExtensionData                  []
+0x01ec  ExtensionData.length               [00 00 00 00] = 0 (0x0)
+

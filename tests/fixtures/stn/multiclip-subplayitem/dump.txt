@@ -1,0 +1,151 @@
+# f.mpls  (382 bytes)
+0x0000  type_indicator                     [4d 50 4c 53] = 'MPLS'
+0x0004  version_number                     [30 32 30 30] = '0200'
+0x0008  PlayList_start_address             [00 00 00 3a] = 58 (0x3a)
+0x000c  PlayListMark_start_address         [00 00 01 34] = 308 (0x134)
+0x0010  ExtensionData_start_address        [00 00 01 48] = 328 (0x148)
+0x0014  reserved(160)                      [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00]
+0x0028  === AppInfoPlayList                []
+0x0028  length                             [00 00 00 0e] = 14 (0xe)
+0x002c  (AppInfoPlayList body)             [00 01 00 00 00 00 00 00 00 00 00 00 40 00]
+0x003a  === PlayList                       []
+0x003a  length                             [00 00 00 f6] = 246 (0xf6)
+0x003e  reserved                           [00 00] = 0 (0x0)
+0x0040  number_of_PlayItems                [00 01] = 1 (0x1)
+0x0042  number_of_SubPaths                 [00 02] = 2 (0x2)
+0x0044    === PlayItem[0]                    []
+0x0044    length                             [00 88] = 136 (0x88)
+0x0046    Clip_Information_file_name         [30 30 30 30 30] = '00000'
+0x004b    Clip_codec_identifier              [4d 32 54 53] = 'M2TS'
+0x004f    reserved(11)|is_multi_angle(1)|connection_condition(4) [00 01] = multi_angle=0 cc=1
+0x0051    ref_to_STC_id                      [00] = 0 (0x0)
+0x0052    IN_time                            [01 9b fc c0] = 27000000 (0x19bfcc0)
+0x0056    OUT_time                           [01 9e bc 94] = 27180180 (0x19ebc94)
+0x005a    UO_mask_table                      [00 00 00 00 00 00 00 00]
+0x0062    random_access_flag(1)|reserved(7)  [00] = 0
+0x0063    still_mode                         [00] = 0 (0x0)
+0x0064    still_time                         [00 00] = 0 (0x0)
+0x0066      STN_table.length                   [00 66] = 102 (0x66)
+0x0068      reserved                           [00 00] = 0 (0x0)
+0x006a      number_of_primary_video_stream_entries [01] = 1 (0x1)
+0x006b      number_of_primary_audio_stream_entries [01] = 1 (0x1)
+0x006c      number_of_PG_textST_stream_entries [01] = 1 (0x1)
+0x006d      number_of_IG_stream_entries        [00] = 0 (0x0)
+0x006e      number_of_secondary_audio_stream_entries [01] = 1 (0x1)
+0x006f      number_of_secondary_video_stream_entries [01] = 1 (0x1)
+0x0070      number_of_PiP_PG_textST_plus_stream_entries [00] = 0 (0x0)
+0x0071      number_of_DV(wiki)/reserved(Sony)_stream_entries [00] = 0 (0x0)
+0x0072      reserved(32; Sony: 40 incl. the 8th count byte) [00 00 00 00]
+0x0076      --- primary_video[0]               []
+0x0076        stream_entry.length                [09] = 9 (0x9)
+0x0077        stream_entry.type                  [01] = 1 (0x1)
+0x0078        ref_to_stream_PID_of_mainClip      [10 11] = 4113 (0x1011)
+0x007a        reserved                           [00 00 00 00 00 00]
+0x0080        stream_attributes.length           [05] = 5 (0x5)
+0x0081        stream_coding_type                 [1b] = 0x1b H.264/AVC
+0x0082        video_format(4)|frame_rate(4)      [61] = format=6 rate=1
+0x0083        (remaining/reserved)               [00 00 00]
+0x0086      --- primary_audio[0]               []
+0x0086        stream_entry.length                [09] = 9 (0x9)
+0x0087        stream_entry.type                  [01] = 1 (0x1)
+0x0088        ref_to_stream_PID_of_mainClip      [11 00] = 4352 (0x1100)
+0x008a        reserved                           [00 00 00 00 00 00]
+0x0090        stream_attributes.length           [05] = 5 (0x5)
+0x0091        stream_coding_type                 [81] = 0x81 AC-3
+0x0092        presentation_type(4)|sampling_freq(4) [31] = pt=3 fs=1
+0x0093        language_code                      [65 6e 67] = 'eng'
+0x0096      --- PG_textST[0]                   []
+0x0096        stream_entry.length                [09] = 9 (0x9)
+0x0097        stream_entry.type                  [01] = 1 (0x1)
+0x0098        ref_to_stream_PID_of_mainClip      [12 00] = 4608 (0x1200)
+0x009a        reserved                           [00 00 00 00 00 00]
+0x00a0        stream_attributes.length           [05] = 5 (0x5)
+0x00a1        stream_coding_type                 [90] = 0x90 PG
+0x00a2        language_code                      [65 6e 67] = 'eng'
+0x00a5        (remaining/reserved)               [00]
+0x00a6      --- secondary_audio[0]             []
+0x00a6        stream_entry.length                [09] = 9 (0x9)
+0x00a7        stream_entry.type                  [02] = 2 (0x2)
+0x00a8        ref_to_SubPath_id                  [01] = 1 (0x1)
+0x00a9        ref_to_subClip_entry_id            [02] = 2 (0x2)
+0x00aa        ref_to_stream_PID_of_subClip       [1a 00] = 6656 (0x1a00)
+0x00ac        reserved                           [00 00 00 00]
+0x00b0        stream_attributes.length           [05] = 5 (0x5)
+0x00b1        stream_coding_type                 [a1] = 0xa1 E-AC-3 (secondary)
+0x00b2        presentation_type(4)|sampling_freq(4) [31] = pt=3 fs=1
+0x00b3        language_code                      [65 6e 67] = 'eng'
+0x00b6        number_of_primary_audio_ref_entries [00] = 0 (0x0)
+0x00b7        reserved_for_word_align            [00] = 0 (0x0)
+0x00b8      --- secondary_video[0]             []
+0x00b8        stream_entry.length                [09] = 9 (0x9)
+0x00b9        stream_entry.type                  [03] = 3 (0x3)
+0x00ba        ref_to_SubPath_id                  [00] = 0 (0x0)
+0x00bb        ref_to_stream_PID_of_mainClip      [1b 00] = 6912 (0x1b00)
+0x00bd        reserved                           [00 00 00 00 00]
+0x00c2        stream_attributes.length           [05] = 5 (0x5)
+0x00c3        stream_coding_type                 [1b] = 0x1b H.264/AVC
+0x00c4        video_format(4)|frame_rate(4)      [51] = format=5 rate=1
+0x00c5        (remaining/reserved)               [00 00 00]
+0x00c8        number_of_secondary_audio_ref_entries [01] = 1 (0x1)
+0x00c9        reserved_for_word_align            [00] = 0 (0x0)
+0x00ca          secondary_audio_stream_id_ref      [00] = 0 (0x0)
+0x00cb          reserved_for_word_align            [00] = 0 (0x0)
+0x00cc        number_of_PiP_PG_textST_ref_entries [00] = 0 (0x0)
+0x00cd        reserved_for_word_align            [00] = 0 (0x0)
+0x00ce    === SubPath[0]                     []
+0x00ce    length                             [00 00 00 24] = 36 (0x24)
+0x00d2    reserved                           [00] = 0 (0x0)
+0x00d3    SubPath_type                       [07] = 7 (0x7)
+0x00d4    reserved(15)|is_repeat_SubPath(1)  [00 00] = 0
+0x00d6    reserved                           [00] = 0 (0x0)
+0x00d7    number_of_SubPlayItems             [01] = 1 (0x1)
+0x00d8      === SubPlayItem[0]                 []
+0x00d8      length                             [00 1c] = 28 (0x1c)
+0x00da      Clip_Information_file_name[0]      [30 30 30 30 30] = '00000'
+0x00df      Clip_codec_identifier[0]           [4d 32 54 53] = 'M2TS'
+0x00e3      reserved(27)|connection_condition(4)|is_multi_clip_entries(1) [00 00 00 02] = cc=1 multi=0 reservedbits=0x0
+0x00e7      ref_to_STC_id[0]                   [00] = 0 (0x0)
+0x00e8      SubPlayItem_IN_time                [01 9b fc c0] = 27000000 (0x19bfcc0)
+0x00ec      SubPlayItem_OUT_time               [01 9e bc 94] = 27180180 (0x19ebc94)
+0x00f0      sync_PlayItem_id                   [00 00] = 0 (0x0)
+0x00f2      sync_start_PTS_of_PlayItem         [01 9b fc c0] = 27000000 (0x19bfcc0)
+0x00f6    === SubPath[1]                     []
+0x00f6    length                             [00 00 00 3a] = 58 (0x3a)
+0x00fa    reserved                           [00] = 0 (0x0)
+0x00fb    SubPath_type                       [05] = 5 (0x5)
+0x00fc    reserved(15)|is_repeat_SubPath(1)  [00 00] = 0
+0x00fe    reserved                           [00] = 0 (0x0)
+0x00ff    number_of_SubPlayItems             [01] = 1 (0x1)
+0x0100      === SubPlayItem[0]                 []
+0x0100      length                             [00 32] = 50 (0x32)
+0x0102      Clip_Information_file_name[0]      [30 30 30 31 30] = '00010'
+0x0107      Clip_codec_identifier[0]           [4d 32 54 53] = 'M2TS'
+0x010b      reserved(27)|connection_condition(4)|is_multi_clip_entries(1) [00 00 00 03] = cc=1 multi=1 reservedbits=0x0
+0x010f      ref_to_STC_id[0]                   [00] = 0 (0x0)
+0x0110      SubPlayItem_IN_time                [01 9b fc c0] = 27000000 (0x19bfcc0)
+0x0114      SubPlayItem_OUT_time               [01 9e bc 94] = 27180180 (0x19ebc94)
+0x0118      sync_PlayItem_id                   [00 00] = 0 (0x0)
+0x011a      sync_start_PTS_of_PlayItem         [01 9b fc c0] = 27000000 (0x19bfcc0)
+0x011e      number_of_multi_clip_entries       [03] = 3 (0x3)
+0x011f      reserved                           [00] = 0 (0x0)
+0x0120        Clip_Information_file_name[1]      [30 30 30 31 31] = '00011'
+0x0125        Clip_codec_identifier              [4d 32 54 53] = 'M2TS'
+0x0129        ref_to_STC_id                      [01] = 1 (0x1)
+0x012a        Clip_Information_file_name[2]      [30 30 30 31 32] = '00012'
+0x012f        Clip_codec_identifier              [4d 32 54 53] = 'M2TS'
+0x0133        ref_to_STC_id                      [02] = 2 (0x2)
+0x0134  === PlayListMark                   []
+0x0134  length                             [00 00 00 10] = 16 (0x10)
+0x0138  (marks)                            [00 01 00 01 00 00 01 9b fc c0 ff ff 00 00 00 00]
+0x0148  === ExtensionData                  []
+0x0148  ExtensionData.length               [00 00 00 32] = 50 (0x32)
+0x014c  data_block_start_address           [00 00 00 18] = 24 (0x18)
+0x0150  reserved(24)                       [00 00 00]
+0x0153  number_of_ext_data_entries         [01] = 1 (0x1)
+0x0154    ID1                                [00 01] = 1 (0x1)
+0x0156    ID2                                [00 01] = 1 (0x1)
+0x0158    ext_data_start_address(rel. ExtensionData) [00 00 00 18] = 24 (0x18)
+0x015c    ext_data_length                    [00 00 00 1e] = 30 (0x1e)
+0x0160  === ext data ID1=1 ID2=1 len=30    []
+0x0160    (PiP metadata block, raw)          [00 00 00 1a 00 01 00 00 00 00 1c 00 00 03 00 00 00 00 00 14 00 01 01 9b fc c0 38 00 30 10]
+

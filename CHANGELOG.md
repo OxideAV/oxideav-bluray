@@ -9,11 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Full `STN_table` coverage: every `stream_entry()` type decodes into the
+  new `StreamEntry` (type 1 main clip, type 2 SubPath + sub-clip entry +
+  PID, type 3 in-mux SubPath PiP, type 4 enhancement-layer SubPath,
+  `Unknown` with the raw body), parsed length-based; each stream record
+  carries it as `entry`. Secondary audio / secondary video carry their
+  `comb_info` stream-id lists (`primary_audio_refs`,
+  `secondary_audio_refs`, `pip_pg_refs`); the eighth STN count byte is
+  kept as `StnTable::eighth_count`.
+- `ExtensionData()` parsing for `.mpls` and `.clpi`
+  (`ExtensionDataEntry`, `PlayListMpls::extension`,
+  `ClipInformation::extension`): the stereoscopic `STN_table_SS` list
+  (`StnTableSs`, dependent-view entry + flags + raw tail), the SubPath
+  extension list, and a dependent-view clip's `ProgramInfo_SS`
+  (`ClipExtension::program_info_ss`). `PlayListMpls::encode` writes the
+  extension back; all six staged playlist fixtures re-encode
+  byte-identically.
+- `PlayListMpls::resolve_stream_entry` / `live_sub_play_item` /
+  `sub_path` + `ResolvedStream` / `SubPathList`: join an entry to the
+  clip carrying its packets (type 2 through the live SubPlayItem and its
+  `ref_to_subClip_entry_id`); `SubPlayItem::clip_entry` selects a
+  multi-clip alternate by entry id.
+- `StreamCodingType::MvcDependentVideo` (`0x20`).
+- Builders (`new` + `with_*`) on every STN stream record.
+- `tests/stn_fixtures.rs`: the six staged playlist fixtures are parsed
+  and compared field by field against their `dump.txt` (811 semantic
+  fields).
+
 - `StreamCodingInfo::new` + `with_format_info_byte` /
   `with_aspect_ratio_nibble` / `with_language_code`, and
   `ProgramEntry::new`, so CLPI program tables stay buildable.
 
 ### Changed
+
+- PiP PG entries are read from the tail of the PG loop (count = PG +
+  PiP-PG-plus) instead of a loop after secondary video, and secondary
+  audio / video consume their `comb_info` blocks — playlists with
+  secondary streams previously mis-parsed every entry after the first
+  secondary audio.
+- Multi-clip `SubPlayItem` entries are parsed against the SubPlayItem
+  length: the non-zero of the two bytes after `sync_start_PTS` is the
+  total clip count, and the entry stride is derived (10 or 11 bytes).
+- Non-type-1 stream entries now report their real PID in
+  `elementary_pid` (previously 0).
+- `#[non_exhaustive]` on `PrimaryVideoStream`, `PrimaryAudioStream`,
+  `PgsSubtitleStream`; `SecondaryAudioStream` / `SecondaryVideoStream`
+  are no longer `Copy` (they carry `comb_info` vectors).
 
 - `#[non_exhaustive]` on the growable enums `AspectRatio`, `AudioFormat`,
   `BlurayError`, `BlurayUriTarget`, `ChapterSelector`,

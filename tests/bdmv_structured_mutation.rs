@@ -95,6 +95,7 @@ fn mutate_and_drive(seed: &[u8]) {
 
 fn valid_mpls() -> Vec<u8> {
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,
@@ -116,20 +117,18 @@ fn valid_mpls() -> Vec<u8> {
                     multi_clip_count: 1,
                     angles: Vec::new(),
                     stn_table: StnTable {
-                        primary_video: vec![PrimaryVideoStream {
-                            elementary_pid: 0x1011,
-                            coding_type: StreamCodingType::AvcVideo,
-                            video_format: 0x06,
-                            frame_rate: 0x03,
-                            aspect_ratio: 0x03,
-                        }],
-                        primary_audio: vec![PrimaryAudioStream {
-                            elementary_pid: 0x1100,
-                            coding_type: StreamCodingType::Ac3Audio,
-                            audio_format: 0x03,
-                            sample_rate: 0x01,
-                            language_code: *b"eng",
-                        }],
+                        primary_video: vec![
+                            PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+                                .with_video_format(0x06)
+                                .with_frame_rate(0x03)
+                                .with_aspect_ratio(0x03),
+                        ],
+                        primary_audio: vec![
+                            PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+                                .with_audio_format(0x03)
+                                .with_sample_rate(0x01)
+                                .with_language_code(*b"eng"),
+                        ],
                         ..StnTable::default()
                     },
                     flags: PlayItemFlags::default(),

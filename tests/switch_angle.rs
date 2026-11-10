@@ -80,6 +80,7 @@ fn make_clpi(rows: &[(u32, u32, bool)], n_source_packets: u32, stream_pid: u16) 
         })
         .collect();
     let clpi = ClipInformation {
+        extension: Default::default(),
         version: *b"0200",
         clip_info: ClipInfo {
             clip_stream_type: 1,
@@ -109,23 +110,21 @@ fn make_clpi(rows: &[(u32, u32, bool)], n_source_packets: u32, stream_pid: u16) 
 }
 
 fn primary_video() -> Vec<PrimaryVideoStream> {
-    vec![PrimaryVideoStream {
-        elementary_pid: 0x1011,
-        coding_type: StreamCodingType::AvcVideo,
-        video_format: 0x06,
-        frame_rate: 0x03,
-        aspect_ratio: 0x03,
-    }]
+    vec![
+        PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+            .with_video_format(0x06)
+            .with_frame_rate(0x03)
+            .with_aspect_ratio(0x03),
+    ]
 }
 
 fn primary_audio() -> Vec<PrimaryAudioStream> {
-    vec![PrimaryAudioStream {
-        elementary_pid: 0x1100,
-        coding_type: StreamCodingType::Ac3Audio,
-        audio_format: 0x03,
-        sample_rate: 0x01,
-        language_code: *b"eng",
-    }]
+    vec![
+        PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+            .with_audio_format(0x03)
+            .with_sample_rate(0x01)
+            .with_language_code(*b"eng"),
+    ]
 }
 
 fn index_bdmv_one_hdmv() -> IndexBdmv {
@@ -177,6 +176,7 @@ fn index_bdmv_one_hdmv() -> IndexBdmv {
 fn build_disc(root: &Path) {
     let bdmv = root.join("BDMV");
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,
@@ -423,6 +423,7 @@ fn switch_angle_yields_not_found_when_no_boundary_remains() {
     // EP rows. `switch_angle` has no boundary to land on so it MUST
     // surface NotFound and leave the source untouched.
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,

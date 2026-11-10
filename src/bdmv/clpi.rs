@@ -33,6 +33,7 @@
 //!   raw bytes.
 
 use crate::bdmv::common::{BdmvHeader, Reader};
+use crate::bdmv::extension::{EXT_ID_PROGRAM_INFO_SS, ExtensionDataEntry, parse_extension_data};
 use crate::bdmv::mpls::{
     AspectRatio, AudioFormat, FrameRate, SampleRate, StreamCodingType, VideoFormat,
 };
@@ -805,6 +806,104 @@ pub struct ClipMark {
     pub num_marks: u16,
 }
 
+/// Parse a `ProgramInfo()` block (§5.5.4.3) whose 32-bit `length`
+/// sits at `prog_start` in `buf`. The same layout carries a dependent-
+/// view clip's `ProgramInfo_SS` inside its ExtensionData `(2, 5)`.
+fn parse_program_info(buf: &[u8], prog_start: usize) -> Result<ProgramInfo> {
+    let mut r = Reader::new(buf);
+    r.seek(prog_start)?;
+    let prog_len = r.read_u32()? as usize;
+    let prog_body_start = r.pos;
+    let _prog_body_end = prog_body_start + prog_len;
+    r.skip(1)?; // 1 reserved
+    let num_programs = r.read_u8()? as usize;
+    let mut programs = Vec::with_capacity(num_programs);
+    for _ in 0..num_programs {
+        let spn_program_sequence_start = r.read_u32()?;
+        let program_map_pid = r.read_u16()?;
+        let num_streams = r.read_u8()? as usize;
+        r.skip(1)?; // 1 reserved
+        let mut streams = Vec::with_capacity(num_streams);
+        for _ in 0..num_streams {
+            let pid = r.read_u16()?;
+            // length + body for stream_coding_info (§5.5.4.3 — the
+            // same length-prefixed structure the MPLS STN_table
+            // carries per stream).
+            let sc_len = r.read_u8()? as usize;
+            let sc_start = r.pos;
+            let sc_end = sc_start
+                .checked_add(sc_len)
+                .ok_or_else(|| BlurayError::malformed("stream_coding_info length overflow"))?;
+            if sc_end > buf.len() {
+                return Err(BlurayError::malformed("stream_coding_info length past EOF"));
+            }
+            let stream_coding_type = if r.pos < sc_end { r.read_u8()? } else { 0 };
+            let format_info_byte = if r.pos < sc_end { r.read_u8()? } else { 0 };
+            let coding = StreamCodingType::from_raw(stream_coding_type);
+            // Video carries an aspect_ratio nibble after the
+            // format byte; audio / graphics carry a 3-byte language
+            // tag instead. Both stay inside the recorded `sc_len`
+            // body, so a stream that ships neither (a short body)
+            // simply leaves the extras at their defaults.
+            let mut aspect_ratio_nibble = 0u8;
+            let mut language_code = [0u8; 3];
+            if coding.is_video() {
+                if r.pos < sc_end {
+                    aspect_ratio_nibble = (r.read_u8()? >> 4) & 0x0F;
+                }
+            } else if r.pos + 3 <= sc_end {
+                language_code.copy_from_slice(r.slice(3)?);
+            }
+            streams.push(StreamCodingInfo {
+                pid,
+                stream_coding_type,
+                format_info_byte,
+                aspect_ratio_nibble,
+                language_code,
+            });
+            r.seek(sc_end)?;
+        }
+        programs.push(ProgramEntry {
+            spn_program_sequence_start,
+            program_map_pid,
+            streams,
+        });
+    }
+    Ok(ProgramInfo { programs })
+}
+
+/// A clip's `ExtensionData()` — raw entries plus the decoded
+/// `ProgramInfo_SS` (entry `(2, 5)`) a stereoscopic dependent-view clip
+/// carries in place of a populated ProgramInfo
+/// (`docs/container/bluray/stn-table-observed.md` §3).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClipExtension {
+    /// Every entry, in table order.
+    pub entries: Vec<ExtensionDataEntry>,
+    /// Decoded `(2, 5)` `ProgramInfo_SS`, when present and well-formed.
+    pub program_info_ss: Option<ProgramInfo>,
+}
+
+impl ClipExtension {
+    /// Build from raw entries, decoding the typed views.
+    pub fn from_entries(entries: Vec<ExtensionDataEntry>) -> Self {
+        let program_info_ss = entries
+            .iter()
+            .find(|e| e.id() == EXT_ID_PROGRAM_INFO_SS)
+            .and_then(|e| parse_program_info(&e.data, 0).ok());
+        Self {
+            entries,
+            program_info_ss,
+        }
+    }
+
+    /// The raw entry with the given `(ID1, ID2)`, if present.
+    pub fn entry(&self, id1: u16, id2: u16) -> Option<&ExtensionDataEntry> {
+        self.entries.iter().find(|e| e.id() == (id1, id2))
+    }
+}
+
 /// Parsed `.clpi` file.
 #[derive(Debug, Clone)]
 pub struct ClipInformation {
@@ -814,6 +913,8 @@ pub struct ClipInformation {
     pub program_info: ProgramInfo,
     pub cpi: Cpi,
     pub clip_mark: ClipMark,
+    /// `ExtensionData()` — raw entries + decoded `ProgramInfo_SS`.
+    pub extension: ClipExtension,
 }
 
 impl ClipInformation {
@@ -841,7 +942,7 @@ impl ClipInformation {
         let prog_start = r.read_u32()? as usize;
         let cpi_start = r.read_u32()? as usize;
         let mark_start = r.read_u32()? as usize;
-        let _ext_start = r.read_u32()? as usize;
+        let ext_start = r.read_u32()? as usize;
         // 12 reserved bytes at 28..40
         r.seek(40)?;
 
@@ -909,65 +1010,7 @@ impl ClipInformation {
         let sequence_info = SequenceInfo { atc_sequences };
 
         // ProgramInfo
-        r.seek(prog_start)?;
-        let prog_len = r.read_u32()? as usize;
-        let prog_body_start = r.pos;
-        let _prog_body_end = prog_body_start + prog_len;
-        r.skip(1)?; // 1 reserved
-        let num_programs = r.read_u8()? as usize;
-        let mut programs = Vec::with_capacity(num_programs);
-        for _ in 0..num_programs {
-            let spn_program_sequence_start = r.read_u32()?;
-            let program_map_pid = r.read_u16()?;
-            let num_streams = r.read_u8()? as usize;
-            r.skip(1)?; // 1 reserved
-            let mut streams = Vec::with_capacity(num_streams);
-            for _ in 0..num_streams {
-                let pid = r.read_u16()?;
-                // length + body for stream_coding_info (§5.5.4.3 — the
-                // same length-prefixed structure the MPLS STN_table
-                // carries per stream).
-                let sc_len = r.read_u8()? as usize;
-                let sc_start = r.pos;
-                let sc_end = sc_start
-                    .checked_add(sc_len)
-                    .ok_or_else(|| BlurayError::malformed("stream_coding_info length overflow"))?;
-                if sc_end > buf.len() {
-                    return Err(BlurayError::malformed("stream_coding_info length past EOF"));
-                }
-                let stream_coding_type = if r.pos < sc_end { r.read_u8()? } else { 0 };
-                let format_info_byte = if r.pos < sc_end { r.read_u8()? } else { 0 };
-                let coding = StreamCodingType::from_raw(stream_coding_type);
-                // Video carries an aspect_ratio nibble after the
-                // format byte; audio / graphics carry a 3-byte language
-                // tag instead. Both stay inside the recorded `sc_len`
-                // body, so a stream that ships neither (a short body)
-                // simply leaves the extras at their defaults.
-                let mut aspect_ratio_nibble = 0u8;
-                let mut language_code = [0u8; 3];
-                if coding.is_video() {
-                    if r.pos < sc_end {
-                        aspect_ratio_nibble = (r.read_u8()? >> 4) & 0x0F;
-                    }
-                } else if r.pos + 3 <= sc_end {
-                    language_code.copy_from_slice(r.slice(3)?);
-                }
-                streams.push(StreamCodingInfo {
-                    pid,
-                    stream_coding_type,
-                    format_info_byte,
-                    aspect_ratio_nibble,
-                    language_code,
-                });
-                r.seek(sc_end)?;
-            }
-            programs.push(ProgramEntry {
-                spn_program_sequence_start,
-                program_map_pid,
-                streams,
-            });
-        }
-        let program_info = ProgramInfo { programs };
+        let program_info = parse_program_info(buf, prog_start)?;
 
         // CPI EP_map (BD-ROM AV §5.7). Best-effort: some homemade clips
         // ship a zero-length CPI; we tolerate that by yielding an empty
@@ -995,6 +1038,7 @@ impl ClipInformation {
             program_info,
             cpi,
             clip_mark,
+            extension: ClipExtension::from_entries(parse_extension_data(buf, ext_start)),
         })
     }
 
@@ -1509,6 +1553,7 @@ mod tests {
 
     fn sample_clpi() -> ClipInformation {
         ClipInformation {
+            extension: Default::default(),
             version: *b"0200",
             clip_info: ClipInfo {
                 clip_stream_type: 1,

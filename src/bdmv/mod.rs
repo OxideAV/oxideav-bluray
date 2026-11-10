@@ -23,6 +23,7 @@
 //! `version_number`.
 
 pub mod clpi;
+pub mod extension;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod common;

@@ -66,6 +66,7 @@ fn make_clpi_with_angle_flags(
         })
         .collect();
     let clpi = ClipInformation {
+        extension: Default::default(),
         version: *b"0200",
         clip_info: ClipInfo {
             clip_stream_type: 1,
@@ -95,23 +96,21 @@ fn make_clpi_with_angle_flags(
 }
 
 fn primary_video() -> Vec<PrimaryVideoStream> {
-    vec![PrimaryVideoStream {
-        elementary_pid: 0x1011,
-        coding_type: StreamCodingType::AvcVideo,
-        video_format: 0x06,
-        frame_rate: 0x03,
-        aspect_ratio: 0x03,
-    }]
+    vec![
+        PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+            .with_video_format(0x06)
+            .with_frame_rate(0x03)
+            .with_aspect_ratio(0x03),
+    ]
 }
 
 fn primary_audio() -> Vec<PrimaryAudioStream> {
-    vec![PrimaryAudioStream {
-        elementary_pid: 0x1100,
-        coding_type: StreamCodingType::Ac3Audio,
-        audio_format: 0x03,
-        sample_rate: 0x01,
-        language_code: *b"eng",
-    }]
+    vec![
+        PrimaryAudioStream::new(0x1100, StreamCodingType::Ac3Audio)
+            .with_audio_format(0x03)
+            .with_sample_rate(0x01)
+            .with_language_code(*b"eng"),
+    ]
 }
 
 fn index_bdmv_one_hdmv() -> IndexBdmv {
@@ -159,6 +158,7 @@ fn index_bdmv_one_hdmv() -> IndexBdmv {
 fn build_disc(root: &Path) {
     let bdmv = root.join("BDMV");
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,
@@ -399,6 +399,7 @@ fn in_point_drops_pre_in_acp_rows() {
     let bdmv = root.join("BDMV");
 
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,
@@ -467,6 +468,7 @@ fn no_acp_rows_yields_empty_list() {
     let bdmv = root.join("BDMV");
 
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,

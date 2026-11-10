@@ -43,34 +43,26 @@ fn make_m2ts(n_packets: usize) -> Vec<u8> {
 
 fn shared_stn_table() -> StnTable {
     StnTable {
-        primary_video: vec![PrimaryVideoStream {
-            elementary_pid: 0x1011,
-            coding_type: StreamCodingType::AvcVideo,
-            video_format: 0x06,
-            frame_rate: 0x03,
-            aspect_ratio: 0x03,
-        }],
-        primary_audio: vec![
-            PrimaryAudioStream {
-                elementary_pid: 0x1100,
-                coding_type: StreamCodingType::DtsHdMaAudio,
-                audio_format: 0x06,
-                sample_rate: 0x01,
-                language_code: *b"eng",
-            },
-            PrimaryAudioStream {
-                elementary_pid: 0x1101,
-                coding_type: StreamCodingType::Ac3Audio,
-                audio_format: 0x03,
-                sample_rate: 0x01,
-                language_code: *b"jpn",
-            },
+        primary_video: vec![
+            PrimaryVideoStream::new(0x1011, StreamCodingType::AvcVideo)
+                .with_video_format(0x06)
+                .with_frame_rate(0x03)
+                .with_aspect_ratio(0x03),
         ],
-        pg_subtitles: vec![PgsSubtitleStream {
-            elementary_pid: 0x1200,
-            coding_type: StreamCodingType::PgsSubtitle,
-            language_code: *b"FRA", // uppercase — the catalogue must lowercase it
-        }],
+        primary_audio: vec![
+            PrimaryAudioStream::new(0x1100, StreamCodingType::DtsHdMaAudio)
+                .with_audio_format(0x06)
+                .with_sample_rate(0x01)
+                .with_language_code(*b"eng"),
+            PrimaryAudioStream::new(0x1101, StreamCodingType::Ac3Audio)
+                .with_audio_format(0x03)
+                .with_sample_rate(0x01)
+                .with_language_code(*b"jpn"),
+        ],
+        pg_subtitles: vec![
+            PgsSubtitleStream::new(0x1200, StreamCodingType::PgsSubtitle)
+                .with_language_code(*b"FRA"),
+        ],
         ..StnTable::default()
     }
 }
@@ -79,6 +71,7 @@ fn synth_disc(root: &Path) {
     let bdmv = root.join("BDMV");
 
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,
@@ -280,6 +273,7 @@ fn title_streams_skips_zero_pid_subpath_entries() {
     let bdmv = tmp.path().join("BDMV");
 
     let pl = PlayListMpls {
+        extension: Default::default(),
         version: *b"0200",
         app_info: AppInfoPlayList {
             playback_type: 1,
@@ -300,13 +294,12 @@ fn title_streams_skips_zero_pid_subpath_entries() {
                 multi_clip_count: 1,
                 angles: Vec::new(),
                 stn_table: StnTable {
-                    primary_audio: vec![PrimaryAudioStream {
-                        elementary_pid: 0,
-                        coding_type: StreamCodingType::Ac3Audio,
-                        audio_format: 0x03,
-                        sample_rate: 0x01,
-                        language_code: *b"eng",
-                    }],
+                    primary_audio: vec![
+                        PrimaryAudioStream::new(0, StreamCodingType::Ac3Audio)
+                            .with_audio_format(0x03)
+                            .with_sample_rate(0x01)
+                            .with_language_code(*b"eng"),
+                    ],
                     ..StnTable::default()
                 },
                 flags: PlayItemFlags::default(),

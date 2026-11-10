@@ -89,17 +89,18 @@ pub mod udf;
 
 pub use bdmv::{
     clpi::{ClipInfo, ClipMark, Cpi, EpEntry, EpMap, ProgramInfo, SequenceInfo, StreamCodingInfo},
+    extension::ExtensionDataEntry,
     index_bdmv::{AppInfoBdmv, IndexBdmv, IndexEntry, IndexObjectType, TitleEntry},
     mobj_runner::{DEFAULT_OBJECT_BUDGET, MobjRunner, RunOutcome},
     movie_object::{MovieObject, MovieObjects, NavCommand},
     mpls::{
         AngleClip, AngleClipRef, AppInfoPlayList, AspectRatio, AudioFormat, Chapter, ChapterSpan,
         ConnectionCondition, FrameRate, IgsInteractiveStream, MarkType, PgsSubtitleStream,
-        PipPgStream, PlayItem, PlayItemFlags, PlayList, PlayListMark, PlayListMpls,
-        PlayListPlaybackType, PrimaryAudioStream, PrimaryVideoStream, SampleRate,
-        SecondaryAudioStream, SecondaryVideoStream, StnTable, StreamCodingType, SubPath,
-        SubPathType, SubPlayItem, SubPlayItemClip, SubPlayItemWindow, TextSubtitleStream,
-        VideoFormat,
+        PipPgStream, PlayItem, PlayItemFlags, PlayList, PlayListExtension, PlayListMark,
+        PlayListMpls, PlayListPlaybackType, PrimaryAudioStream, PrimaryVideoStream, ResolvedStream,
+        SampleRate, SecondaryAudioStream, SecondaryVideoStream, StnTable, StnTableSs,
+        StreamCodingType, StreamEntry, SubPath, SubPathList, SubPathType, SubPlayItem,
+        SubPlayItemClip, SubPlayItemWindow, TextSubtitleStream, VideoFormat,
     },
     nav_command::{
         CommandGroup, DecodedCommand, Operand, Operation, RegisterBank, ResolvedRegister,
