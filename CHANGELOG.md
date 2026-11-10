@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ref_to_subClip_entry_id`); `SubPlayItem::clip_entry` selects a
   multi-clip alternate by entry id.
 - `StreamCodingType::MvcDependentVideo` (`0x20`).
+- `PlayListMpls::sub_play_item_sync_window_in(list, …)` — the
+  title-timeline window of a SubPlayItem in either SubPath list (the
+  split 3D fixture's dependent-view sequence tiles the title exactly).
+- Hostile-input sweep over the STN fixtures: every truncation and every
+  single-byte corruption of all 16 fixture `.mpls` / `.clpi` files, with
+  stream-entry resolution and re-encode driven on each successful parse.
 - Stream selection: `Track::entry` / `Track::carrier_clips` /
   `Track::is_in_main_path`, `TrackKind::DependentView` (from the
   `STN_table_SS`), `Disc::title_playlist`, `Disc::open_sub_path`

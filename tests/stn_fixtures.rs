@@ -702,6 +702,19 @@ fn split_3d_sub_play_items_are_a_sequence_selected_by_sync_play_item() {
         6,
         "second SubPlayItem is a seamless new-STC join"
     );
+    // The sequence tiles the title timeline: SubPlayItem k starts where
+    // PlayItem k starts.
+    let pi0 = pl.play_list.play_items[0].duration_90k();
+    let w0 = pl
+        .sub_play_item_sync_window_in(SubPathList::Extension, 0, 0)
+        .unwrap();
+    let w1 = pl
+        .sub_play_item_sync_window_in(SubPathList::Extension, 0, 1)
+        .unwrap();
+    assert_eq!((w0.title_start_pts_90k, w0.title_end_pts_90k), (0, pi0));
+    assert_eq!(w1.title_start_pts_90k, pi0);
+    assert_eq!(w1.title_end_pts_90k, pl.duration_90k());
+    assert!(pl.sub_play_item_sync_window(0, 0).is_none());
     for stem in ["00001", "00003"] {
         let c = clip("mvc-3d-split", stem);
         assert_eq!(c.clip_info.application_type, 8);

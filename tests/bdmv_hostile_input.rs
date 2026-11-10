@@ -55,14 +55,51 @@ fn drive_all(buf: &[u8]) {
         for m in &pl.marks {
             let _ = m.kind();
         }
-        for sp in &pl.play_list.sub_paths {
+        for sp in pl
+            .play_list
+            .sub_paths
+            .iter()
+            .chain(pl.extension.sub_paths.iter())
+        {
             let _ = sp.kind().display_name();
             for spi in &sp.sub_play_items {
                 let _ = spi.duration_90k();
                 let _ = spi.sync_start_pts_90k();
                 let _ = spi.num_clips();
+                for id in 0..=spi.num_clips().min(255) as u8 {
+                    let _ = spi.clip_entry(id);
+                }
             }
         }
+        // Resolve every stream entry against both SubPath lists.
+        for (i, pi) in pl.play_list.play_items.iter().enumerate() {
+            let t = &pi.stn_table;
+            let entries = t
+                .primary_video
+                .iter()
+                .map(|s| s.entry)
+                .chain(t.primary_audio.iter().map(|s| s.entry))
+                .chain(t.pg_subtitles.iter().map(|s| s.entry))
+                .chain(t.pip_pg.iter().map(|s| s.entry))
+                .chain(t.ig_streams.iter().map(|s| s.entry))
+                .chain(t.secondary_audio.iter().map(|s| s.entry))
+                .chain(t.secondary_video.iter().map(|s| s.entry))
+                .chain(
+                    pl.extension
+                        .stn_table_ss
+                        .iter()
+                        .filter_map(|ss| ss.dependent_view.map(|d| d.entry)),
+                );
+            for e in entries {
+                for list in [mpls::SubPathList::PlayList, mpls::SubPathList::Extension] {
+                    let _ = pl.resolve_stream_entry(i, &e, list);
+                }
+            }
+        }
+        // Encode must not panic on whatever was parsed, and what it
+        // produces must parse again.
+        let re = pl.encode();
+        let _ = mpls::PlayListMpls::parse(&re);
     }
     if let Ok(clip) = clpi::ClipInformation::parse(buf) {
         let _ = clip.cpi.primary_video_ep_map();
@@ -192,4 +229,42 @@ fn pure_random_does_not_panic() {
         }
         drive_all(&buf);
     }
+}
+
+/// The staged STN fixtures (secondary streams, PiP, 3D ExtensionData,
+/// multi-clip SubPlayItems) under every truncation and every
+/// single-byte corruption (zeroed, saturated, top bit flipped).
+#[test]
+fn stn_fixture_mutation_sweep_does_not_panic() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stn");
+    let mut files = Vec::new();
+    for fx in std::fs::read_dir(&root).unwrap() {
+        let bdmv = fx.unwrap().path().join("BDMV");
+        for sub in ["PLAYLIST", "CLIPINF"] {
+            if let Ok(rd) = std::fs::read_dir(bdmv.join(sub)) {
+                for f in rd {
+                    files.push(std::fs::read(f.unwrap().path()).unwrap());
+                }
+            }
+        }
+    }
+    assert!(files.len() >= 15, "found {} fixture files", files.len());
+    let mut parses = 0usize;
+    for bytes in &files {
+        for n in 0..=bytes.len() {
+            drive_all(&bytes[..n]);
+            parses += 1;
+        }
+        let mut m = bytes.clone();
+        for i in 0..m.len() {
+            let orig = m[i];
+            for v in [0x00, 0xFF, orig ^ 0x80] {
+                m[i] = v;
+                drive_all(&m);
+                parses += 1;
+            }
+            m[i] = orig;
+        }
+    }
+    assert!(parses > 10_000);
 }

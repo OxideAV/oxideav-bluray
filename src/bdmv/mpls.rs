@@ -2578,7 +2578,19 @@ impl PlayListMpls {
         sub_path_index: usize,
         item_index: usize,
     ) -> Option<SubPlayItemWindow> {
-        let sp = self.play_list.sub_paths.get(sub_path_index)?;
+        self.sub_play_item_sync_window_in(SubPathList::PlayList, sub_path_index, item_index)
+    }
+
+    /// [`Self::sub_play_item_sync_window`] for a SubPath of either list
+    /// — e.g. a stereoscopic dependent-view SubPlayItem of the
+    /// ExtensionData SubPath list ([`SubPathList::Extension`]).
+    pub fn sub_play_item_sync_window_in(
+        &self,
+        list: SubPathList,
+        sub_path_index: usize,
+        item_index: usize,
+    ) -> Option<SubPlayItemWindow> {
+        let sp = self.sub_path(list, sub_path_index)?;
         if sp.kind().is_synchronous() == Some(false) {
             return None;
         }
