@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-bluray/compare/v0.0.4...v0.0.5) - 2026-11-10
+
+### Other
+
+- drive stream-entry resolution, multi-clip entry lookup and re-encode in the mpls arm
+- SubPlayItem sync window for the ExtensionData SubPath list; STN fixture mutation sweep
+- stream selection over SubPaths — carrier clips, open_track / open_sub_path, ?stream= URI
+- full STN_table + STN_table_SS stream_entry coverage, ExtensionData, multi-clip SubPlayItems
+- API hygiene: non_exhaustive growable enums and parsed records, StreamCodingInfo/ProgramEntry constructors
+- dlsym instead of libloading
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - Full `STN_table` coverage: every `stream_entry()` type decodes into the
