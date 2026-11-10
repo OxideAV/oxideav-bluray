@@ -44,13 +44,44 @@ fuzz_target!(|data: &[u8]| {
                 }
                 let _ = pl.app_info.playback_kind();
                 let _ = pl.app_info.uo_mask_table().prohibited_ops();
-                for sp in &pl.play_list.sub_paths {
+                for sp in pl
+                    .play_list
+                    .sub_paths
+                    .iter()
+                    .chain(pl.extension.sub_paths.iter())
+                {
                     let _ = sp.kind().display_name();
                     for spi in &sp.sub_play_items {
                         let _ = spi.duration_90k();
                         let _ = spi.num_clips();
+                        let _ = spi.clip_entry(spi.num_clips() as u8);
                     }
                 }
+                // Join every STN / STN_table_SS entry to its carrier.
+                for (i, pi) in pl.play_list.play_items.iter().enumerate() {
+                    let t = &pi.stn_table;
+                    let entries = t
+                        .primary_video
+                        .iter()
+                        .map(|s| s.entry)
+                        .chain(t.primary_audio.iter().map(|s| s.entry))
+                        .chain(t.pg_subtitles.iter().map(|s| s.entry))
+                        .chain(t.pip_pg.iter().map(|s| s.entry))
+                        .chain(t.ig_streams.iter().map(|s| s.entry))
+                        .chain(t.secondary_audio.iter().map(|s| s.entry))
+                        .chain(t.secondary_video.iter().map(|s| s.entry))
+                        .chain(
+                            pl.extension
+                                .stn_table_ss
+                                .iter()
+                                .filter_map(|ss| ss.dependent_view.map(|d| d.entry)),
+                        );
+                    for e in entries {
+                        let _ = pl.resolve_stream_entry(i, &e, mpls::SubPathList::PlayList);
+                        let _ = pl.resolve_stream_entry(i, &e, mpls::SubPathList::Extension);
+                    }
+                }
+                let _ = mpls::PlayListMpls::parse(&pl.encode());
             }
         }
         1 => {
