@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ref_to_subClip_entry_id`); `SubPlayItem::clip_entry` selects a
   multi-clip alternate by entry id.
 - `StreamCodingType::MvcDependentVideo` (`0x20`).
+- Stream selection: `Track::entry` / `Track::carrier_clips` /
+  `Track::is_in_main_path`, `TrackKind::DependentView` (from the
+  `STN_table_SS`), `Disc::title_playlist`, `Disc::open_sub_path`
+  (a SubPath's SubPlayItem sequence on a chosen multi-clip alternate)
+  and `Disc::open_track` (the clip set carrying a catalogue track);
+  `bluray://…?stream=PID` opens that track's carrier. Secondary audio,
+  PiP video and the MVC dependent view reach the catalogue with real
+  PIDs; the MVC fixture demuxes both views.
 - Builders (`new` + `with_*`) on every STN stream record.
 - `tests/stn_fixtures.rs`: the six staged playlist fixtures are parsed
   and compared field by field against their `dump.txt` (811 semantic
@@ -51,7 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   length: the non-zero of the two bytes after `sync_start_PTS` is the
   total clip count, and the entry stride is derived (10 or 11 bytes).
 - Non-type-1 stream entries now report their real PID in
-  `elementary_pid` (previously 0).
+  `elementary_pid` (previously 0), so they now appear in
+  `Disc::title_streams`; the catalogue dedups on
+  `(pid, kind, stream_entry)` and orders by class then PID.
 - `#[non_exhaustive]` on `PrimaryVideoStream`, `PrimaryAudioStream`,
   `PgsSubtitleStream`; `SecondaryAudioStream` / `SecondaryVideoStream`
   are no longer `Copy` (they carry `comb_info` vectors).

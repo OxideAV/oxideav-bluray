@@ -300,16 +300,45 @@ bluray://                          → auto-detect first BD-ROM mount
   new physical stream after a switch — callers who tracked their
   position by byte should re-anchor against the returned value.
 - **Per-title track catalogue** — `Disc::title_streams(title) ->
-  TrackCatalogue` aggregates every PlayItem's STN_table (§5.4.4.4) into
-  a flat per-track listing, deduplicated by `(elementary_pid, kind)` so
-  a remuxer sees exactly one `Track { pid, kind, coding_type, language,
-  playitem_count }` per distinct elementary stream. Tracks are emitted
+  TrackCatalogue` aggregates every PlayItem's STN_table (§5.4.4.4) and
+  STN_table_SS into a flat per-track listing, deduplicated by
+  `(pid, kind, stream_entry)` so a remuxer sees exactly one
+  `Track { pid, kind, coding_type, language, playitem_count, entry,
+  carrier_clips }` per distinct elementary stream. Tracks are emitted
   in canonical STN class order (primary video → primary audio → PG → IG
-  → secondary audio → secondary video → PiP PG). `TrackCatalogue::by_pid`
-  / `by_kind` give O(n) PID lookup + class filter for downstream label
-  emission. `TitleInfo::languages` is now populated at mount time from
-  every audio + subtitle entry's 3-byte ISO 639-2/T tag (sorted,
-  deduplicated, lowercased — disc authors ship a mix of `ENG` / `eng`).
+  → secondary audio → secondary video → PiP PG → stereoscopic dependent
+  view). Every track carries the clip stems that hold its packets
+  (main-path clips for in-mux streams, the live SubPlayItem's selected
+  clip for a sub-clip stream), and `Disc::open_track(title, &track, _)`
+  streams exactly that clip set — so secondary audio, PiP video and the
+  MVC dependent view are reachable with their real PIDs.
+  `bluray://…?stream=0x1012` does the same from the URI.
+  `TrackCatalogue::by_pid` / `by_kind` give PID lookup + class filter.
+  `TitleInfo::languages` is populated at mount time from every audio +
+  subtitle entry's 3-byte ISO 639-2/T tag (sorted, deduplicated,
+  lowercased).
+- **Full STN_table / STN_table_SS coverage** (staged
+  `stn-table-observed.md`) — every `stream_entry()` decodes into
+  `StreamEntry`: type 1 (main-clip PID), type 2 (SubPath id + sub-clip
+  entry id + sub-clip PID), type 3 (in-mux PiP through a SubPath),
+  type 4 (enhancement-layer SubPath), or `Unknown` with the raw body —
+  parsed length-based. PiP PG entries come from the tail of the PG
+  loop; secondary audio / video carry their `comb_info` stream-id
+  lists. `ExtensionData()` is parsed for `.mpls` and `.clpi`
+  (`PlayListExtension`: raw entries + per-PlayItem `StnTableSs` with
+  the dependent-view entry + the stereoscopic SubPath list;
+  `ClipExtension::program_info_ss` for a dependent-view clip).
+  `PlayListMpls::resolve_stream_entry(play_item, &entry, list)` joins an
+  entry to its carrying clip (type 2 through the SubPlayItem live for
+  that PlayItem — a SubPlayItem *sequence* — and its multi-clip
+  *alternate* chosen by `ref_to_subClip_entry_id`);
+  `Disc::open_sub_path(title, list, index, clip_entry_id, _)` streams a
+  SubPath on any alternate. All six staged playlist fixtures (multi
+  primary audio + PG, PiP + secondary audio, two PiPs, MVC 3D, split
+  MVC 3D, multi-clip SubPlayItem) parse field-for-field equal to their
+  `dump.txt` (811 semantic fields) and re-encode byte-identically; the
+  MVC pair demuxes both views (130 base-view / 196 dependent-view
+  packets).
 - **SubPath / SubPlayItem parsing + typed `SubPathType`** (§5.4.4 /
   §5.4.4.2) — the SubPath placeholder (type byte + repeat flag only,
   SubPlayItems skipped) is now a full parse: each `SubPath` carries its
@@ -319,8 +348,8 @@ bluray://                          → auto-detect first BD-ROM mount
   `is_multi_clip_entries` word, `ref_to_STC_id`, 45 kHz IN/OUT times,
   and the `sync_PlayItem_id` + `sync_start_PTS_of_PlayItem` MainPath
   anchor that time-locks a synchronous SubPath — plus the multi-clip
-  entry list (entry id 0 = the header clip; ids 1..n as 10-byte
-  records). Derived helpers lift onto the 90 kHz axis
+  entry list (entry id 0 = the header clip; ids 1..n, the
+  count including entry 0, stride derived from the SubPlayItem length). Derived helpers lift onto the 90 kHz axis
   (`duration_90k` / `sync_start_pts_90k`); everything round-trips
   through `encode`, and a `length`-envelope extension tail is skipped
   not misparsed. `SubPathType` types the `SubPath_type` byte
@@ -441,11 +470,13 @@ bluray://                          → auto-detect first BD-ROM mount
 
 - HDMV interactive layer (`MovieObject.bdmv` opcode execution).
 - BD-J (Java ME).
-- SubPath secondary-stream *playback* (PiP compositing, out-of-mux
-  audio mixing, text-subtitle presentation). The SubPath / SubPlayItem
-  structures, the typed `SubPathType`, and the multi-clip lists now
-  parse (see Scope); `TitleSource` still streams the MainPath clips
-  only — a SubPlayItem's out-of-mux clip is not opened or interleaved.
+- SubPath secondary-stream *presentation* (PiP compositing, out-of-mux
+  audio mixing, text-subtitle rendering). Every stream entry resolves
+  to its clip and `Disc::open_track` / `open_sub_path` stream a
+  sub-clip on its own; interleaving a sub-clip into the main-path
+  stream (one TS carrying both) is not done.
+- PiP metadata (PlayList ExtensionData `(1, 1)`) and the `STN_table_SS`
+  bytes after the dependent-view entry are kept raw (no staged layout).
 - Raw-block-device mount (`bluray:///dev/sr0`) — UDF mounter exists,
   high-level routing in `Disc::mount_image` is Phase 2.
 - Cross-PlayItem STC PTS continuity is exposed as a

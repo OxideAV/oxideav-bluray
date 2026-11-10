@@ -24,6 +24,11 @@
 //!   chapter 2 to the end".
 //! - `?chapters=A,B,C` — emit each named chapter as its own segment.
 //!   A single integer (`chapters=3`) is the degenerate case.
+//! - `?stream=PID` (decimal or `0x`-hex) — stream the clip set that
+//!   carries the title's elementary stream on `PID` instead of the main
+//!   path: a secondary audio / PiP video in a sub-clip, or the 3D
+//!   dependent view, opened through `Disc::open_track`. A stream that
+//!   is multiplexed into the main path yields the main path.
 //!
 //! Forgiving on missing keys, strict on malformed values: bad values
 //! surface as parse errors rather than being silently dropped.
@@ -96,6 +101,9 @@ pub struct BlurayUri {
     /// Chapter selector from `?chapters=` (defaults to
     /// [`ChapterSelector::All`]).
     pub chapter_selector: ChapterSelector,
+    /// Elementary PID from `?stream=` — select the clip set carrying
+    /// that stream (see the module docs). `None` = the main path.
+    pub stream_pid: Option<u16>,
 }
 
 impl BlurayUri {
@@ -107,6 +115,7 @@ impl BlurayUri {
             target: BlurayUriTarget::AutoDetect,
             title_id: None,
             chapter_selector: ChapterSelector::All,
+            stream_pid: None,
         }
     }
 
@@ -117,6 +126,7 @@ impl BlurayUri {
             target: BlurayUriTarget::Path(p.into()),
             title_id: None,
             chapter_selector: ChapterSelector::All,
+            stream_pid: None,
         }
     }
 }
@@ -139,15 +149,16 @@ pub fn parse_bluray_uri(uri: &str) -> Result<BlurayUri> {
     };
 
     let target = parse_target(path_part);
-    let (title_id, chapter_selector) = match query_part {
+    let (title_id, chapter_selector, stream_pid) = match query_part {
         Some(q) => parse_query(q)?,
-        None => (None, ChapterSelector::All),
+        None => (None, ChapterSelector::All, None),
     };
 
     Ok(BlurayUri {
         target,
         title_id,
         chapter_selector,
+        stream_pid,
     })
 }
 
@@ -178,9 +189,10 @@ fn parse_target(path_part: &str) -> BlurayUriTarget {
 
 /// Parse the query string (everything after `?`). Forgiving on missing
 /// keys; strict on malformed values.
-fn parse_query(query: &str) -> Result<(Option<u16>, ChapterSelector)> {
+fn parse_query(query: &str) -> Result<(Option<u16>, ChapterSelector, Option<u16>)> {
     let mut title_id: Option<u16> = None;
     let mut chapter_selector = ChapterSelector::All;
+    let mut stream_pid: Option<u16> = None;
 
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -211,6 +223,21 @@ fn parse_query(query: &str) -> Result<(Option<u16>, ChapterSelector)> {
             "chapters" => {
                 chapter_selector = parse_chapter_selector(value)?;
             }
+            "stream" => {
+                let parsed = match value
+                    .strip_prefix("0x")
+                    .or_else(|| value.strip_prefix("0X"))
+                {
+                    Some(hex) => u16::from_str_radix(hex, 16).ok(),
+                    None => value.parse::<u16>().ok(),
+                };
+                let pid = parsed.filter(|&p| p <= 0x1FFF).ok_or_else(|| {
+                    BlurayError::malformed(format!(
+                        "bluray:// `stream=` expects a PID (0..=0x1FFF, decimal or 0x-hex), got `{value}`"
+                    ))
+                })?;
+                stream_pid = Some(pid);
+            }
             other => {
                 return Err(BlurayError::malformed(format!(
                     "bluray:// unknown query key `{other}`"
@@ -218,7 +245,7 @@ fn parse_query(query: &str) -> Result<(Option<u16>, ChapterSelector)> {
             }
         }
     }
-    Ok((title_id, chapter_selector))
+    Ok((title_id, chapter_selector, stream_pid))
 }
 
 /// Parse the value of a `chapters=` query: a range (`A-B` / `A-`), a
@@ -418,10 +445,34 @@ pub fn open_bluray(uri: &str) -> oxideav_core::Result<Box<dyn oxideav_core::Byte
             None
         }
     };
-    let src: TitleSource = disc
-        .open_title(&title, decryptor)
-        .map_err(|e| CoreError::invalid(e.to_string()))?;
+    let src: TitleSource = open_title_or_stream(&disc, &title, parsed.stream_pid, decryptor)?;
     Ok(Box::new(src))
+}
+
+/// Open `title`'s main path, or — for `?stream=PID` — the clip set that
+/// carries that elementary stream ([`Disc::open_track`]).
+#[cfg(feature = "registry")]
+fn open_title_or_stream(
+    disc: &Disc,
+    title: &crate::TitleInfo,
+    stream_pid: Option<u16>,
+    decryptor: Option<Box<dyn crate::StreamDecryptor>>,
+) -> oxideav_core::Result<TitleSource> {
+    use oxideav_core::Error as CoreError;
+    let res = match stream_pid {
+        None => disc.open_title(title, decryptor),
+        Some(pid) => {
+            let cat = disc.title_streams(title);
+            let track = cat.by_pid(pid).ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "bluray://?stream=0x{pid:04X} — title {} lists no stream on that PID",
+                    title.id
+                ))
+            })?;
+            disc.open_track(title, track, decryptor)
+        }
+    };
+    res.map_err(|e| CoreError::invalid(e.to_string()))
 }
 
 /// `bluray://` opener that returns a [`oxideav_core::MultiTitleSource`]
@@ -510,11 +561,28 @@ pub fn open_bluray_multi_title(
         }
     }
 
+    // Chapter slicing seeks on the title timeline, which only the main
+    // path follows; a sub-clip stream selection is whole-stream only.
+    if let (Some(pid), Some(_)) = (parsed.stream_pid, &chapter_list) {
+        let in_main = disc
+            .title_streams(&title)
+            .by_pid(pid)
+            .map(|t| t.is_in_main_path())
+            .unwrap_or(true);
+        if !in_main {
+            return Err(CoreError::invalid(format!(
+                "bluray://?stream=0x{pid:04X}&chapters= — chapter slicing is only \
+                 available for streams multiplexed into the main path"
+            )));
+        }
+    }
+
     Ok(Box::new(BluRayMultiTitleSource {
         disc_root: root,
         title,
         chapter_list,
         metadata,
+        stream_pid: parsed.stream_pid,
     }))
 }
 
@@ -531,6 +599,8 @@ struct BluRayMultiTitleSource {
     /// `Some(ids)` → emit one segment per chapter id, in the given order.
     chapter_list: Option<Vec<u32>>,
     metadata: Vec<(String, String)>,
+    /// `?stream=` PID — whole-title opens stream that stream's carrier.
+    stream_pid: Option<u16>,
 }
 
 #[cfg(feature = "registry")]
@@ -581,9 +651,7 @@ impl oxideav_core::MultiTitleSource for BluRayMultiTitleSource {
                         "bluray:// MultiTitleSource: index {index} out of range (have 1 title)"
                     )));
                 }
-                let src = disc
-                    .open_title(&self.title, decryptor)
-                    .map_err(|e| CoreError::invalid(e.to_string()))?;
+                let src = open_title_or_stream(&disc, &self.title, self.stream_pid, decryptor)?;
                 Ok(Box::new(src))
             }
             Some(ids) => {
@@ -915,6 +983,32 @@ mod tests {
     #[test]
     fn rejects_empty_chapters_value() {
         assert!(parse_bluray_uri("bluray://?chapters=").is_err());
+    }
+
+    #[test]
+    fn parse_stream_pid_hex_and_decimal() {
+        let u = parse_bluray_uri("bluray:///d?stream=0x1012").unwrap();
+        assert_eq!(u.stream_pid, Some(0x1012));
+        let u = parse_bluray_uri("bluray:///d?title=1&stream=6656").unwrap();
+        assert_eq!(u.stream_pid, Some(0x1A00));
+        assert_eq!(u.title_id, Some(1));
+        assert_eq!(parse_bluray_uri("bluray:///d").unwrap().stream_pid, None);
+    }
+
+    #[test]
+    fn rejects_bad_stream_pid() {
+        for bad in [
+            "stream=",
+            "stream=0x2000",
+            "stream=abc",
+            "stream=0xZZ",
+            "stream=-1",
+        ] {
+            assert!(
+                parse_bluray_uri(&format!("bluray:///d?{bad}")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

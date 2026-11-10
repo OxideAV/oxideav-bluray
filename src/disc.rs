@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 use crate::bdmv::clpi::ClipInformation;
 use crate::bdmv::index_bdmv::{IndexBdmv, IndexEntry, IndexObjectType};
 use crate::bdmv::mpls::{
-    Chapter, ChapterSpan, ConnectionCondition, PlayItem, PlayListMpls, StreamCodingType, SubPath,
+    Chapter, ChapterSpan, ConnectionCondition, PlayItem, PlayItemFlags, PlayListMpls, StnTable,
+    StreamCodingType, StreamEntry, SubPath, SubPathList,
 };
 use crate::decrypt::{AACS_UNIT_LEN, StreamDecryptor};
 use crate::error::{BlurayError, Result};
@@ -485,6 +486,110 @@ impl Disc {
         pl.play_list.sub_paths
     }
 
+    /// The title's parsed PlayList (`PLAYLIST/<id>.mpls`) — the full
+    /// typed surface (STN tables, SubPaths, ExtensionData) behind
+    /// [`Self::title_streams`] / [`Self::title_sub_paths`].
+    pub fn title_playlist(&self, title: &TitleInfo) -> Result<PlayListMpls> {
+        let bdmv = self.root.join("BDMV");
+        let pl_bytes = read_file(&playlist_path(&bdmv, title.playlist_id))?;
+        PlayListMpls::parse(&pl_bytes)
+    }
+
+    /// Open one SubPath of `title` as a [`TitleSource`]: its
+    /// SubPlayItems' clips streamed back to back (a sequence of
+    /// SubPlayItems is a sequence of clips, each synchronised to its own
+    /// PlayItem), TP_extra stripped like the main path.
+    ///
+    /// `list` picks the PlayList's SubPath loop or the ExtensionData
+    /// SubPath list (stereoscopic dependent view);
+    /// `clip_entry_id` picks the multi-clip alternate of every
+    /// SubPlayItem (`0` = each SubPlayItem's own clip) — multi-clip
+    /// entries are alternates over one shared IN/OUT window, so exactly
+    /// one of them is opened, never their concatenation
+    /// (`docs/container/bluray/stn-table-observed.md` §4).
+    ///
+    /// Errors when the SubPath does not exist, has no SubPlayItems, or a
+    /// SubPlayItem lacks entry `clip_entry_id`.
+    pub fn open_sub_path(
+        &self,
+        title: &TitleInfo,
+        list: SubPathList,
+        sub_path_index: usize,
+        clip_entry_id: u8,
+        decryptor: Option<Box<dyn StreamDecryptor>>,
+    ) -> Result<TitleSource> {
+        let pl = self.title_playlist(title)?;
+        let sp = pl.sub_path(list, sub_path_index).ok_or_else(|| {
+            BlurayError::not_bluray(format!("no SubPath {sub_path_index} in {list:?} list"))
+        })?;
+        if sp.sub_play_items.is_empty() {
+            return Err(BlurayError::not_bluray("SubPath has no SubPlayItems"));
+        }
+        let mut items = Vec::with_capacity(sp.sub_play_items.len());
+        for (j, spi) in sp.sub_play_items.iter().enumerate() {
+            let clip = spi.clip_entry(clip_entry_id).ok_or_else(|| {
+                BlurayError::not_bluray(format!(
+                    "SubPlayItem {j} has no clip entry {clip_entry_id} ({} clips)",
+                    spi.num_clips()
+                ))
+            })?;
+            items.push(PlayItem {
+                clip_information_file_name: clip.clip_information_file_name,
+                clip_codec_identifier: clip.clip_codec_identifier,
+                connection_condition: spi.connection_condition,
+                stc_id_ref: clip.stc_id_ref,
+                in_time_ticks: spi.in_time_ticks,
+                out_time_ticks: spi.out_time_ticks,
+                multi_clip_count: 1,
+                angles: Vec::new(),
+                stn_table: StnTable::default(),
+                flags: PlayItemFlags::default(),
+            });
+        }
+        TitleSource::new(self.root.join("BDMV"), items, 0, decryptor)
+    }
+
+    /// Open the clip set that carries `track` (from
+    /// [`Self::title_streams`]): the main path ([`Self::open_title`])
+    /// for an in-mux stream (entry types 1 / 3 / 4), otherwise the
+    /// SubPath its type-2 entry names, on the multi-clip alternate its
+    /// `ref_to_subClip_entry_id` selects ([`Self::open_sub_path`]). A
+    /// [`TrackKind::DependentView`] resolves against the ExtensionData
+    /// SubPath list. The track's packets are on [`Track::pid`] in the
+    /// returned stream.
+    pub fn open_track(
+        &self,
+        title: &TitleInfo,
+        track: &Track,
+        decryptor: Option<Box<dyn StreamDecryptor>>,
+    ) -> Result<TitleSource> {
+        match track.entry {
+            StreamEntry::SubClip {
+                sub_path_id,
+                sub_clip_entry_id,
+                ..
+            } => {
+                let list = if track.kind == TrackKind::DependentView {
+                    SubPathList::Extension
+                } else {
+                    SubPathList::PlayList
+                };
+                self.open_sub_path(
+                    title,
+                    list,
+                    sub_path_id as usize,
+                    sub_clip_entry_id,
+                    decryptor,
+                )
+            }
+            e if e.is_in_main_clip() => self.open_title(title, decryptor),
+            other => Err(BlurayError::unsupported(format!(
+                "stream_entry type {} has no known carrier",
+                other.stream_type()
+            ))),
+        }
+    }
+
     /// Per-track catalogue lifted out of the title's playlist STN_table
     /// (BD-ROM Part 3 §5.4.4.4).
     ///
@@ -505,8 +610,13 @@ impl Disc {
     ///
     /// Tracks are returned in canonical STN class order — primary
     /// video, primary audio, PG subtitles, IG menus, secondary audio,
-    /// secondary video, PiP PG — and within each class in the order
-    /// the STN_table itself lists them. This is the same order a BD
+    /// secondary video, PiP PG, then the stereoscopic dependent view
+    /// from the `STN_table_SS` — and within each class by PID.
+    ///
+    /// Every track records its [`Track::entry`] and the clips carrying
+    /// it ([`Track::carrier_clips`]): secondary audio / PiP video in a
+    /// sub-clip (type-2 entry) and the 3D dependent view are listed
+    /// with their real PIDs and opened with [`Self::open_track`]. This is the same order a BD
     /// player applies when assigning per-class user-selector indices,
     /// so a remuxer can label tracks deterministically off `Track::pid`.
     ///
@@ -1812,6 +1922,10 @@ pub enum TrackKind {
     SecondaryVideo,
     /// Picture-in-Picture Presentation Graphic Stream.
     PipPgSubtitle,
+    /// Stereoscopic dependent-view video, listed in the PlayList's
+    /// `STN_table_SS` (ExtensionData `(2, 1)`) and carried in a
+    /// separate clip reached through the ExtensionData SubPath list.
+    DependentView,
 }
 
 /// One elementary stream a title carries, as listed in every PlayItem's
@@ -1844,9 +1958,26 @@ pub struct Track {
     /// a value lower than the PlayItem count indicates a per-PlayItem
     /// override (e.g. a clip that drops a commentary track).
     pub playitem_count: u32,
+    /// The `stream_entry()` that listed this stream — type 1 / 3 / 4
+    /// streams live in the PlayItem's own clip, type 2 streams in a
+    /// sub-clip reached through a SubPath (see
+    /// [`StreamEntry`](crate::StreamEntry)). [`Disc::open_track`]
+    /// streams the right clip set for either.
+    pub entry: StreamEntry,
+    /// Stems of the clips carrying the stream (`STREAM/<stem>.m2ts`),
+    /// one per distinct carrier in PlayItem order — the main-path clips
+    /// for an in-mux stream, the live SubPlayItem's selected clip entry
+    /// for a sub-clip stream. Empty when the entry did not resolve.
+    pub carrier_clips: Vec<String>,
 }
 
 impl Track {
+    /// `true` when the stream's packets are multiplexed into the
+    /// title's main-path clips (what [`Disc::open_title`] streams).
+    pub fn is_in_main_path(&self) -> bool {
+        self.entry.is_in_main_clip()
+    }
+
     /// A one-line UI label for this track: the coding type's
     /// [`StreamCodingType::display_name`] with the language appended in
     /// parentheses when known — e.g. `"Dolby TrueHD (eng)"`,
@@ -1919,121 +2050,123 @@ fn decode_lang_code(raw: [u8; 3]) -> Option<String> {
     Some(s)
 }
 
-/// Lift every PlayItem's STN_table into a single deduplicated
-/// [`TrackCatalogue`]. See [`Disc::title_streams`] for details.
+/// Lift every PlayItem's STN_table (and STN_table_SS) into a single
+/// deduplicated [`TrackCatalogue`]. See [`Disc::title_streams`].
 fn build_track_catalogue(pl: &PlayListMpls) -> TrackCatalogue {
-    // Track records pushed in first-seen order; the canonical STN
-    // class order falls out of the inner walk order below.
+    struct Item {
+        entry: StreamEntry,
+        kind: TrackKind,
+        coding_type: StreamCodingType,
+        language: Option<String>,
+    }
+    // Track records pushed in first-seen order; keyed on the full entry
+    // so the same PID in two different clips stays two tracks.
     let mut tracks: Vec<Track> = Vec::new();
-    let mut index_by_key: std::collections::HashMap<(u16, TrackKind), usize> =
+    let mut index_by_key: std::collections::HashMap<(u16, TrackKind, StreamEntry), usize> =
         std::collections::HashMap::new();
 
-    let bump = |tracks: &mut Vec<Track>,
-                index_by_key: &mut std::collections::HashMap<(u16, TrackKind), usize>,
-                pid: u16,
-                kind: TrackKind,
-                coding_type: StreamCodingType,
-                language: Option<String>| {
-        if pid == 0 {
-            // Non-in-mux entries (stream_type 2/3/4) carry a SubPath
-            // reference rather than a direct PID; the parser leaves
-            // the PID at 0 for those. Skip — there's no main-TS PID
-            // for a remuxer to label.
-            return;
+    for (pi_idx, pi) in pl.play_list.play_items.iter().enumerate() {
+        let t = &pi.stn_table;
+        let mut items: Vec<(Item, SubPathList)> = Vec::new();
+        let mut push = |entry, kind, coding_type, language, list| {
+            items.push((
+                Item {
+                    entry,
+                    kind,
+                    coding_type,
+                    language,
+                },
+                list,
+            ))
+        };
+        let main = SubPathList::PlayList;
+        for s in &t.primary_video {
+            push(s.entry, TrackKind::PrimaryVideo, s.coding_type, None, main);
         }
-        let key = (pid, kind);
-        if let Some(&idx) = index_by_key.get(&key) {
-            tracks[idx].playitem_count += 1;
-        } else {
-            let idx = tracks.len();
-            tracks.push(Track {
-                pid,
-                kind,
-                coding_type,
-                language,
-                playitem_count: 1,
-            });
-            index_by_key.insert(key, idx);
+        for s in &t.primary_audio {
+            let l = decode_lang_code(s.language_code);
+            push(s.entry, TrackKind::PrimaryAudio, s.coding_type, l, main);
         }
-    };
-
-    for pi in &pl.play_list.play_items {
-        for s in &pi.stn_table.primary_video {
-            bump(
-                &mut tracks,
-                &mut index_by_key,
-                s.elementary_pid,
-                TrackKind::PrimaryVideo,
-                s.coding_type,
-                None,
-            );
+        for s in &t.pg_subtitles {
+            let l = decode_lang_code(s.language_code);
+            push(s.entry, TrackKind::PgSubtitle, s.coding_type, l, main);
         }
-        for s in &pi.stn_table.primary_audio {
-            bump(
-                &mut tracks,
-                &mut index_by_key,
-                s.elementary_pid,
-                TrackKind::PrimaryAudio,
-                s.coding_type,
-                decode_lang_code(s.language_code),
-            );
+        for s in &t.ig_streams {
+            let l = decode_lang_code(s.language_code);
+            push(s.entry, TrackKind::IgMenu, s.coding_type, l, main);
         }
-        for s in &pi.stn_table.pg_subtitles {
-            bump(
-                &mut tracks,
-                &mut index_by_key,
-                s.elementary_pid,
-                TrackKind::PgSubtitle,
-                s.coding_type,
-                decode_lang_code(s.language_code),
-            );
+        for s in &t.secondary_audio {
+            let l = decode_lang_code(s.language_code);
+            push(s.entry, TrackKind::SecondaryAudio, s.coding_type, l, main);
         }
-        for s in &pi.stn_table.ig_streams {
-            bump(
-                &mut tracks,
-                &mut index_by_key,
-                s.elementary_pid,
-                TrackKind::IgMenu,
-                s.coding_type,
-                decode_lang_code(s.language_code),
-            );
-        }
-        for s in &pi.stn_table.secondary_audio {
-            bump(
-                &mut tracks,
-                &mut index_by_key,
-                s.elementary_pid,
-                TrackKind::SecondaryAudio,
-                s.coding_type,
-                decode_lang_code(s.language_code),
-            );
-        }
-        for s in &pi.stn_table.secondary_video {
-            bump(
-                &mut tracks,
-                &mut index_by_key,
-                s.elementary_pid,
+        for s in &t.secondary_video {
+            push(
+                s.entry,
                 TrackKind::SecondaryVideo,
                 s.coding_type,
                 None,
+                main,
             );
         }
-        for s in &pi.stn_table.pip_pg {
-            bump(
-                &mut tracks,
-                &mut index_by_key,
-                s.elementary_pid,
-                TrackKind::PipPgSubtitle,
-                s.coding_type,
-                decode_lang_code(s.language_code),
+        for s in &t.pip_pg {
+            let l = decode_lang_code(s.language_code);
+            push(s.entry, TrackKind::PipPgSubtitle, s.coding_type, l, main);
+        }
+        if let Some(dv) = pl
+            .extension
+            .stn_table_ss
+            .get(pi_idx)
+            .and_then(|ss| ss.dependent_view.as_ref())
+        {
+            push(
+                dv.entry,
+                TrackKind::DependentView,
+                dv.coding_type,
+                None,
+                SubPathList::Extension,
             );
+        }
+
+        for (it, list) in items {
+            // Unknown entry types carry no PID; PID 0 is the PAT, never
+            // an elementary stream.
+            let Some(pid) = it.entry.pid().filter(|&p| p != 0) else {
+                continue;
+            };
+            let carrier = pl
+                .resolve_stream_entry(pi_idx, &it.entry, list)
+                .map(|r| r.clip_information_file_name);
+            let key = (pid, it.kind, it.entry);
+            let idx = match index_by_key.get(&key) {
+                Some(&idx) => {
+                    tracks[idx].playitem_count += 1;
+                    idx
+                }
+                None => {
+                    let idx = tracks.len();
+                    tracks.push(Track {
+                        pid,
+                        kind: it.kind,
+                        coding_type: it.coding_type,
+                        language: it.language,
+                        playitem_count: 1,
+                        entry: it.entry,
+                        carrier_clips: Vec::new(),
+                    });
+                    index_by_key.insert(key, idx);
+                    idx
+                }
+            };
+            if let Some(c) = carrier
+                && !tracks[idx].carrier_clips.contains(&c)
+            {
+                tracks[idx].carrier_clips.push(c);
+            }
         }
     }
 
-    // Sort by class (canonical STN order) then by first-seen index.
-    // Currently the input order already matches class order across
-    // PlayItems, but if a downstream parser ever introduced an
-    // out-of-order STN class the explicit sort keeps the invariant.
+    // Sort by class (canonical STN order) then by PID; stable, so
+    // first-seen order breaks the remaining ties.
     tracks.sort_by_key(|t| (class_order(t.kind), t.pid));
     TrackCatalogue { tracks }
 }
@@ -2049,6 +2182,7 @@ fn class_order(kind: TrackKind) -> u8 {
         TrackKind::SecondaryAudio => 4,
         TrackKind::SecondaryVideo => 5,
         TrackKind::PipPgSubtitle => 6,
+        TrackKind::DependentView => 7,
     }
 }
 

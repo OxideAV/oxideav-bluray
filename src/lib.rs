@@ -18,10 +18,11 @@
 //!
 //! Out of scope (deferred or indefinite):
 //! - BD-J (Java VM).
-//! - SubPath secondary-stream *playback* (PiP compositing / out-of-mux
-//!   audio mixing) — the SubPath / SubPlayItem structures and the typed
-//!   `SubPathType` now parse (`bdmv::mpls`); `TitleSource` still
-//!   streams the MainPath only.
+//! - SubPath secondary-stream *presentation* (PiP compositing / out-of-mux
+//!   audio mixing). Every STN / STN_table_SS stream entry resolves to its
+//!   carrying clip and `Disc::open_track` / `Disc::open_sub_path` stream
+//!   a sub-clip on its own; interleaving it into the main-path stream is
+//!   not done.
 //!
 //! (The HDMV interactive layer's `MovieObject.bdmv` opcode *decode* and a
 //! minimal navigation *VM* — `bdmv::nav_command`, `bdmv::vm`,
